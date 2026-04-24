@@ -58,6 +58,7 @@ use hashbrown::HashMap;
 use hashbrown::hash_map;
 use itertools::Itertools;
 use rayon::iter::IndexedParallelIterator as _;
+use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator;
@@ -1645,6 +1646,12 @@ fn try_load_parsed_input_cache<'data, P: Platform>(
 /// combined logic lives here so the call-site in
 /// `read_symbols_for_group` stays a single line and the gates-driven
 /// branching is easy to audit.
+/// Returns the fresh [`CacheBuilder`] when the caller should persist
+/// it after the parse loop finishes, or `None` when replay fired or
+/// no write gate is active. Persistence is deferred + fanned out
+/// across rayon workers because 1000+ sequential `fs::write` +
+/// `fs::rename` calls are ~200 ms on bevy-dylib — enough to dwarf
+/// the parse savings unless parallelised.
 fn run_object_parse_skip<'data, P: Platform>(
     obj: &SequencedInputObject<'data, P>,
     version_script: &VersionScript,
@@ -1654,7 +1661,7 @@ fn run_object_parse_skip<'data, P: Platform>(
     output_kind: OutputKind,
     gates: ParseSkipGates,
     cached_bytes: Option<&'data [u8]>,
-) -> Result {
+) -> Result<Option<crate::parsed_input_cache::CacheBuilder>> {
     // READ path (no canary): if a cache was pre-fetched for this
     // input, replay and skip the parse entirely. The caller has
     // already verified per-input cleanness via `.wild-hashes` before
@@ -1666,7 +1673,7 @@ fn run_object_parse_skip<'data, P: Platform>(
         && let Some(view) = crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)
     {
         crate::parse_skip::replay_cached_symbols(&view, obj.file_id, sink);
-        return Ok(());
+        return Ok(None);
     }
 
     // Parse normally. Under write/canary, tee into a fresh
@@ -1692,7 +1699,7 @@ fn run_object_parse_skip<'data, P: Platform>(
     .with_context(|| format!("Failed to load symbols from `{}`", obj.parsed.input))?;
 
     let Some(builder) = tee.take_cache() else {
-        return Ok(());
+        return Ok(None);
     };
 
     // CANARY: compare against the pre-fetched disk cache. `cached_bytes`
@@ -1706,11 +1713,9 @@ fn run_object_parse_skip<'data, P: Platform>(
         }
     }
 
-    // WRITE: persist the fresh cache (overwrites any stale copy so
-    // next link's canary / read path gets the current stream).
-    write_parsed_input_cache(obj, builder);
-
-    Ok(())
+    // Defer the disk write to the caller — it batches all builders
+    // from the group and fans them out across rayon workers.
+    Ok(Some(builder))
 }
 
 /// Emit a rustc-style diff between the freshly-parsed stream and the
@@ -1811,11 +1816,15 @@ fn read_symbols_for_group<'data, P: Platform>(
                 vec![None; parsed_input_objects.len()]
             };
 
-            // One allocator per group for the serial-write path:
-            // during replay we don't need new allocations (the
-            // pre-fetch already arena-allocated), so this is cheap.
+            // Serial parse-or-replay loop. Builders returned here are
+            // BUFFERED for a parallel write pass below — inlining
+            // fs::write in this loop on bevy-dylib cost ~200 ms.
+            let mut pending_writes: Vec<(
+                &SequencedInputObject<'data, P>,
+                crate::parsed_input_cache::CacheBuilder,
+            )> = Vec::new();
             for (obj, cached) in parsed_input_objects.iter().zip(cached_bytes.iter()) {
-                run_object_parse_skip(
+                if let Some(builder) = run_object_parse_skip(
                     obj,
                     version_script,
                     &mut sink,
@@ -1824,7 +1833,20 @@ fn read_symbols_for_group<'data, P: Platform>(
                     output_kind,
                     gates,
                     *cached,
-                )?;
+                )? {
+                    pending_writes.push((obj, builder));
+                }
+            }
+
+            // Fan cache writes across rayon workers. Each worker does
+            // its own create_dir_all + fs::write + fs::rename. Order
+            // is irrelevant — every cache file is addressed by a
+            // (path, entry_id) hash so there are no inter-file
+            // dependencies.
+            if !pending_writes.is_empty() {
+                pending_writes.into_par_iter().for_each(|(obj, builder)| {
+                    write_parsed_input_cache(obj, builder);
+                });
             }
         }
         Group::LinkerScripts(scripts) => {
