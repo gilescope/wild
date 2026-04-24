@@ -1511,6 +1511,53 @@ fn read_symbols<'data, P: Platform>(
         .collect::<Result<Vec<SymbolLoadOutputs>>>()
 }
 
+/// Env-var gate for tier-1 incremental-link parse-skip cache WRITES.
+/// `WILD_INCREMENTAL_PARSE_SKIP=1` (or `WILD_INCREMENTAL_DEBUG=1` as an
+/// umbrella covering every incremental feature) opts in. The gate is
+/// checked once per group so repeated env lookups don't appear in the
+/// per-symbol hot path — the cost is one `getenv` per `.rlib` / `.o`
+/// (microseconds, bounded by input count).
+///
+/// Default off. See `tier-1-parse-skip-plan.md`.
+fn parse_skip_write_enabled() -> bool {
+    std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some()
+        || std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+}
+
+/// Persist a freshly-captured [`CacheBuilder`] next to the input it
+/// was teed from. Failures are swallowed — a missing or unwritable
+/// cache dir is never a reason to fail the link. On success the cache
+/// is ready to be consumed by the replay path on a subsequent link.
+fn write_parsed_input_cache<'data, P: Platform>(
+    obj: &SequencedInputObject<'data, P>,
+    builder: crate::parsed_input_cache::CacheBuilder,
+) {
+    // Skip entries we can't key stably on disk — e.g. synthetic /
+    // in-memory inputs whose filename is empty. Those tend to be the
+    // prelude stub, which we don't parse via load_symbols_from_file
+    // anyway, so this is a belt-and-braces guard.
+    let path = obj.parsed.input.file.filename.as_path();
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    // Archive members (rlib entries) share the archive's filename; the
+    // member identifier disambiguates them in the cache filename.
+    let entry_id = obj
+        .parsed
+        .input
+        .entry
+        .as_ref()
+        .map(|e| e.identifier.as_slice());
+    let Some(cache_path) =
+        crate::parsed_input_cache::cache_path_for_input(path, entry_id)
+    else {
+        return;
+    };
+    // Best-effort: any IO error drops the cache silently. The next
+    // link will just re-parse.
+    let _ = builder.write_to(&cache_path);
+}
+
 fn read_symbols_for_group<'data, P: Platform>(
     shard: &mut SymbolWriterShard<'_, '_, 'data, P>,
     version_script: &VersionScript,
@@ -1540,16 +1587,45 @@ fn read_symbols_for_group<'data, P: Platform>(
             prelude.load_symbols(&mut sink);
         }
         Group::Objects(parsed_input_objects) => {
+            let parse_skip_writes = parse_skip_write_enabled();
             for obj in *parsed_input_objects {
-                load_symbols_from_file(
-                    obj,
-                    version_script,
-                    &mut sink,
-                    args,
-                    export_list,
-                    output_kind,
-                )
-                .with_context(|| format!("Failed to load symbols from `{}`", obj.parsed.input))?;
+                if parse_skip_writes {
+                    // Tee the parse into a CacheBuilder so the next
+                    // link can replay the symbol stream instead of
+                    // re-iterating the object crate. Cache write is
+                    // best-effort: any IO error is ignored — a stale
+                    // cache can never fail the link.
+                    let mut tee = crate::parse_skip::TeeSink::new(
+                        &mut sink as &mut dyn SymbolSink<'data>,
+                        Some(crate::parsed_input_cache::CacheBuilder::default()),
+                    );
+                    load_symbols_from_file(
+                        obj,
+                        version_script,
+                        &mut tee,
+                        args,
+                        export_list,
+                        output_kind,
+                    )
+                    .with_context(|| {
+                        format!("Failed to load symbols from `{}`", obj.parsed.input)
+                    })?;
+                    if let Some(builder) = tee.take_cache() {
+                        write_parsed_input_cache(obj, builder);
+                    }
+                } else {
+                    load_symbols_from_file(
+                        obj,
+                        version_script,
+                        &mut sink,
+                        args,
+                        export_list,
+                        output_kind,
+                    )
+                    .with_context(|| {
+                        format!("Failed to load symbols from `{}`", obj.parsed.input)
+                    })?;
+                }
             }
         }
         Group::LinkerScripts(scripts) => {

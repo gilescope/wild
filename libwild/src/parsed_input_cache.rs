@@ -41,18 +41,46 @@ use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Read the cache file for `input` (with optional `entry_id` for
+/// archive members) into an owned buffer, or return `None` if the file
+/// is missing, unreadable, schema-mismatched, or truncated. A bad
+/// cache must never prevent the link — callers fall through to the
+/// normal parse path.
+///
+/// Archive entry disambiguation: wild's inputs include `.rlib` archive
+/// members that share a filesystem path with their archive. Without an
+/// entry identifier, every member of the same archive would collide on
+/// the same cache file; `entry_id` (typically the member's filename
+/// bytes from the archive header) disambiguates them.
+///
+/// The returned buffer is allocated on the heap; because its pointer
+/// may not be 8-byte aligned (Rust's `Vec` guarantees at least
+/// `align_of::<u8>()`), `CacheView::from_bytes` validates alignment
+/// internally and rejects misaligned buffers. Production callers that
+/// need zero-copy should mmap the file and feed the mmap's page-aligned
+/// slice directly.
+pub(crate) fn try_load_cache(input: &Path, entry_id: Option<&[u8]>) -> Option<Vec<u8>> {
+    let path = cache_path_for_input(input, entry_id)?;
+    let bytes = std::fs::read(&path).ok()?;
+    // Validate before returning — saves an allocation-and-throw in the
+    // caller when the file was written by an older schema.
+    CacheView::from_bytes(&bytes)?;
+    Some(bytes)
+}
+
 /// Locate the on-disk cache file for a given input. Returns
 /// `None` when we can't determine a cache directory (no
 /// `$XDG_CACHE_HOME` *and* no `$HOME`), in which case callers
 /// fall back to the re-parse path without caching.
 ///
-/// File name is derived from blake3(absolute_input_path) ‖ schema
-/// so different inputs with the same basename (very common across
-/// cargo's `deps/` directory — the `libfoo-<hash>.rlib` shape) can't
-/// collide. `std::path::Path::canonicalize` is deliberately NOT
+/// File name is derived from blake3(absolute_input_path ‖ entry_tag ‖
+/// schema) so different inputs with the same basename (very common
+/// across cargo's `deps/` directory — the `libfoo-<hash>.rlib` shape)
+/// can't collide, and two archive members of the same `.rlib` can't
+/// collide either. `std::path::Path::canonicalize` is deliberately NOT
 /// used here: wild's input fingerprints are path-string-based too,
 /// so staying symlink-literal keeps the two layers consistent.
-pub(crate) fn cache_path_for_input(input: &Path) -> Option<PathBuf> {
+pub(crate) fn cache_path_for_input(input: &Path, entry_id: Option<&[u8]>) -> Option<PathBuf> {
     let dir = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         PathBuf::from(xdg).join("wild").join("parsed-inputs")
     } else {
@@ -64,6 +92,15 @@ pub(crate) fn cache_path_for_input(input: &Path) -> Option<PathBuf> {
     };
     let mut key = blake3::Hasher::new();
     key.update(input.as_os_str().as_encoded_bytes());
+    // Length-prefix the entry id so `foo.rlib` + entry `ab` can't
+    // collide with `foo.rli` + entry `bab`. A zero-length id is the
+    // normal (non-archive) case.
+    if let Some(id) = entry_id {
+        key.update(&(id.len() as u64).to_le_bytes());
+        key.update(id);
+    } else {
+        key.update(&0u64.to_le_bytes());
+    }
     key.update(&SCHEMA.to_le_bytes());
     let hex = key.finalize().to_hex();
     Some(dir.join(format!("{hex}.wildpi")))
@@ -535,8 +572,8 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_CACHE_HOME", std::env::temp_dir());
         }
-        let a = cache_path_for_input(Path::new("/tmp/build-a/libfoo-abc.rlib"));
-        let b = cache_path_for_input(Path::new("/tmp/build-b/libfoo-abc.rlib"));
+        let a = cache_path_for_input(Path::new("/tmp/build-a/libfoo-abc.rlib"), None);
+        let b = cache_path_for_input(Path::new("/tmp/build-b/libfoo-abc.rlib"), None);
         let a = a.expect("a");
         let b = b.expect("b");
         assert_ne!(
@@ -544,8 +581,23 @@ mod tests {
             "same-basename inputs from different dirs produced the same cache path"
         );
         // Same input twice → same cache path.
-        let a2 = cache_path_for_input(Path::new("/tmp/build-a/libfoo-abc.rlib")).unwrap();
+        let a2 = cache_path_for_input(Path::new("/tmp/build-a/libfoo-abc.rlib"), None).unwrap();
         assert_eq!(a, a2, "identical input path produced different cache paths");
+        // Same archive file, different member entries → distinct cache
+        // paths so rlib members don't collide on their parent's path.
+        let m1 =
+            cache_path_for_input(Path::new("/tmp/foo.rlib"), Some(b"first.o")).unwrap();
+        let m2 =
+            cache_path_for_input(Path::new("/tmp/foo.rlib"), Some(b"second.o")).unwrap();
+        assert_ne!(
+            m1, m2,
+            "archive-entry-disambiguated cache paths unexpectedly collided"
+        );
+        // Member vs. whole-archive disambiguation: the archive-entry
+        // case must also differ from the no-entry case.
+        let whole =
+            cache_path_for_input(Path::new("/tmp/foo.rlib"), None).unwrap();
+        assert_ne!(whole, m1, "entry-absent cache path collided with a member");
         // Restore env.
         match prev {
             Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
