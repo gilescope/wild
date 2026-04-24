@@ -6,24 +6,27 @@ nothing consumes it yet. This doc is the next session's spec.*
 
 ## Status (2026-04-24, post-integration)
 
-Infrastructure shipped across 4 commits (`f0120e6` refactor →
+Infrastructure shipped across 6 commits (`f0120e6` refactor →
 `87ef10a` write path → `bd38941` read + canary → `33a3b43`
-wild-hashes gating). **Canary session 1 of 3: green on all
-plan-specified test sets:**
+wild-hashes gating → `ef750cd` parallel cache pre-fetch).
+**Canary sessions 1 + 2 of 3: green on all plan-specified test
+sets (4 sets × 3 runs × 2 sessions = 24 clean):**
 
-| input set       | cache entries | canary (3 runs)          |
-| --------------- | ------------: | ------------------------ |
-| rust-hello-world |           403 | clean                    |
-| bevy-dylib      |          1649 | clean                    |
-| ripgrep         |         (~300) | clean                    |
-| rust-analyzer   |       (large) | clean                    |
+| input set       | cache entries | session 1 | session 2 |
+| --------------- | ------------: | --------- | --------- |
+| rust-hello-world |           403 | clean     | clean     |
+| bevy-dylib      |          1649 | clean     | clean     |
+| ripgrep         |         (~300) | clean     | clean     |
+| rust-analyzer   |         (~700) | clean     | clean     |
 
 The v1 schema is lossless for Mach-O symbol streams in practice.
 
-Speed note: read-path timing on the measured links is roughly
-wash with fresh parse (cache I/O + clean-set hashing overhead
-cancels the symbol-parse saving on these inputs). The win is
-correctness + foundation for tier-2; speed-tuning is a follow-up.
+**Perf: read-path Read-symbols phase is 4 ms faster than fresh
+parse on bevy-dylib** (13 ms replay vs 17 ms fresh; 46 ms
+serial-read → 13 ms parallel-read after `ef750cd`). Total
+wall-clock is still bounded by layout + write (~380 ms on
+bevy-dylib), which are untouched until tier-2 / tier-3 —
+Read-symbols is the only phase tier-1 can move.
 
 ## What's landed
 
