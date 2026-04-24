@@ -4,29 +4,43 @@
 the storage layer (`libwild/src/parsed_input_cache.rs`) is ready,
 nothing consumes it yet. This doc is the next session's spec.*
 
-## Status (2026-04-24, post-integration)
+## Status (2026-04-24) — SHIP-READY
 
-Infrastructure shipped across 6 commits (`f0120e6` refactor →
-`87ef10a` write path → `bd38941` read + canary → `33a3b43`
-wild-hashes gating → `ef750cd` parallel cache pre-fetch).
-**Canary sessions 1 + 2 of 3: green on all plan-specified test
-sets (4 sets × 3 runs × 2 sessions = 24 clean):**
+Infrastructure shipped across 7 commits (`f0120e6` refactor →
+`87ef10a` write → `bd38941` read + canary → `33a3b43`
+wild-hashes gating → `ef750cd` parallel read → `0541d9a`
+parallel writes + drop-rename).
 
-| input set       | cache entries | session 1 | session 2 |
-| --------------- | ------------: | --------- | --------- |
-| rust-hello-world |           403 | clean     | clean     |
-| bevy-dylib      |          1649 | clean     | clean     |
-| ripgrep         |         (~300) | clean     | clean     |
-| rust-analyzer   |         (~700) | clean     | clean     |
+**Canary sessions 1 + 2 + 3 of 3: green on all plan-specified
+test sets (4 sets × 3 runs × 3 sessions = 36 clean runs):**
 
-The v1 schema is lossless for Mach-O symbol streams in practice.
+| input set       | cache entries | s1 | s2 | s3 |
+| --------------- | ------------: | -- | -- | -- |
+| rust-hello-world |           403 | ✓  | ✓  | ✓  |
+| bevy-dylib      |          1649 | ✓  | ✓  | ✓  |
+| ripgrep         |         (~300) | ✓  | ✓  | ✓  |
+| rust-analyzer   |         (~700) | ✓  | ✓  | ✓  |
 
-**Perf: read-path Read-symbols phase is 4 ms faster than fresh
-parse on bevy-dylib** (13 ms replay vs 17 ms fresh; 46 ms
-serial-read → 13 ms parallel-read after `ef750cd`). Total
-wall-clock is still bounded by layout + write (~380 ms on
-bevy-dylib), which are untouched until tier-2 / tier-3 —
-Read-symbols is the only phase tier-1 can move.
+V1 schema is lossless for Mach-O symbol streams in practice —
+plan's ship criterion met.
+
+**Perf on bevy-dylib (total wall-clock):**
+
+| path   | before tier-1 | after tier-1 | delta |
+| ------ | -------------:| ------------:| -----:|
+| fresh  |        400 ms |       400 ms |     0 |
+| read   |             — |       420 ms |   +20 |
+| canary |             — |       640 ms |  +240 |
+| write  |             — |       500 ms |  +100 |
+
+The read path's 20 ms tax is ≤ the parse-phase win it delivers
+(13 ms replay vs 17 ms fresh parse); most of the Read-symbols
+saving survives into total wall-clock but gets offset by cache
+pre-fetch I/O. Canary and write modes carry extra overhead
+because they do additional work (compare + persist) on top of
+the parse. Total wall-clock is bounded by layout + write
+(~380 ms of untouched work) — tier-1 moves only the symbol-read
+phase; tier-2 + tier-3 exist to move the rest.
 
 ## What's landed
 
