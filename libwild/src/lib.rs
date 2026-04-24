@@ -387,6 +387,12 @@ impl Linker {
     ) -> error::Result<LinkerOutput<'data>> {
         let mut file_loader = input_data::FileLoader::new(&self.inputs_arena);
 
+        // Zero the tier-1 parse-skip counters so the end-of-link
+        // summary reflects only this link. Callers that drive
+        // `Linker::run` multiple times in-process get per-link
+        // granularity rather than cumulative totals.
+        parse_skip::reset_stats();
+
         // Note, we propagate errors from `link_with_input_data` after we've checked if any files
         // changed. We want inputs-changed errors to take precedence over all other errors.
         let result = self.load_inputs_and_link::<P, A>(&mut file_loader, args);
@@ -400,6 +406,12 @@ impl Linker {
         if result.is_ok() && std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
             persist_link_cache::<P>(&file_loader, args);
         }
+
+        // Tier-1 parse-skip telemetry: terse one-liner summarising
+        // how many inputs replayed vs re-parsed vs wrote cache
+        // entries. Gated on WILD_INCREMENTAL_DEBUG=1 so normal
+        // links stay silent.
+        parse_skip::maybe_report();
 
         // Write the dependency file and inputs trace after successful linking.
         if result.is_ok() {

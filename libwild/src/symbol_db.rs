@@ -462,7 +462,6 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             self.args,
             &self.export_list,
             self.output_kind,
-            self.herd,
             clean_input_paths,
         )?;
 
@@ -1495,7 +1494,6 @@ fn read_symbols<'data, P: Platform>(
     args: &P::Args,
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
-    herd: &'data bumpalo_herd::Herd,
     clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> Result<Vec<SymbolLoadOutputs<'data>>> {
     timing_phase!("Read symbols");
@@ -1512,7 +1510,6 @@ fn read_symbols<'data, P: Platform>(
                 num_buckets,
                 args,
                 output_kind,
-                herd,
                 clean_input_paths,
             )
         })
@@ -1593,36 +1590,26 @@ fn write_parsed_input_cache<'data, P: Platform>(
     };
     // Best-effort: any IO error drops the cache silently. The next
     // link will just re-parse.
-    let _ = builder.write_to(&cache_path);
-}
-
-/// Copy `src` into an 8-byte-aligned allocation inside the bumpalo
-/// member's arena. Returns the resulting slice with the arena's
-/// lifetime. The alignment matches [`parsed_input_cache::CacheView`]'s
-/// requirement so the returned slice can feed `CacheView::from_bytes`
-/// without a second copy.
-fn alloc_cache_slice<'h>(src: &[u8], m: &bumpalo_herd::Member<'h>) -> &'h [u8] {
-    let layout = std::alloc::Layout::from_size_align(src.len().max(1), 8)
-        .expect("cache size within isize::MAX");
-    let ptr = m.alloc_layout(layout);
-    // SAFETY: `ptr` points to `src.len().max(1)` freshly-allocated,
-    // 8-byte-aligned bytes with the member's lifetime; `src` is a
-    // valid non-overlapping source of length `src.len()`. We copy
-    // only `src.len()` bytes, then read back the same range.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.as_ptr(), src.len());
-        std::slice::from_raw_parts(ptr.as_ptr() as *const u8, src.len())
+    if builder.write_to(&cache_path).is_ok() {
+        crate::parse_skip::STATS
+            .written
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Try to load + validate a cache for `obj` into the arena, returning
-/// a byte slice with the arena's 'data lifetime ready for
-/// `CacheView::from_bytes`. `None` on cache miss or any validation
-/// failure — caller falls through to the re-parse path.
+/// Try to load + validate a cache for `obj`, returning a fully-built
+/// `CacheView` with the arena's 'data lifetime. Backed by an mmap
+/// that's leaked for the process lifetime — so the returned view's
+/// name slices stay valid for as long as the symbol DB might hold
+/// them. `None` on cache miss or any validation failure (caller
+/// falls through to the re-parse path).
+///
+/// Returns the view directly rather than raw bytes so the replay
+/// loop can skip a redundant `CacheView::from_bytes` re-validation
+/// (the mmap loader already did it).
 fn try_load_parsed_input_cache<'data, P: Platform>(
     obj: &SequencedInputObject<'data, P>,
-    allocator: &bumpalo_herd::Member<'data>,
-) -> Option<&'data [u8]> {
+) -> Option<crate::parsed_input_cache::CacheView<'data>> {
     let path = obj.parsed.input.file.filename.as_path();
     if path.as_os_str().is_empty() {
         return None;
@@ -1633,13 +1620,9 @@ fn try_load_parsed_input_cache<'data, P: Platform>(
         .entry
         .as_ref()
         .map(|e| e.identifier.as_slice());
-    let disk_bytes = crate::parsed_input_cache::try_load_cache(path, entry_id)?;
-    let arena_bytes = alloc_cache_slice(&disk_bytes, allocator);
-    // Re-validate from the arena slice — `try_load_cache` already
-    // validated against its own Vec<u8>, but the alignment guarantees
-    // are only honoured by the arena copy.
-    crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)?;
-    Some(arena_bytes)
+    // CacheView<'static> downcasts to CacheView<'data> by lifetime
+    // covariance — the leaked mmap outlives any per-link 'data.
+    crate::parsed_input_cache::try_load_cache_view_mmap(path, entry_id)
 }
 
 /// Orchestrates read / canary / write for a single object input. The
@@ -1652,7 +1635,7 @@ fn try_load_parsed_input_cache<'data, P: Platform>(
 /// across rayon workers because 1000+ sequential `fs::write` +
 /// `fs::rename` calls are ~200 ms on bevy-dylib — enough to dwarf
 /// the parse savings unless parallelised.
-fn run_object_parse_skip<'data, P: Platform>(
+fn run_object_parse_skip<'data, 'view, P: Platform>(
     obj: &SequencedInputObject<'data, P>,
     version_script: &VersionScript,
     sink: &mut DefaultSymbolSink<'_, '_, '_, 'data, P>,
@@ -1660,21 +1643,31 @@ fn run_object_parse_skip<'data, P: Platform>(
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
     gates: ParseSkipGates,
-    cached_bytes: Option<&'data [u8]>,
+    cached_view: Option<&'view crate::parsed_input_cache::CacheView<'data>>,
 ) -> Result<Option<crate::parsed_input_cache::CacheBuilder>> {
     // READ path (no canary): if a cache was pre-fetched for this
     // input, replay and skip the parse entirely. The caller has
     // already verified per-input cleanness via `.wild-hashes` before
-    // allocating `cached_bytes`, so presence here implies safety to
-    // reuse.
+    // building `cached_view`, and the mmap loader validated the
+    // header — so presence here implies safety to reuse without a
+    // third validation.
     if gates.read
         && !gates.canary
-        && let Some(arena_bytes) = cached_bytes
-        && let Some(view) = crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)
+        && let Some(view) = cached_view
     {
-        crate::parse_skip::replay_cached_symbols(&view, obj.file_id, sink);
+        crate::parse_skip::replay_cached_symbols(view, obj.file_id, sink);
+        crate::parse_skip::STATS
+            .replayed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
     }
+
+    // From this point we're re-parsing — count the re-parse before
+    // the heavy work starts so the counter reflects intent even on
+    // error-return paths below.
+    crate::parse_skip::STATS
+        .reparsed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Parse normally. Under write/canary, tee into a fresh
     // CacheBuilder; its bytes become both the canary's reference and
@@ -1702,15 +1695,19 @@ fn run_object_parse_skip<'data, P: Platform>(
         return Ok(None);
     };
 
-    // CANARY: compare against the pre-fetched disk cache. `cached_bytes`
+    // CANARY: compare against the pre-fetched disk cache. `cached_view`
     // is `Some` only for clean inputs (caller-gated), so any divergence
     // here is a schema or cache-file bug, not a content-changed
     // false-positive.
-    if gates.canary && let Some(disk_bytes) = cached_bytes {
+    if gates.canary && let Some(view) = cached_view {
         let fresh_bytes = builder.clone_bytes();
+        let disk_bytes = view.as_bytes();
         if fresh_bytes != disk_bytes {
             panic_canary_diff(obj, &fresh_bytes, disk_bytes);
         }
+        crate::parse_skip::STATS
+            .canary_matched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Defer the disk write to the caller — it batches all builders
@@ -1760,7 +1757,6 @@ fn read_symbols_for_group<'data, P: Platform>(
     num_buckets: usize,
     args: &P::Args,
     output_kind: OutputKind,
-    herd: &'data bumpalo_herd::Herd,
     clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> Result<SymbolLoadOutputs<'data>> {
     verbose_timing_phase!(
@@ -1785,36 +1781,37 @@ fn read_symbols_for_group<'data, P: Platform>(
         }
         Group::Objects(parsed_input_objects) => {
             let gates = ParseSkipGates::from_env();
-            // Pre-fetch cache bytes in parallel per object — turns a
-            // serial chain of 1000+ fs::read calls into a
-            // rayon-parallel fan-out. Each parallel thread gets its
-            // own `bumpalo_herd::Member` and allocates the cache
-            // slice directly into the arena with 'data lifetime, so
-            // the subsequent serial replay loop does zero I/O.
+            // Pre-fetch cache views in parallel per object — turns a
+            // serial chain of 1000+ open+read calls into a
+            // rayon-parallel fan-out. Each parsed cache is mmap'd
+            // (not heap-Vec'd) and the mmap is leaked so the symbol
+            // names can be borrowed for the whole link without an
+            // arena copy. wild's a one-shot CLI so the kernel
+            // reclaims the mappings at exit.
             //
             // Skipped entirely when no read/canary gate is active:
-            // we only need bytes on the read or compare path, and
-            // pre-fetching would be wasted I/O otherwise.
-            let cached_bytes: Vec<Option<&'data [u8]>> = if gates.read || gates.canary {
-                parsed_input_objects
-                    .par_iter()
-                    .map(|obj| {
-                        let input_is_clean = match clean_input_paths {
-                            Some(clean) => {
-                                clean.contains(obj.parsed.input.file.filename.as_path())
+            // we only need cache files on the read or compare path,
+            // and pre-fetching would be wasted I/O otherwise.
+            let cached_views: Vec<Option<crate::parsed_input_cache::CacheView<'data>>> =
+                if gates.read || gates.canary {
+                    parsed_input_objects
+                        .par_iter()
+                        .map(|obj| {
+                            let input_is_clean = match clean_input_paths {
+                                Some(clean) => {
+                                    clean.contains(obj.parsed.input.file.filename.as_path())
+                                }
+                                None => false,
+                            };
+                            if !input_is_clean {
+                                return None;
                             }
-                            None => false,
-                        };
-                        if !input_is_clean {
-                            return None;
-                        }
-                        let m = herd.get();
-                        try_load_parsed_input_cache(obj, &m)
-                    })
-                    .collect()
-            } else {
-                vec![None; parsed_input_objects.len()]
-            };
+                            try_load_parsed_input_cache(obj)
+                        })
+                        .collect()
+                } else {
+                    (0..parsed_input_objects.len()).map(|_| None).collect()
+                };
 
             // Serial parse-or-replay loop. Builders returned here are
             // BUFFERED for a parallel write pass below — inlining
@@ -1823,7 +1820,7 @@ fn read_symbols_for_group<'data, P: Platform>(
                 &SequencedInputObject<'data, P>,
                 crate::parsed_input_cache::CacheBuilder,
             )> = Vec::new();
-            for (obj, cached) in parsed_input_objects.iter().zip(cached_bytes.iter()) {
+            for (obj, cached) in parsed_input_objects.iter().zip(cached_views.iter()) {
                 if let Some(builder) = run_object_parse_skip(
                     obj,
                     version_script,
@@ -1832,7 +1829,7 @@ fn read_symbols_for_group<'data, P: Platform>(
                     export_list,
                     output_kind,
                     gates,
-                    *cached,
+                    cached.as_ref(),
                 )? {
                     pending_writes.push((obj, builder));
                 }

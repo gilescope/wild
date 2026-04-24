@@ -41,11 +41,10 @@ use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Read the cache file for `input` (with optional `entry_id` for
-/// archive members) into an owned buffer, or return `None` if the file
-/// is missing, unreadable, schema-mismatched, or truncated. A bad
-/// cache must never prevent the link — callers fall through to the
-/// normal parse path.
+/// mmap-backed loader for the parse-skip read hot path. Returns a
+/// validated [`CacheView`] borrowing a leaked mmap; the slice is
+/// `'static` so the caller can downcast it to whatever per-link
+/// `'data` lifetime the rest of the symbol-load pipeline expects.
 ///
 /// Archive entry disambiguation: wild's inputs include `.rlib` archive
 /// members that share a filesystem path with their archive. Without an
@@ -53,19 +52,31 @@ use std::path::PathBuf;
 /// the same cache file; `entry_id` (typically the member's filename
 /// bytes from the archive header) disambiguates them.
 ///
-/// The returned buffer is allocated on the heap; because its pointer
-/// may not be 8-byte aligned (Rust's `Vec` guarantees at least
-/// `align_of::<u8>()`), `CacheView::from_bytes` validates alignment
-/// internally and rejects misaligned buffers. Production callers that
-/// need zero-copy should mmap the file and feed the mmap's page-aligned
-/// slice directly.
-pub(crate) fn try_load_cache(input: &Path, entry_id: Option<&[u8]>) -> Option<Vec<u8>> {
+/// Why leak: parsed name slices flow into the symbol DB and are
+/// retained for the entire link. wild is a one-shot CLI process, so
+/// "leaked" only means the kernel reclaims the mapping at exit
+/// instead of munmap'ing per file. The trade is one heap-Vec
+/// allocation + one arena memcpy avoided per cached input — on
+/// bevy-dylib that's 1649 saved copies. A bad cache must never
+/// prevent the link, so any I/O or validation failure returns
+/// `None` and the caller falls through to a re-parse.
+pub(crate) fn try_load_cache_view_mmap(
+    input: &Path,
+    entry_id: Option<&[u8]>,
+) -> Option<CacheView<'static>> {
     let path = cache_path_for_input(input, entry_id)?;
-    let bytes = std::fs::read(&path).ok()?;
-    // Validate before returning — saves an allocation-and-throw in the
-    // caller when the file was written by an older schema.
-    CacheView::from_bytes(&bytes)?;
-    Some(bytes)
+    let file = std::fs::File::open(&path).ok()?;
+    // SAFETY: the file is opened read-only and we're about to leak
+    // the mmap so it can never be mutated under our feet. The mmap
+    // outlives every borrow we hand out.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    // Leak the mmap so its bytes are 'static for the rest of the
+    // process. The Box wrapper is what we leak, not the kernel
+    // mapping itself — at process exit the kernel reclaims either
+    // way.
+    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+    let bytes: &'static [u8] = leaked.as_ref();
+    CacheView::from_bytes(bytes)
 }
 
 /// Locate the on-disk cache file for a given input. Returns
@@ -278,9 +289,9 @@ impl<'data> CacheView<'data> {
         (0..self.len()).filter_map(move |i| self.get(i))
     }
 
-    /// Raw bytes backing this view. Useful only for pass-through
-    /// tests that want to exercise `from_bytes` again.
-    #[cfg(test)]
+    /// Raw bytes backing this view. The canary path uses this to
+    /// byte-compare a freshly-built cache blob against the on-disk
+    /// copy without reconstructing it.
     pub(crate) fn as_bytes(&self) -> &'data [u8] {
         self.bytes
     }

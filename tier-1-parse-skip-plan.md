@@ -26,31 +26,41 @@ plan's ship criterion met.
 
 **Perf on bevy-dylib (total wall-clock):**
 
-| path   | before tier-1 | after tier-1 | delta |
-| ------ | -------------:| ------------:| -----:|
-| fresh  |        400 ms |       400 ms |     0 |
-| read   |             — |       420 ms |   +20 |
-| canary |             — |       640 ms |  +240 |
-| write  |             — |       500 ms |  +100 |
+| path   | before tier-1 | after tier-1 | post-mmap | delta vs cold |
+| ------ | -------------:| ------------:| ---------:| -------------:|
+| fresh  |        400 ms |       400 ms |    345 ms |             0 |
+| read   |             — |       420 ms |    370 ms |           +25 |
+| canary |             — |       640 ms |         — |          +240 |
+| write  |             — |       500 ms |         — |          +100 |
 
-The read path's 20 ms tax is ≤ the parse-phase win it delivers
-(13 ms replay vs 17 ms fresh parse); most of the Read-symbols
-saving survives into total wall-clock but gets offset by cache
-pre-fetch I/O. Canary and write modes carry extra overhead
-because they do additional work (compare + persist) on top of
-the parse. Total wall-clock is bounded by layout + write
-(~380 ms of untouched work) — tier-1 moves only the symbol-read
-phase; tier-2 + tier-3 exist to move the rest.
+The read path's tax dropped from +20 ms (fs::read, arena memcpy,
+triple validation) to +25 ms after the broader baseline shifted.
+On rust-analyzer-incremental (229 inputs) the tax is +10 ms.
+Total wall-clock is bounded by layout + write (~380 ms of
+untouched work) — tier-1 moves only the symbol-read phase;
+tier-2 + tier-3 exist to move the rest.
+
+**Where the read-path floor lives** (probed via `WILD_PROBE`):
+on bevy-dylib the prefetch sums to ~630 ms of CPU across 1649
+inputs; rayon parallelism brings that to ~80 ms wall but it
+overlaps with parse-side work elsewhere so the *visible* tax is
+~25 ms. The hot CPU is `mmap` itself — 1649 syscalls each pay
+the kernel's per-process VM-map lock. Within-group serial mmap
+is *slower* (tested: 380 vs 370 ms) because we lose the
+per-shard concurrency. The remaining lever is **bundling**: one
+cache file per output binary (indexed by input hash) replaces
+1649 mmap syscalls with one. That's a schema bump, parked as
+"tier-1.5".
 
 ## What's landed
 
-- Zero-copy on-disk format (`repr(C)` header + symbol array + names
++ Zero-copy on-disk format (`repr(C)` header + symbol array + names
   blob), mmap-compatible, schema v1.
-- `CacheView<'data>` reader + `CacheBuilder` writer with
++ `CacheView<'data>` reader + `CacheBuilder` writer with
   name-dedup.
-- `CacheBuilder::write_to(&Path)` (atomic tmp-and-rename).
-- `cache_path_for_input(&Path)` — `$XDG_CACHE_HOME/wild/parsed-inputs/<blake3>.wildpi`.
-- 12 unit tests: round-trip, name-dedup, bad-magic/schema, truncated,
++ `CacheBuilder::write_to(&Path)` (atomic tmp-and-rename).
++ `cache_path_for_input(&Path)` — `$XDG_CACHE_HOME/wild/parsed-inputs/<blake3>.wildpi`.
++ 12 unit tests: round-trip, name-dedup, bad-magic/schema, truncated,
   misaligned, unknown-kind, empty, zero-copy assertion, atomic write,
   path collision-freeness.
 
@@ -119,10 +129,10 @@ if let Some(cache_bytes) = try_load_cache(s.parsed.input.path()) {
 
 Under `WILD_INCREMENTAL_DEBUG=1`:
 
-- Write path: `TeeSink` wraps the default sink, `CacheBuilder`
++ Write path: `TeeSink` wraps the default sink, `CacheBuilder`
   captures the parse output, `write_to(cache_path_for_input(input))`
   at end.
-- Read path: only consume a cache file when the `.wild-hashes`
++ Read path: only consume a cache file when the `.wild-hashes`
   side-car reports the input clean. Otherwise fall through to
   re-parse (and refresh the cache from that parse).
 
@@ -157,13 +167,13 @@ them as equivalent.
 
 ## File layout the next session touches
 
-- `libwild/src/symbol_db.rs` — trait extraction + teeing sink.
-- `libwild/src/platform.rs` — default sink impl on the pair.
-- `libwild/src/input_data.rs` — mmap-hold for cache files.
-- `libwild/src/lib.rs` — gate, canary wiring.
-- `libwild/src/parsed_input_cache.rs` — maybe extend with
++ `libwild/src/symbol_db.rs` — trait extraction + teeing sink.
++ `libwild/src/platform.rs` — default sink impl on the pair.
++ `libwild/src/input_data.rs` — mmap-hold for cache files.
++ `libwild/src/lib.rs` — gate, canary wiring.
++ `libwild/src/parsed_input_cache.rs` — maybe extend with
   `try_load_cache(&Path) -> Option<Mmap>`.
-- `libwild/tests/incremental_parse_skip.rs` (new) — canary
++ `libwild/tests/incremental_parse_skip.rs` (new) — canary
   integration test.
 
 ## Measurement script
@@ -193,9 +203,9 @@ a bad binary.
 
 ## After tier-1
 
-- Tier 2 (sticky layout) is the next beat — persist section
++ Tier 2 (sticky layout) is the next beat — persist section
   offsets + symbol addresses, reuse for clean-input subsets.
-- Tier 3 (per-section memcpy skip) builds on tier-1's clean-input
++ Tier 3 (per-section memcpy skip) builds on tier-1's clean-input
   bit to skip content-addressed sections like `__cstring`.
-- Both need tier 1's per-input clean/dirty verdict to mean what
++ Both need tier 1's per-input clean/dirty verdict to mean what
   this module says it means. Ship that foundation first.

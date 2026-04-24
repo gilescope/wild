@@ -44,6 +44,82 @@ use crate::symbol_db::PendingVersionedSymbol;
 use crate::symbol_db::SymbolId;
 use crate::symbol_db::SymbolSink;
 use crate::value_flags::ValueFlags;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+/// Counters bumped by the tier-1 coordinator in `symbol_db.rs` as it
+/// walks per-group object inputs. Aggregated across rayon workers via
+/// `Relaxed` atomics — final-link reporting reads these on the main
+/// thread after all groups have finished, so there's no race on the
+/// observed totals.
+///
+/// Zeroed by [`reset_stats`] once per link. Currently exposed for the
+/// `WILD_INCREMENTAL_DEBUG=1` end-of-link summary; a future
+/// `--time-phase=incremental` would read the same counters.
+pub(crate) struct ParseSkipStats {
+    /// Inputs that replayed from cache and skipped parse entirely.
+    pub replayed: AtomicUsize,
+    /// Inputs that re-parsed (dirty, uncached, canary mode, or any
+    /// write path where replay wasn't eligible).
+    pub reparsed: AtomicUsize,
+    /// Cache files persisted on this link.
+    pub written: AtomicUsize,
+    /// Canary compares that passed (fresh == cached).
+    pub canary_matched: AtomicUsize,
+}
+
+impl ParseSkipStats {
+    const fn zero() -> Self {
+        Self {
+            replayed: AtomicUsize::new(0),
+            reparsed: AtomicUsize::new(0),
+            written: AtomicUsize::new(0),
+            canary_matched: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Per-process counters. A single linker invocation maps to one
+/// process so the static-global pattern is sound; users of
+/// `Linker::run` in-process across multiple links get cumulative
+/// totals, which matches the intent of `WILD_INCREMENTAL_DEBUG`'s
+/// existing per-link lines.
+pub(crate) static STATS: ParseSkipStats = ParseSkipStats::zero();
+
+/// Zero all counters. Called at the start of each link so debug
+/// output reflects only this link's activity.
+pub(crate) fn reset_stats() {
+    STATS.replayed.store(0, Ordering::Relaxed);
+    STATS.reparsed.store(0, Ordering::Relaxed);
+    STATS.written.store(0, Ordering::Relaxed);
+    STATS.canary_matched.store(0, Ordering::Relaxed);
+}
+
+/// Emit a terse one-line summary to stderr, matching the style of
+/// the other `wild incremental: …` lines already emitted under
+/// `WILD_INCREMENTAL_DEBUG=1`. Called from `lib.rs` after the link
+/// is done.
+pub(crate) fn maybe_report() {
+    let any_gate = std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+        || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some()
+        || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_some()
+        || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some()
+        || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some();
+    if !any_gate {
+        return;
+    }
+    let replayed = STATS.replayed.load(Ordering::Relaxed);
+    let reparsed = STATS.reparsed.load(Ordering::Relaxed);
+    let written = STATS.written.load(Ordering::Relaxed);
+    let canary_matched = STATS.canary_matched.load(Ordering::Relaxed);
+    if replayed == 0 && reparsed == 0 && written == 0 && canary_matched == 0 {
+        return;
+    }
+    eprintln!(
+        "wild parse-skip: {replayed} replayed, {reparsed} re-parsed, \
+         {written} written, {canary_matched} canary-matched",
+    );
+}
 
 /// Sink wrapper that forwards every op to `inner` and, when `cache` is
 /// `Some`, also records it into a [`CacheBuilder`]. Ownership of the
@@ -460,7 +536,7 @@ mod tests {
     }
 
     /// End-to-end: tee a stream into a cache, persist to a temp file,
-    /// reload via `try_load_cache`, replay through an Oracle, and
+    /// reload via `try_load_cache_view_mmap`, replay through an Oracle, and
     /// assert the replayed ops match what the Oracle would have seen
     /// during the original parse. Exercises the on-disk format, the
     /// tmp-and-rename write path, the alignment-tolerant load, and
