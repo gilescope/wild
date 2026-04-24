@@ -128,15 +128,35 @@ struct SymbolBucket<'data> {
 
 /// A global symbol that hasn't been put into our database yet.
 #[derive(Clone, Copy)]
-struct PendingSymbol<'data> {
+pub(crate) struct PendingSymbol<'data> {
     symbol_id: SymbolId,
     name: PreHashed<UnversionedSymbolName<'data>>,
 }
 
 #[derive(Clone, Copy)]
-struct PendingVersionedSymbol<'data> {
+pub(crate) struct PendingVersionedSymbol<'data> {
     symbol_id: SymbolId,
     name: PreHashed<VersionedSymbolName<'data>>,
+}
+
+impl<'data> PendingSymbol<'data> {
+    pub(crate) fn name(&self) -> &PreHashed<UnversionedSymbolName<'data>> {
+        &self.name
+    }
+
+    pub(crate) fn symbol_id(&self) -> SymbolId {
+        self.symbol_id
+    }
+}
+
+impl<'data> PendingVersionedSymbol<'data> {
+    pub(crate) fn name(&self) -> &PreHashed<VersionedSymbolName<'data>> {
+        &self.name
+    }
+
+    pub(crate) fn symbol_id(&self) -> SymbolId {
+        self.symbol_id
+    }
 }
 
 /// An ID for a symbol. All symbols from all input files are allocated a unique symbol ID. The
@@ -272,7 +292,7 @@ impl Iterator for SymbolIdRangeIterator {
     }
 }
 
-struct SymbolLoadOutputs<'data> {
+pub(crate) struct SymbolLoadOutputs<'data> {
     /// Pending non-versioned symbols, grouped by hash bucket.
     pending_symbols_by_bucket: Vec<PendingSymbolHashBucket<'data>>,
 }
@@ -1509,17 +1529,22 @@ fn read_symbols_for_group<'data, P: Platform>(
         pending_symbols_by_bucket: vec![PendingSymbolHashBucket::default(); num_buckets],
     };
 
-    match shard.group {
+    // Pull `group` out of the shard as a Copy ref before we hand the
+    // shard into the sink's &mut. Matching on `shard.group` after the
+    // sink owns &mut shard would conflict with the sink's reservation.
+    let group = shard.group;
+    let mut sink = DefaultSymbolSink::new(shard, &mut outputs);
+
+    match group {
         Group::Prelude(prelude) => {
-            prelude.load_symbols(shard, &mut outputs);
+            prelude.load_symbols(&mut sink);
         }
         Group::Objects(parsed_input_objects) => {
             for obj in *parsed_input_objects {
                 load_symbols_from_file(
                     obj,
                     version_script,
-                    shard,
-                    &mut outputs,
+                    &mut sink,
                     args,
                     export_list,
                     output_kind,
@@ -1529,7 +1554,7 @@ fn read_symbols_for_group<'data, P: Platform>(
         }
         Group::LinkerScripts(scripts) => {
             for script in scripts {
-                load_linker_script_symbols(script, shard, &mut outputs);
+                load_linker_script_symbols(script, &mut sink);
             }
         }
         Group::SyntheticSymbols(_) => {
@@ -1538,7 +1563,7 @@ fn read_symbols_for_group<'data, P: Platform>(
         #[cfg(feature = "plugins")]
         Group::LtoInputs(lto_objects) => {
             for obj in lto_objects {
-                load_lto_symbols(shard, &mut outputs, obj);
+                load_lto_symbols(&mut sink, obj);
             }
         }
     }
@@ -1547,25 +1572,24 @@ fn read_symbols_for_group<'data, P: Platform>(
 }
 
 #[cfg(feature = "plugins")]
-fn load_lto_symbols<'data, P: Platform>(
-    symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-    outputs: &mut SymbolLoadOutputs<'data>,
+fn load_lto_symbols<'data>(
+    sink: &mut dyn SymbolSink<'data>,
     obj: &crate::linker_plugins::LtoInput<'data>,
 ) {
     for (symbol_id, sym) in obj.symbols_iter() {
         if sym.is_definition() {
             if let Some(version) = sym.version {
-                outputs.add_versioned(PendingVersionedSymbol::from_prehashed(
+                sink.add_versioned(PendingVersionedSymbol::from_prehashed(
                     symbol_id,
                     UnversionedSymbolName::prehashed(sym.name.bytes()),
                     version,
                 ));
             } else {
-                outputs.add_non_versioned(PendingSymbol::new(symbol_id, sym.name.bytes()));
+                sink.add_non_versioned(PendingSymbol::new(symbol_id, sym.name.bytes()));
             }
-            symbols_out.set_next(ValueFlags::empty(), symbol_id, obj.file_id);
+            sink.set_next(ValueFlags::empty(), symbol_id, obj.file_id);
         } else {
-            symbols_out.set_next(ValueFlags::empty(), SymbolId::undefined(), obj.file_id);
+            sink.set_next(ValueFlags::empty(), SymbolId::undefined(), obj.file_id);
         }
     }
 }
@@ -1602,15 +1626,14 @@ fn populate_symbol_db<'data>(
     });
 }
 
-fn load_linker_script_symbols<'data, P: Platform>(
+fn load_linker_script_symbols<'data>(
     script: &SequencedLinkerScript<'data>,
-    symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-    outputs: &mut SymbolLoadOutputs<'data>,
+    sink: &mut dyn SymbolSink<'data>,
 ) {
     for (offset, definition) in script.parsed.symbol_defs.iter().enumerate() {
         let symbol_id = script.symbol_id_range.offset_to_id(offset);
 
-        outputs.add_non_versioned(PendingSymbol::from_prehashed(
+        sink.add_non_versioned(PendingSymbol::from_prehashed(
             symbol_id,
             PreHashed::new(
                 UnversionedSymbolName::new(definition.name),
@@ -1624,27 +1647,23 @@ fn load_linker_script_symbols<'data, P: Platform>(
         if definition.is_hidden {
             flags |= ValueFlags::DOWNGRADE_TO_LOCAL;
         }
-        symbols_out.set_next(flags, symbol_id, script.file_id);
+        sink.set_next(flags, symbol_id, script.file_id);
     }
 }
 
 fn load_symbols_from_file<'data, P: Platform>(
     s: &SequencedInputObject<'data, P>,
     version_script: &VersionScript,
-    symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-    outputs: &mut SymbolLoadOutputs<'data>,
+    sink: &mut dyn SymbolSink<'data>,
     args: &P::Args,
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
 ) -> Result {
     if s.is_dynamic() {
-        DynamicObjectSymbolLoader::new(&s.parsed.object)?.load_symbols(
-            s.file_id,
-            symbols_out,
-            outputs,
-        )
+        DynamicObjectSymbolLoader::<'_, 'data, P>::new(&s.parsed.object)?
+            .load_symbols(s.file_id, sink)
     } else {
-        RegularObjectSymbolLoader {
+        RegularObjectSymbolLoader::<'_, 'data, P> {
             object: &s.parsed.object,
             args,
             version_script,
@@ -1653,11 +1672,11 @@ fn load_symbols_from_file<'data, P: Platform>(
             export_list,
             output_kind,
         }
-        .load_symbols(s.file_id, symbols_out, outputs)
+        .load_symbols(s.file_id, sink)
     }
 }
 
-struct SymbolWriterShard<'out, 'group, 'data, P: Platform> {
+pub(crate) struct SymbolWriterShard<'out, 'group, 'data, P: Platform> {
     group: &'group Group<'data, P>,
     resolutions: sharded_vec_writer::Shard<'out, SymbolId>,
     flags: sharded_vec_writer::Shard<'out, RawFlags>,
@@ -1674,29 +1693,82 @@ impl<'out, 'group, 'data, P: Platform> SymbolWriterShard<'out, 'group, 'data, P>
     }
 }
 
+/// Abstraction over "where the symbol-load loop puts its outputs". The
+/// original loop wrote directly into a `SymbolWriterShard` + a
+/// `SymbolLoadOutputs` pair; the trait makes that call-path pluggable so
+/// tier-1 incremental linking can tee symbols into a `CacheBuilder`
+/// (write path) or replay them from a `CacheView` (read path) without
+/// touching the object-crate iteration logic.
+///
+/// Implementations must keep `next_symbol_id` equal to the `symbol_id`
+/// assigned by the next `set_next` call — mirrors
+/// `SymbolWriterShard::next`.
+pub(crate) trait SymbolSink<'data> {
+    fn next_symbol_id(&self) -> SymbolId;
+    fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId);
+    fn add_non_versioned(&mut self, pending: PendingSymbol<'data>);
+    fn add_versioned(&mut self, pending: PendingVersionedSymbol<'data>);
+}
+
+/// The production sink — forwards every call directly into the
+/// (shard, outputs) pair. Represents the original pre-trait behaviour
+/// and always lives behind a `&mut` in the hot path, so the vtable
+/// dispatch cost is a single indirect call per symbol (~1 ns on
+/// aarch64, lost in the object-crate iteration noise).
+pub(crate) struct DefaultSymbolSink<'a, 'out, 'group, 'data, P: Platform> {
+    shard: &'a mut SymbolWriterShard<'out, 'group, 'data, P>,
+    outputs: &'a mut SymbolLoadOutputs<'data>,
+}
+
+impl<'a, 'out, 'group, 'data, P: Platform> DefaultSymbolSink<'a, 'out, 'group, 'data, P> {
+    pub(crate) fn new(
+        shard: &'a mut SymbolWriterShard<'out, 'group, 'data, P>,
+        outputs: &'a mut SymbolLoadOutputs<'data>,
+    ) -> Self {
+        Self { shard, outputs }
+    }
+}
+
+impl<'data, P: Platform> SymbolSink<'data> for DefaultSymbolSink<'_, '_, '_, 'data, P> {
+    fn next_symbol_id(&self) -> SymbolId {
+        self.shard.next
+    }
+
+    fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId) {
+        self.shard.set_next(flags, resolution, file_id);
+    }
+
+    fn add_non_versioned(&mut self, pending: PendingSymbol<'data>) {
+        self.outputs.add_non_versioned(pending);
+    }
+
+    fn add_versioned(&mut self, pending: PendingVersionedSymbol<'data>) {
+        self.outputs.add_versioned(pending);
+    }
+}
+
 trait SymbolLoader<'data, P: Platform> {
     fn load_symbols(
         &self,
         file_id: FileId,
-        symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-        outputs: &mut SymbolLoadOutputs<'data>,
+        sink: &mut dyn SymbolSink<'data>,
     ) -> Result {
-        let base_symbol_id = symbols_out.next;
+        let base_symbol_id = sink.next_symbol_id();
 
         for symbol in self.object().symbols_iter() {
-            let symbol_id = symbols_out.next;
+            let symbol_id = sink.next_symbol_id();
             let mut flags = self.compute_value_flags(symbol);
             let local_index = symbol_id.offset_from(base_symbol_id);
 
             if symbol.is_undefined() || self.should_ignore_symbol(symbol) {
-                symbols_out.set_next(flags, SymbolId::undefined(), file_id);
+                sink.set_next(flags, SymbolId::undefined(), file_id);
                 continue;
             }
 
             let resolution = symbol_id;
 
             if symbol.is_local() {
-                symbols_out.set_next(flags, resolution, file_id);
+                sink.set_next(flags, resolution, file_id);
                 continue;
             }
 
@@ -1717,15 +1789,15 @@ trait SymbolLoader<'data, P: Platform> {
 
             if info.is_default() {
                 let pending = PendingSymbol::from_prehashed(symbol_id, name);
-                outputs.add_non_versioned(pending);
+                sink.add_non_versioned(pending);
             }
 
             if let Some(version) = info.version_name() {
                 let pending = PendingVersionedSymbol::from_prehashed(symbol_id, name, version);
-                outputs.add_versioned(pending);
+                sink.add_versioned(pending);
             }
 
-            symbols_out.set_next(flags, resolution, file_id);
+            sink.set_next(flags, resolution, file_id);
         }
 
         Ok(())
@@ -2031,19 +2103,15 @@ impl TryFrom<usize> for SymbolId {
 }
 
 impl<'data> Prelude<'data> {
-    fn load_symbols<P: Platform>(
-        &self,
-        symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-        outputs: &mut SymbolLoadOutputs<'data>,
-    ) {
+    fn load_symbols(&self, sink: &mut dyn SymbolSink<'data>) {
         for definition in &self.symbol_definitions {
-            let symbol_id = symbols_out.next;
+            let symbol_id = sink.next_symbol_id();
             let mut flags = match definition.placement {
                 SymbolPlacement::Undefined
                 | SymbolPlacement::ForceUndefined
                 | SymbolPlacement::ImportDynamicSymbol => ValueFlags::ABSOLUTE,
                 SymbolPlacement::DefsymAbsolute(_) => {
-                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
+                    sink.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
                     ValueFlags::NON_INTERPOSABLE | ValueFlags::ABSOLUTE
                 }
                 SymbolPlacement::SectionStart(_)
@@ -2051,14 +2119,14 @@ impl<'data> Prelude<'data> {
                 | SymbolPlacement::SectionGroupEnd(_)
                 | SymbolPlacement::DefsymSymbol(_, _)
                 | SymbolPlacement::LoadBaseAddress => {
-                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
+                    sink.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
                     ValueFlags::NON_INTERPOSABLE
                 }
             };
             if definition.is_hidden {
                 flags |= ValueFlags::DOWNGRADE_TO_LOCAL;
             }
-            symbols_out.set_next(flags, symbol_id, PRELUDE_FILE_ID);
+            sink.set_next(flags, symbol_id, PRELUDE_FILE_ID);
         }
     }
 }
@@ -2089,11 +2157,11 @@ impl InternalSymDefInfo<'_> {
 }
 
 impl<'data> PendingSymbol<'data> {
-    fn new(symbol_id: SymbolId, name: &'data [u8]) -> PendingSymbol<'data> {
+    pub(crate) fn new(symbol_id: SymbolId, name: &'data [u8]) -> PendingSymbol<'data> {
         Self::from_prehashed(symbol_id, UnversionedSymbolName::prehashed(name))
     }
 
-    fn from_prehashed(
+    pub(crate) fn from_prehashed(
         symbol_id: SymbolId,
         name: PreHashed<UnversionedSymbolName<'data>>,
     ) -> PendingSymbol<'data> {
@@ -2102,7 +2170,7 @@ impl<'data> PendingSymbol<'data> {
 }
 
 impl<'data> PendingVersionedSymbol<'data> {
-    fn from_prehashed(
+    pub(crate) fn from_prehashed(
         symbol_id: SymbolId,
         name: PreHashed<UnversionedSymbolName<'data>>,
         version: &'data [u8],
