@@ -4,6 +4,27 @@
 the storage layer (`libwild/src/parsed_input_cache.rs`) is ready,
 nothing consumes it yet. This doc is the next session's spec.*
 
+## Status (2026-04-24, post-integration)
+
+Infrastructure shipped across 4 commits (`f0120e6` refactor →
+`87ef10a` write path → `bd38941` read + canary → `33a3b43`
+wild-hashes gating). **Canary session 1 of 3: green on all
+plan-specified test sets:**
+
+| input set       | cache entries | canary (3 runs)          |
+| --------------- | ------------: | ------------------------ |
+| rust-hello-world |           403 | clean                    |
+| bevy-dylib      |          1649 | clean                    |
+| ripgrep         |         (~300) | clean                    |
+| rust-analyzer   |       (large) | clean                    |
+
+The v1 schema is lossless for Mach-O symbol streams in practice.
+
+Speed note: read-path timing on the measured links is roughly
+wash with fresh parse (cache I/O + clean-set hashing overhead
+cancels the symbol-parse saving on these inputs). The win is
+correctness + foundation for tier-2; speed-tuning is a follow-up.
+
 ## What's landed
 
 - Zero-copy on-disk format (`repr(C)` header + symbol array + names
