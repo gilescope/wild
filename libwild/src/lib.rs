@@ -480,11 +480,21 @@ impl Linker {
         let mut symbol_db = symbol_db::SymbolDb::new(args, output_kind, &auxiliary, &self.herd)?;
         let mut per_symbol_flags = PerSymbolFlags::new();
 
+        // Tier-1 parse-skip gating: classify each input as clean (its
+        // on-disk bytes fingerprint matches the last link's
+        // .wild-hashes side-car) so the replay / canary paths only
+        // engage for inputs that are actually reusable. Built once
+        // per link and threaded through add_inputs → read_symbols →
+        // run_object_parse_skip; None when no parse-skip gate is
+        // active so the hashing cost vanishes on normal links.
+        let clean_input_paths = compute_clean_input_paths::<P>(file_loader, args);
+
         symbol_db.add_inputs(
             &mut per_symbol_flags,
             &mut output_sections,
             &mut layout_rules_builder,
             loaded,
+            clean_input_paths.as_ref(),
         )?;
 
         // TODO: Doing this here means that we can't wrap symbols produced by the linker plugin.
@@ -683,6 +693,61 @@ fn try_whole_link_skip<P: Platform>(file_loader: &FileLoader<'_>, args: &P::Args
             false
         }
     }
+}
+
+/// Build a set of input paths whose content bytes fingerprint to the
+/// same value they had at the last link — i.e. *safe to replay from
+/// cache* under the tier-1 parse-skip read path. Mirrors
+/// `classify_dirty`'s logic but returns the complement (clean rather
+/// than dirty) and keyed by PathBuf for O(1) lookup during
+/// `run_object_parse_skip`.
+///
+/// Returns `None` when no parse-skip gate is active — skips the
+/// hashing work entirely on default-off links. Returns `Some(empty)`
+/// when gates are active but there's no prior cache on disk, which
+/// treats every input as dirty (the safe default — a first-link run
+/// populates caches; subsequent runs can replay).
+///
+/// Archive members inherit their parent `.rlib`'s verdict because
+/// `.wild-hashes` tracks whole-file fingerprints: a clean `.rlib`
+/// means every member is cacheable; a dirty one forces a re-parse of
+/// all members.
+fn compute_clean_input_paths<P: Platform>(
+    file_loader: &FileLoader<'_>,
+    args: &P::Args,
+) -> Option<std::collections::HashSet<std::path::PathBuf>> {
+    // Fast path: no gate active → don't hash inputs at all.
+    let canary = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some();
+    let read = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some();
+    if !canary && !read {
+        return None;
+    }
+
+    let inputs: Vec<(&std::path::Path, &[u8])> = file_loader
+        .loaded_files
+        .iter()
+        .map(|f| (f.filename.as_path(), f.data()))
+        .collect();
+    let current_inputs = incremental_cache::hash_loaded_inputs(inputs);
+
+    let hashes_path = incremental_cache::hashes_path_for_output(args.output());
+    let Some(cached) = incremental_cache::read_link_cache(&hashes_path) else {
+        // No prior link cache → every input is dirty. Returning an
+        // empty set (rather than None) keeps callers on the
+        // dirty-by-default branch without forcing an extra
+        // is-gate-active check.
+        return Some(std::collections::HashSet::new());
+    };
+
+    let mut clean = std::collections::HashSet::with_capacity(current_inputs.len());
+    for (path, hash) in &current_inputs {
+        if let Some(cached_hash) = cached.inputs.get(path)
+            && cached_hash == hash
+        {
+            clean.insert(path.clone());
+        }
+    }
+    Some(clean)
 }
 
 /// Persist this link's signature next to the output binary so the

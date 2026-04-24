@@ -408,6 +408,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         output_sections: &mut OutputSections<'data, P>,
         layout_rules_builder: &mut LayoutRulesBuilder<'data>,
         loaded: LoadedInputs<'data, P>,
+        clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     ) -> Result {
         timing_phase!("Load inputs into symbol DB");
 
@@ -461,6 +462,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             &self.export_list,
             self.output_kind,
             self.herd,
+            clean_input_paths,
         )?;
 
         populate_symbol_db(&mut self.buckets, &per_group_outputs);
@@ -1493,6 +1495,7 @@ fn read_symbols<'data, P: Platform>(
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
     herd: &'data bumpalo_herd::Herd,
+    clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> Result<Vec<SymbolLoadOutputs<'data>>> {
     timing_phase!("Read symbols");
 
@@ -1509,6 +1512,7 @@ fn read_symbols<'data, P: Platform>(
                 args,
                 output_kind,
                 herd,
+                clean_input_paths,
             )
         })
         .collect::<Result<Vec<SymbolLoadOutputs>>>()
@@ -1655,14 +1659,28 @@ fn run_object_parse_skip<'data, P: Platform>(
     output_kind: OutputKind,
     gates: ParseSkipGates,
     allocator: Option<&bumpalo_herd::Member<'data>>,
+    clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> Result {
-    // READ path (no canary): if a cache exists, replay and skip the
-    // parse entirely. The replay produces identical (shard, outputs)
-    // effects to the parse — under canary the shapes are verified
-    // byte-for-byte against the parse; outside canary the user takes
-    // on trust that their cache is current (see plan).
+    // Decide once whether cache I/O is safe for THIS input. The
+    // `.wild-hashes` side-car reports whether the input's content
+    // matches the last link's; if the user hasn't populated a
+    // wild-hashes verdict, `clean_input_paths` is `None` and we must
+    // treat every input as dirty (the stricter choice — a stale
+    // cache could silently miscompile). Archive members inherit
+    // their parent archive's verdict: the side-car tracks whole
+    // files, so a clean `.rlib` makes every member cacheable.
+    let input_is_clean = match clean_input_paths {
+        Some(clean) => clean.contains(obj.parsed.input.file.filename.as_path()),
+        None => false,
+    };
+
+    // READ path (no canary): if the input is clean AND a cache
+    // exists, replay and skip the parse entirely. The clean-bit is
+    // what makes this safe — without it, a stale cache could feed
+    // the linker out-of-date symbol info.
     if gates.read
         && !gates.canary
+        && input_is_clean
         && let Some(alloc) = allocator
         && let Some(arena_bytes) = try_load_parsed_input_cache(obj, alloc)
         && let Some(view) = crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)
@@ -1697,11 +1715,12 @@ fn run_object_parse_skip<'data, P: Platform>(
         return Ok(());
     };
 
-    // CANARY: compare the freshly-built cache bytes against the
-    // on-disk cache. Any divergence is a schema or staleness bug —
-    // better to panic with a clear pointer than to silently ship a
-    // wrong binary.
+    // CANARY: only compare when the input is clean — a dirty input's
+    // on-disk cache is from the PREVIOUS content and a mismatch would
+    // be the expected result of that change, not a schema bug. Skipping
+    // dirty compares keeps the canary's panic a true signal.
     if gates.canary
+        && input_is_clean
         && let Some(alloc) = allocator
         && let Some(disk_bytes) = try_load_parsed_input_cache(obj, alloc)
     {
@@ -1761,6 +1780,7 @@ fn read_symbols_for_group<'data, P: Platform>(
     args: &P::Args,
     output_kind: OutputKind,
     herd: &'data bumpalo_herd::Herd,
+    clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
 ) -> Result<SymbolLoadOutputs<'data>> {
     verbose_timing_phase!(
         "Read group symbols",
@@ -1795,6 +1815,7 @@ fn read_symbols_for_group<'data, P: Platform>(
                     output_kind,
                     gates,
                     allocator.as_ref(),
+                    clean_input_paths,
                 )?;
             }
         }
