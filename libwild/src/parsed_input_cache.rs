@@ -290,6 +290,7 @@ impl<'data> CacheView<'data> {
 /// a single `Vec<u8>` ready for `write`. Callers are responsible
 /// for atomically replacing the old cache file (write-to-tmp,
 /// rename) to avoid torn reads under racing links.
+#[derive(Clone)]
 pub(crate) struct CacheBuilder {
     entries: Vec<CachedSymbol>,
     names: Vec<u8>,
@@ -343,6 +344,15 @@ impl CacheBuilder {
         let tmp = path.with_extension("wildpi.tmp");
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, path)
+    }
+
+    /// Serialise the cache WITHOUT consuming the builder. Used by the
+    /// canary path, which needs to hold on to the bytes for an
+    /// in-memory compare AND the bytes to persist afterwards. Has the
+    /// same complexity as `finish()` — just clones out the inner
+    /// vectors first. Not a hot path.
+    pub(crate) fn clone_bytes(&self) -> Vec<u8> {
+        self.clone().finish()
     }
 
     pub(crate) fn finish(self) -> Vec<u8> {

@@ -460,6 +460,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             self.args,
             &self.export_list,
             self.output_kind,
+            self.herd,
         )?;
 
         populate_symbol_db(&mut self.buckets, &per_group_outputs);
@@ -1491,6 +1492,7 @@ fn read_symbols<'data, P: Platform>(
     args: &P::Args,
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
+    herd: &'data bumpalo_herd::Herd,
 ) -> Result<Vec<SymbolLoadOutputs<'data>>> {
     timing_phase!("Read symbols");
 
@@ -1506,22 +1508,57 @@ fn read_symbols<'data, P: Platform>(
                 num_buckets,
                 args,
                 output_kind,
+                herd,
             )
         })
         .collect::<Result<Vec<SymbolLoadOutputs>>>()
 }
 
-/// Env-var gate for tier-1 incremental-link parse-skip cache WRITES.
-/// `WILD_INCREMENTAL_PARSE_SKIP=1` (or `WILD_INCREMENTAL_DEBUG=1` as an
-/// umbrella covering every incremental feature) opts in. The gate is
-/// checked once per group so repeated env lookups don't appear in the
-/// per-symbol hot path — the cost is one `getenv` per `.rlib` / `.o`
-/// (microseconds, bounded by input count).
+/// Env-var gates for tier-1 incremental-link parse-skip. Three
+/// independent axes:
 ///
-/// Default off. See `tier-1-parse-skip-plan.md`.
-fn parse_skip_write_enabled() -> bool {
-    std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some()
-        || std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+/// * `WILD_INCREMENTAL_PARSE_SKIP_WRITE=1` (alias: `WILD_INCREMENTAL_PARSE_SKIP=1`) —
+///   tee every parse into an on-disk cache file. Safe: writes are
+///   best-effort side-car files that can't affect link correctness.
+/// * `WILD_INCREMENTAL_PARSE_SKIP_CANARY=1` — ALSO load any existing
+///   cache for each input, freshly-build a cache from the live parse,
+///   and compare them byte-for-byte. Any divergence panics the link
+///   with a clear diagnostic. Implies write (a successful canary
+///   refreshes the disk cache). Intended for CI + dev canary runs.
+/// * `WILD_INCREMENTAL_PARSE_SKIP_READ=1` — SKIP the parse entirely
+///   when a cache exists, replaying the cached symbol stream. Only
+///   safe once the canary has been green across the relevant input
+///   set; wild itself never enables this implicitly.
+///
+/// Checked once per group (not per symbol) so the env lookups don't
+/// pollute the hot path.
+#[derive(Clone, Copy)]
+struct ParseSkipGates {
+    write: bool,
+    canary: bool,
+    read: bool,
+}
+
+impl ParseSkipGates {
+    fn from_env() -> Self {
+        let canary = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some();
+        let read = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some();
+        let write_explicit = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some();
+        // Canary implies write so the on-disk cache stays fresh after
+        // a clean compare. Read implies write for the same reason —
+        // a cache miss should populate the cache for next time.
+        let write = write_explicit || canary || read;
+        Self {
+            write,
+            canary,
+            read,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.write || self.canary || self.read
+    }
 }
 
 /// Persist a freshly-captured [`CacheBuilder`] next to the input it
@@ -1558,6 +1595,164 @@ fn write_parsed_input_cache<'data, P: Platform>(
     let _ = builder.write_to(&cache_path);
 }
 
+/// Copy `src` into an 8-byte-aligned allocation inside the bumpalo
+/// member's arena. Returns the resulting slice with the arena's
+/// lifetime. The alignment matches [`parsed_input_cache::CacheView`]'s
+/// requirement so the returned slice can feed `CacheView::from_bytes`
+/// without a second copy.
+fn alloc_cache_slice<'h>(src: &[u8], m: &bumpalo_herd::Member<'h>) -> &'h [u8] {
+    let layout = std::alloc::Layout::from_size_align(src.len().max(1), 8)
+        .expect("cache size within isize::MAX");
+    let ptr = m.alloc_layout(layout);
+    // SAFETY: `ptr` points to `src.len().max(1)` freshly-allocated,
+    // 8-byte-aligned bytes with the member's lifetime; `src` is a
+    // valid non-overlapping source of length `src.len()`. We copy
+    // only `src.len()` bytes, then read back the same range.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.as_ptr(), src.len());
+        std::slice::from_raw_parts(ptr.as_ptr() as *const u8, src.len())
+    }
+}
+
+/// Try to load + validate a cache for `obj` into the arena, returning
+/// a byte slice with the arena's 'data lifetime ready for
+/// `CacheView::from_bytes`. `None` on cache miss or any validation
+/// failure — caller falls through to the re-parse path.
+fn try_load_parsed_input_cache<'data, P: Platform>(
+    obj: &SequencedInputObject<'data, P>,
+    allocator: &bumpalo_herd::Member<'data>,
+) -> Option<&'data [u8]> {
+    let path = obj.parsed.input.file.filename.as_path();
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let entry_id = obj
+        .parsed
+        .input
+        .entry
+        .as_ref()
+        .map(|e| e.identifier.as_slice());
+    let disk_bytes = crate::parsed_input_cache::try_load_cache(path, entry_id)?;
+    let arena_bytes = alloc_cache_slice(&disk_bytes, allocator);
+    // Re-validate from the arena slice — `try_load_cache` already
+    // validated against its own Vec<u8>, but the alignment guarantees
+    // are only honoured by the arena copy.
+    crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)?;
+    Some(arena_bytes)
+}
+
+/// Orchestrates read / canary / write for a single object input. The
+/// combined logic lives here so the call-site in
+/// `read_symbols_for_group` stays a single line and the gates-driven
+/// branching is easy to audit.
+#[allow(clippy::too_many_arguments)]
+fn run_object_parse_skip<'data, P: Platform>(
+    obj: &SequencedInputObject<'data, P>,
+    version_script: &VersionScript,
+    sink: &mut DefaultSymbolSink<'_, '_, '_, 'data, P>,
+    args: &P::Args,
+    export_list: &Option<ExportList<'data>>,
+    output_kind: OutputKind,
+    gates: ParseSkipGates,
+    allocator: Option<&bumpalo_herd::Member<'data>>,
+) -> Result {
+    // READ path (no canary): if a cache exists, replay and skip the
+    // parse entirely. The replay produces identical (shard, outputs)
+    // effects to the parse — under canary the shapes are verified
+    // byte-for-byte against the parse; outside canary the user takes
+    // on trust that their cache is current (see plan).
+    if gates.read
+        && !gates.canary
+        && let Some(alloc) = allocator
+        && let Some(arena_bytes) = try_load_parsed_input_cache(obj, alloc)
+        && let Some(view) = crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)
+    {
+        crate::parse_skip::replay_cached_symbols(&view, obj.file_id, sink);
+        return Ok(());
+    }
+
+    // Parse normally. Under write/canary, tee into a fresh
+    // CacheBuilder; its bytes become both the canary's reference and
+    // the persisted cache.
+    let mut tee = crate::parse_skip::TeeSink::new(
+        sink as &mut dyn SymbolSink<'data>,
+        if gates.write {
+            Some(crate::parsed_input_cache::CacheBuilder::default())
+        } else {
+            None
+        },
+    );
+
+    load_symbols_from_file(
+        obj,
+        version_script,
+        &mut tee,
+        args,
+        export_list,
+        output_kind,
+    )
+    .with_context(|| format!("Failed to load symbols from `{}`", obj.parsed.input))?;
+
+    let Some(builder) = tee.take_cache() else {
+        return Ok(());
+    };
+
+    // CANARY: compare the freshly-built cache bytes against the
+    // on-disk cache. Any divergence is a schema or staleness bug —
+    // better to panic with a clear pointer than to silently ship a
+    // wrong binary.
+    if gates.canary
+        && let Some(alloc) = allocator
+        && let Some(disk_bytes) = try_load_parsed_input_cache(obj, alloc)
+    {
+        let fresh_bytes = builder.clone_bytes();
+        if fresh_bytes != disk_bytes {
+            panic_canary_diff(obj, &fresh_bytes, disk_bytes);
+        }
+    }
+
+    // WRITE: persist the fresh cache (overwrites any stale copy so
+    // next link's canary / read path gets the current stream).
+    write_parsed_input_cache(obj, builder);
+
+    Ok(())
+}
+
+/// Emit a rustc-style diff between the freshly-parsed stream and the
+/// on-disk cache, then panic. Called only under canary mode, at the
+/// first point of divergence per-input. Intentionally chatty — this
+/// message is what alerts CI / dev to a broken cache invariant.
+fn panic_canary_diff<'data, P: Platform>(
+    obj: &SequencedInputObject<'data, P>,
+    fresh: &[u8],
+    disk: &[u8],
+) {
+    let path = obj.parsed.input.file.filename.as_path().display();
+    let entry = obj
+        .parsed
+        .input
+        .entry
+        .as_ref()
+        .map(|e| String::from_utf8_lossy(e.identifier.as_slice()).into_owned())
+        .unwrap_or_default();
+    panic!(
+        "wild parse-skip canary mismatch for `{path}`{entry_tag}:\n  \
+         fresh parse emitted {fresh_len} bytes\n  \
+         cached file holds  {disk_len} bytes\n\
+         This indicates the parsed-input cache format cannot round-trip \
+         this input losslessly (or the on-disk cache is stale). Delete \
+         ~/.cache/wild/parsed-inputs/ to force a refresh and retry; if \
+         it reproduces, the schema needs a bump.",
+        entry_tag = if entry.is_empty() {
+            String::new()
+        } else {
+            format!(" (archive entry `{entry}`)")
+        },
+        fresh_len = fresh.len(),
+        disk_len = disk.len(),
+    );
+}
+
 fn read_symbols_for_group<'data, P: Platform>(
     shard: &mut SymbolWriterShard<'_, '_, 'data, P>,
     version_script: &VersionScript,
@@ -1565,6 +1760,7 @@ fn read_symbols_for_group<'data, P: Platform>(
     num_buckets: usize,
     args: &P::Args,
     output_kind: OutputKind,
+    herd: &'data bumpalo_herd::Herd,
 ) -> Result<SymbolLoadOutputs<'data>> {
     verbose_timing_phase!(
         "Read group symbols",
@@ -1587,45 +1783,19 @@ fn read_symbols_for_group<'data, P: Platform>(
             prelude.load_symbols(&mut sink);
         }
         Group::Objects(parsed_input_objects) => {
-            let parse_skip_writes = parse_skip_write_enabled();
+            let gates = ParseSkipGates::from_env();
+            let allocator = gates.any().then(|| herd.get());
             for obj in *parsed_input_objects {
-                if parse_skip_writes {
-                    // Tee the parse into a CacheBuilder so the next
-                    // link can replay the symbol stream instead of
-                    // re-iterating the object crate. Cache write is
-                    // best-effort: any IO error is ignored — a stale
-                    // cache can never fail the link.
-                    let mut tee = crate::parse_skip::TeeSink::new(
-                        &mut sink as &mut dyn SymbolSink<'data>,
-                        Some(crate::parsed_input_cache::CacheBuilder::default()),
-                    );
-                    load_symbols_from_file(
-                        obj,
-                        version_script,
-                        &mut tee,
-                        args,
-                        export_list,
-                        output_kind,
-                    )
-                    .with_context(|| {
-                        format!("Failed to load symbols from `{}`", obj.parsed.input)
-                    })?;
-                    if let Some(builder) = tee.take_cache() {
-                        write_parsed_input_cache(obj, builder);
-                    }
-                } else {
-                    load_symbols_from_file(
-                        obj,
-                        version_script,
-                        &mut sink,
-                        args,
-                        export_list,
-                        output_kind,
-                    )
-                    .with_context(|| {
-                        format!("Failed to load symbols from `{}`", obj.parsed.input)
-                    })?;
-                }
+                run_object_parse_skip(
+                    obj,
+                    version_script,
+                    &mut sink,
+                    args,
+                    export_list,
+                    output_kind,
+                    gates,
+                    allocator.as_ref(),
+                )?;
             }
         }
         Group::LinkerScripts(scripts) => {

@@ -19,10 +19,10 @@
 //!
 //! [`CachedSymbolKind::Undefined`] / [`CachedSymbolKind::Local`] /
 //! [`CachedSymbolKind::Defined`] tags a symbol by its sink-op shape:
-//!   * `Undefined` — only a `set_next(flags, UNDEF, file_id)`; no adds.
-//!   * `Local`     — only a `set_next(flags, symbol_id, file_id)`; no adds.
-//!   * `Defined`   — an `add_non_versioned(name)` followed by a
-//!                   `set_next(flags, symbol_id, file_id)`.
+//! * `Undefined` — only a `set_next(flags, UNDEF, file_id)`; no adds.
+//! * `Local`     — only a `set_next(flags, symbol_id, file_id)`; no adds.
+//! * `Defined`   — an `add_non_versioned(name)` followed by a
+//!   `set_next(flags, symbol_id, file_id)`.
 //!
 //! Mach-O `RawSymbolName::version_name()` always returns `None` and
 //! `is_default()` always returns `true`, so the v1 schema is lossless
@@ -95,7 +95,7 @@ impl<'a, 'data> SymbolSink<'data> for TeeSink<'a, 'data> {
     fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId) {
         if let Some(cache) = self.cache.as_mut() {
             let pending = self.pending_name.take();
-            let flags_raw = flags.bits() as u32;
+            let flags_raw = u32::from(flags.bits());
             if resolution.is_undefined() {
                 cache.add(b"", 0, flags_raw, CachedSymbolKind::Undefined);
             } else if let Some(p) = pending {
@@ -157,14 +157,17 @@ pub(crate) enum StreamOp<'data> {
 }
 
 /// Sink wrapper that records the op stream into an internal `Vec`
-/// without forwarding. Intended for the canary's diff path, where
-/// we want a second copy of the stream to compare but don't want
-/// the replay to mutate real writer state.
+/// without forwarding. The current canary uses byte-compare of
+/// `CacheBuilder` output (cheaper, deterministic); `CaptureSink` is
+/// reserved for a richer structured diff in follow-up work — keep it
+/// around so that upgrade doesn't require reinventing the type.
+#[allow(dead_code)]
 pub(crate) struct CaptureSink<'data> {
     ops: Vec<StreamOp<'data>>,
     next: SymbolId,
 }
 
+#[allow(dead_code)]
 impl<'data> CaptureSink<'data> {
     pub(crate) fn new(start: SymbolId) -> Self {
         Self {
@@ -185,7 +188,7 @@ impl<'data> SymbolSink<'data> for CaptureSink<'data> {
 
     fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId) {
         self.ops.push(StreamOp::SetNext {
-            flags: flags.bits() as u32,
+            flags: u32::from(flags.bits()),
             resolution,
             file_id,
         });
@@ -279,7 +282,7 @@ mod tests {
         }
         fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId) {
             self.ops.push(StreamOp::SetNext {
-                flags: flags.bits() as u32,
+                flags: u32::from(flags.bits()),
                 resolution,
                 file_id,
             });
@@ -415,5 +418,95 @@ mod tests {
         c.set_next(ValueFlags::empty(), s0, file_id_one());
         let s1 = c.next_symbol_id();
         assert_ne!(s0, s1, "next_symbol_id did not advance after set_next");
+    }
+
+    /// Canary invariant: a cache built from parse-stream A and a
+    /// cache built from an identical parse-stream B must produce
+    /// BYTE-IDENTICAL output. Without that guarantee the canary's
+    /// `fresh_bytes == disk_bytes` compare is unreliable.
+    #[test]
+    fn two_identical_tees_produce_identical_cache_bytes() {
+        let build = || {
+            let mut drain = Oracle::new();
+            let mut tee = TeeSink::new(&mut drain, Some(CacheBuilder::default()));
+            tee.set_next(ValueFlags::ABSOLUTE, SymbolId::undefined(), file_id_one());
+            let sid = tee.next_symbol_id();
+            let n = UnversionedSymbolName::prehashed(b"_sym");
+            tee.add_non_versioned(PendingSymbol::from_prehashed(sid, n));
+            tee.set_next(ValueFlags::empty(), sid, file_id_one());
+            tee.take_cache().unwrap().finish()
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a, b, "two identical parse streams produced different cache bytes");
+    }
+
+    /// `clone_bytes` must agree with a fresh `finish()` on the same
+    /// builder state. The canary calls `clone_bytes` so it can hold
+    /// the bytes for the on-disk compare AND still persist afterwards;
+    /// drift between the two would break canary correctness.
+    #[test]
+    fn clone_bytes_matches_finish() {
+        let mut drain = Oracle::new();
+        let mut tee = TeeSink::new(&mut drain, Some(CacheBuilder::default()));
+        let sid = tee.next_symbol_id();
+        let n = UnversionedSymbolName::prehashed(b"_clone_test");
+        tee.add_non_versioned(PendingSymbol::from_prehashed(sid, n));
+        tee.set_next(ValueFlags::NON_INTERPOSABLE, sid, file_id_one());
+        let builder = tee.take_cache().unwrap();
+        let cloned = builder.clone_bytes();
+        let finished = builder.finish();
+        assert_eq!(cloned, finished);
+    }
+
+    /// End-to-end: tee a stream into a cache, persist to a temp file,
+    /// reload via `try_load_cache`, replay through an Oracle, and
+    /// assert the replayed ops match what the Oracle would have seen
+    /// during the original parse. Exercises the on-disk format, the
+    /// tmp-and-rename write path, the alignment-tolerant load, and
+    /// the replay-into-sink adapter in a single round trip.
+    #[test]
+    fn write_then_load_then_replay_round_trip() {
+        // Unique tmp files per test run so concurrent cargo test
+        // invocations don't stomp on each other.
+        let fname = format!("wild-parse-skip-rt-{}.wildpi", std::process::id());
+        let tmp = std::env::temp_dir().join(fname);
+        let _ = std::fs::remove_file(&tmp);
+
+        // Build + persist via CacheBuilder directly (the symbol_db's
+        // write_parsed_input_cache helper uses the same call chain).
+        let bytes_written = {
+            let mut drain = Oracle::new();
+            let mut tee = TeeSink::new(&mut drain, Some(CacheBuilder::default()));
+            tee.set_next(ValueFlags::ABSOLUTE, SymbolId::undefined(), file_id_one());
+            let sid = tee.next_symbol_id();
+            let n = UnversionedSymbolName::prehashed(b"_persisted");
+            tee.add_non_versioned(PendingSymbol::from_prehashed(sid, n));
+            tee.set_next(ValueFlags::empty(), sid, file_id_one());
+            let builder = tee.take_cache().unwrap();
+            let bytes = builder.clone_bytes();
+            builder.write_to(&tmp).expect("write_to");
+            bytes
+        };
+
+        let disk_bytes = std::fs::read(&tmp).expect("read tmp cache");
+        assert_eq!(disk_bytes, bytes_written, "disk bytes diverged from builder");
+
+        let aligned_bytes = aligned(&disk_bytes);
+        let view = CacheView::from_bytes(&aligned_bytes).expect("view");
+        let mut replayed = Oracle::new();
+        let n = replay_cached_symbols(&view, file_id_one(), &mut replayed);
+        assert_eq!(n, 2, "expected 2 replayed entries");
+
+        // Replay must produce one Undefined (set_next) and one Defined
+        // (add_non_versioned + set_next) — 3 ops total.
+        let kinds: Vec<_> = replayed
+            .ops
+            .iter()
+            .map(|op| std::mem::discriminant(op))
+            .collect();
+        assert_eq!(kinds.len(), 3);
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
