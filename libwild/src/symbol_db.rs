@@ -1559,10 +1559,6 @@ impl ParseSkipGates {
             read,
         }
     }
-
-    fn any(self) -> bool {
-        self.write || self.canary || self.read
-    }
 }
 
 /// Persist a freshly-captured [`CacheBuilder`] next to the input it
@@ -1649,7 +1645,6 @@ fn try_load_parsed_input_cache<'data, P: Platform>(
 /// combined logic lives here so the call-site in
 /// `read_symbols_for_group` stays a single line and the gates-driven
 /// branching is easy to audit.
-#[allow(clippy::too_many_arguments)]
 fn run_object_parse_skip<'data, P: Platform>(
     obj: &SequencedInputObject<'data, P>,
     version_script: &VersionScript,
@@ -1658,31 +1653,16 @@ fn run_object_parse_skip<'data, P: Platform>(
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
     gates: ParseSkipGates,
-    allocator: Option<&bumpalo_herd::Member<'data>>,
-    clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    cached_bytes: Option<&'data [u8]>,
 ) -> Result {
-    // Decide once whether cache I/O is safe for THIS input. The
-    // `.wild-hashes` side-car reports whether the input's content
-    // matches the last link's; if the user hasn't populated a
-    // wild-hashes verdict, `clean_input_paths` is `None` and we must
-    // treat every input as dirty (the stricter choice — a stale
-    // cache could silently miscompile). Archive members inherit
-    // their parent archive's verdict: the side-car tracks whole
-    // files, so a clean `.rlib` makes every member cacheable.
-    let input_is_clean = match clean_input_paths {
-        Some(clean) => clean.contains(obj.parsed.input.file.filename.as_path()),
-        None => false,
-    };
-
-    // READ path (no canary): if the input is clean AND a cache
-    // exists, replay and skip the parse entirely. The clean-bit is
-    // what makes this safe — without it, a stale cache could feed
-    // the linker out-of-date symbol info.
+    // READ path (no canary): if a cache was pre-fetched for this
+    // input, replay and skip the parse entirely. The caller has
+    // already verified per-input cleanness via `.wild-hashes` before
+    // allocating `cached_bytes`, so presence here implies safety to
+    // reuse.
     if gates.read
         && !gates.canary
-        && input_is_clean
-        && let Some(alloc) = allocator
-        && let Some(arena_bytes) = try_load_parsed_input_cache(obj, alloc)
+        && let Some(arena_bytes) = cached_bytes
         && let Some(view) = crate::parsed_input_cache::CacheView::from_bytes(arena_bytes)
     {
         crate::parse_skip::replay_cached_symbols(&view, obj.file_id, sink);
@@ -1715,15 +1695,11 @@ fn run_object_parse_skip<'data, P: Platform>(
         return Ok(());
     };
 
-    // CANARY: only compare when the input is clean — a dirty input's
-    // on-disk cache is from the PREVIOUS content and a mismatch would
-    // be the expected result of that change, not a schema bug. Skipping
-    // dirty compares keeps the canary's panic a true signal.
-    if gates.canary
-        && input_is_clean
-        && let Some(alloc) = allocator
-        && let Some(disk_bytes) = try_load_parsed_input_cache(obj, alloc)
-    {
+    // CANARY: compare against the pre-fetched disk cache. `cached_bytes`
+    // is `Some` only for clean inputs (caller-gated), so any divergence
+    // here is a schema or cache-file bug, not a content-changed
+    // false-positive.
+    if gates.canary && let Some(disk_bytes) = cached_bytes {
         let fresh_bytes = builder.clone_bytes();
         if fresh_bytes != disk_bytes {
             panic_canary_diff(obj, &fresh_bytes, disk_bytes);
@@ -1804,8 +1780,41 @@ fn read_symbols_for_group<'data, P: Platform>(
         }
         Group::Objects(parsed_input_objects) => {
             let gates = ParseSkipGates::from_env();
-            let allocator = gates.any().then(|| herd.get());
-            for obj in *parsed_input_objects {
+            // Pre-fetch cache bytes in parallel per object — turns a
+            // serial chain of 1000+ fs::read calls into a
+            // rayon-parallel fan-out. Each parallel thread gets its
+            // own `bumpalo_herd::Member` and allocates the cache
+            // slice directly into the arena with 'data lifetime, so
+            // the subsequent serial replay loop does zero I/O.
+            //
+            // Skipped entirely when no read/canary gate is active:
+            // we only need bytes on the read or compare path, and
+            // pre-fetching would be wasted I/O otherwise.
+            let cached_bytes: Vec<Option<&'data [u8]>> = if gates.read || gates.canary {
+                parsed_input_objects
+                    .par_iter()
+                    .map(|obj| {
+                        let input_is_clean = match clean_input_paths {
+                            Some(clean) => {
+                                clean.contains(obj.parsed.input.file.filename.as_path())
+                            }
+                            None => false,
+                        };
+                        if !input_is_clean {
+                            return None;
+                        }
+                        let m = herd.get();
+                        try_load_parsed_input_cache(obj, &m)
+                    })
+                    .collect()
+            } else {
+                vec![None; parsed_input_objects.len()]
+            };
+
+            // One allocator per group for the serial-write path:
+            // during replay we don't need new allocations (the
+            // pre-fetch already arena-allocated), so this is cheap.
+            for (obj, cached) in parsed_input_objects.iter().zip(cached_bytes.iter()) {
                 run_object_parse_skip(
                     obj,
                     version_script,
@@ -1814,8 +1823,7 @@ fn read_symbols_for_group<'data, P: Platform>(
                     export_list,
                     output_kind,
                     gates,
-                    allocator.as_ref(),
-                    clean_input_paths,
+                    *cached,
                 )?;
             }
         }
