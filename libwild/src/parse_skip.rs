@@ -535,22 +535,14 @@ mod tests {
         assert_eq!(cloned, finished);
     }
 
-    /// End-to-end: tee a stream into a cache, persist to a temp file,
-    /// reload via `try_load_cache_view_mmap`, replay through an Oracle, and
-    /// assert the replayed ops match what the Oracle would have seen
-    /// during the original parse. Exercises the on-disk format, the
-    /// tmp-and-rename write path, the alignment-tolerant load, and
-    /// the replay-into-sink adapter in a single round trip.
+    /// End-to-end (in-memory): tee a stream into a cache, finish to
+    /// bytes, parse the bytes back via `CacheView::from_bytes`, replay
+    /// through an Oracle, and assert the replayed ops match. Exercises
+    /// the on-disk format, the alignment-tolerant load, and the
+    /// replay-into-sink adapter without depending on the bundle write
+    /// path (which has its own tests in `parsed_input_cache::tests`).
     #[test]
     fn write_then_load_then_replay_round_trip() {
-        // Unique tmp files per test run so concurrent cargo test
-        // invocations don't stomp on each other.
-        let fname = format!("wild-parse-skip-rt-{}.wildpi", std::process::id());
-        let tmp = std::env::temp_dir().join(fname);
-        let _ = std::fs::remove_file(&tmp);
-
-        // Build + persist via CacheBuilder directly (the symbol_db's
-        // write_parsed_input_cache helper uses the same call chain).
         let bytes_written = {
             let mut drain = Oracle::new();
             let mut tee = TeeSink::new(&mut drain, Some(CacheBuilder::default()));
@@ -560,15 +552,12 @@ mod tests {
             tee.add_non_versioned(PendingSymbol::from_prehashed(sid, n));
             tee.set_next(ValueFlags::empty(), sid, file_id_one());
             let builder = tee.take_cache().unwrap();
-            let bytes = builder.clone_bytes();
-            builder.write_to(&tmp).expect("write_to");
-            bytes
+            let cloned = builder.clone_bytes();
+            assert_eq!(cloned, builder.finish(), "clone_bytes vs finish drift");
+            cloned
         };
 
-        let disk_bytes = std::fs::read(&tmp).expect("read tmp cache");
-        assert_eq!(disk_bytes, bytes_written, "disk bytes diverged from builder");
-
-        let aligned_bytes = aligned(&disk_bytes);
+        let aligned_bytes = aligned(&bytes_written);
         let view = CacheView::from_bytes(&aligned_bytes).expect("view");
         let mut replayed = Oracle::new();
         let n = replay_cached_symbols(&view, file_id_one(), &mut replayed);
@@ -582,7 +571,5 @@ mod tests {
             .map(|op| std::mem::discriminant(op))
             .collect();
         assert_eq!(kinds.len(), 3);
-
-        let _ = std::fs::remove_file(&tmp);
     }
 }

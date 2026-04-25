@@ -41,83 +41,7 @@ use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// mmap-backed loader for the parse-skip read hot path. Returns a
-/// validated [`CacheView`] borrowing a leaked mmap; the slice is
-/// `'static` so the caller can downcast it to whatever per-link
-/// `'data` lifetime the rest of the symbol-load pipeline expects.
-///
-/// Archive entry disambiguation: wild's inputs include `.rlib` archive
-/// members that share a filesystem path with their archive. Without an
-/// entry identifier, every member of the same archive would collide on
-/// the same cache file; `entry_id` (typically the member's filename
-/// bytes from the archive header) disambiguates them.
-///
-/// Why leak: parsed name slices flow into the symbol DB and are
-/// retained for the entire link. wild is a one-shot CLI process, so
-/// "leaked" only means the kernel reclaims the mapping at exit
-/// instead of munmap'ing per file. The trade is one heap-Vec
-/// allocation + one arena memcpy avoided per cached input — on
-/// bevy-dylib that's 1649 saved copies. A bad cache must never
-/// prevent the link, so any I/O or validation failure returns
-/// `None` and the caller falls through to a re-parse.
-pub(crate) fn try_load_cache_view_mmap(
-    input: &Path,
-    entry_id: Option<&[u8]>,
-) -> Option<CacheView<'static>> {
-    let path = cache_path_for_input(input, entry_id)?;
-    let file = std::fs::File::open(&path).ok()?;
-    // SAFETY: the file is opened read-only and we're about to leak
-    // the mmap so it can never be mutated under our feet. The mmap
-    // outlives every borrow we hand out.
-    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    // Leak the mmap so its bytes are 'static for the rest of the
-    // process. The Box wrapper is what we leak, not the kernel
-    // mapping itself — at process exit the kernel reclaims either
-    // way.
-    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
-    let bytes: &'static [u8] = leaked.as_ref();
-    CacheView::from_bytes(bytes)
-}
-
-/// Locate the on-disk cache file for a given input. Returns
-/// `None` when we can't determine a cache directory (no
-/// `$XDG_CACHE_HOME` *and* no `$HOME`), in which case callers
-/// fall back to the re-parse path without caching.
-///
-/// File name is derived from blake3(absolute_input_path ‖ entry_tag ‖
-/// schema) so different inputs with the same basename (very common
-/// across cargo's `deps/` directory — the `libfoo-<hash>.rlib` shape)
-/// can't collide, and two archive members of the same `.rlib` can't
-/// collide either. `std::path::Path::canonicalize` is deliberately NOT
-/// used here: wild's input fingerprints are path-string-based too,
-/// so staying symlink-literal keeps the two layers consistent.
-pub(crate) fn cache_path_for_input(input: &Path, entry_id: Option<&[u8]>) -> Option<PathBuf> {
-    let dir = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("wild").join("parsed-inputs")
-    } else {
-        let home = std::env::var_os("HOME")?;
-        PathBuf::from(home)
-            .join(".cache")
-            .join("wild")
-            .join("parsed-inputs")
-    };
-    let mut key = blake3::Hasher::new();
-    key.update(input.as_os_str().as_encoded_bytes());
-    // Length-prefix the entry id so `foo.rlib` + entry `ab` can't
-    // collide with `foo.rli` + entry `bab`. A zero-length id is the
-    // normal (non-archive) case.
-    if let Some(id) = entry_id {
-        key.update(&(id.len() as u64).to_le_bytes());
-        key.update(id);
-    } else {
-        key.update(&0u64.to_le_bytes());
-    }
-    key.update(&SCHEMA.to_le_bytes());
-    let hex = key.finalize().to_hex();
-    Some(dir.join(format!("{hex}.wildpi")))
-}
-
-/// 8-byte magic at the head of every cache file. Distinct from
+/// 8-byte magic at the head of every per-blob cache file. Distinct from
 /// `WILDIH01` (the `.wild-hashes` side-car magic) so mixing the two
 /// fails loudly at `load`.
 const MAGIC: &[u8; 8] = b"WILDPI01";
@@ -344,26 +268,6 @@ impl CacheBuilder {
         });
     }
 
-    /// Write the cache to `path` directly — no tmp-and-rename dance.
-    ///
-    /// Atomicity is provided by `CacheView::from_bytes`'s validation
-    /// (magic, schema, bounded offsets): a torn write produced by a
-    /// racing wild invocation fails the load silently and the reader
-    /// falls through to re-parse. Dropping the rename saves ~100 ms
-    /// per 1649-file write batch on macOS APFS, which is >½ of the
-    /// cache-write cost on bevy-dylib.
-    ///
-    /// Callers are expected to validate on read; any caller that needs
-    /// stronger (tmp+rename) atomicity must implement it above this
-    /// method — no callers in tier-1 need it.
-    pub(crate) fn write_to(self, path: &std::path::Path) -> std::io::Result<()> {
-        let bytes = self.finish();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, &bytes)
-    }
-
     /// Serialise the cache WITHOUT consuming the builder. Used by the
     /// canary path, which needs to hold on to the bytes for an
     /// in-memory compare AND the bytes to persist afterwards. Has the
@@ -403,6 +307,342 @@ impl CacheBuilder {
         out.extend_from_slice(sym_raw);
         out.extend_from_slice(&self.names);
         out
+    }
+}
+
+// =====================================================================
+// Tier-1.5 — single-bundle cache format (schema v2 of the cache layer)
+// =====================================================================
+//
+// The per-input file scheme above pays one mmap syscall per cached
+// input. On bevy-dylib (1649 inputs) those syscalls dominate the
+// read-path tax — the kernel's per-process VM-map lock serialises
+// what looks like cheap parallel I/O.
+//
+// The bundle format below stores ALL of a link's parsed-input caches
+// inside a single sidecar file at `<output>.wild-pi-cache`. One mmap
+// gets the whole thing; an in-memory `HashMap<key, blob_slice>` does
+// O(1) per-input lookup. Each blob inside the bundle is a complete
+// v1 [`CacheView`] payload (with its own magic/schema), so the
+// existing reader is reused unchanged.
+
+/// Bundle file magic. Distinct from `WILDPI01` (per-input) and
+/// `WILDIH01` (`.wild-hashes`) so accidentally feeding one to another
+/// fails loudly.
+const BUNDLE_MAGIC: &[u8; 8] = b"WILDPB02";
+
+/// Bundle schema version. Bumped whenever `BundleHeader` /
+/// `BundleTocEntry` change shape, or whenever the meaning of fields
+/// changes. v1 of the cache layer stayed in `WILDPI01` files; the
+/// bundle is `WILDPB02` from the start to make the version distinct.
+const BUNDLE_SCHEMA: u32 = 2;
+
+/// Per-blob alignment inside a bundle. v1 [`CacheView`] requires its
+/// bytes to be 8-byte aligned for the symbol-array cast; we honour
+/// that for every blob.
+const BUNDLE_BLOB_ALIGN: usize = 8;
+
+/// Length of the per-input key used as a TOC primary key — blake3 of
+/// `(input_path, entry_id)` truncated to 16 bytes. 128 bits gives a
+/// collision probability of ~1.5e-30 for 1k inputs; well below the
+/// "ignore it" threshold.
+pub(crate) const BUNDLE_KEY_LEN: usize = 16;
+
+/// Header at the start of every bundle file. Field order matches the
+/// disk layout exactly; `repr(C)` + 8-byte alignment is asserted at
+/// build time.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BundleHeader {
+    magic: [u8; 8],
+    schema: u32,
+    flags: u32,
+    n_entries: u32,
+    _pad: u32,
+    toc_off: u64,
+    blobs_off: u64,
+    blobs_len: u64,
+}
+
+const _: () = {
+    // Header layout: magic(8) + schema(4) + flags(4) + n_entries(4)
+    // + _pad(4) + toc_off(8) + blobs_off(8) + blobs_len(8) = 48.
+    assert!(size_of::<BundleHeader>() == 48);
+    assert!(std::mem::align_of::<BundleHeader>() <= REQUIRED_ALIGN);
+};
+
+/// One TOC slot. `key` is opaque (blake3-128 of input + entry id);
+/// `blob_off` is bytes from the start of the file; `blob_len` is the
+/// blob's payload length (the next blob starts at the next 8-byte
+/// boundary after `blob_off + blob_len`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BundleTocEntry {
+    key: [u8; BUNDLE_KEY_LEN],
+    blob_off: u64,
+    blob_len: u64,
+}
+
+const _: () = {
+    // 16 + 8 + 8 = 32. Multiple of 8 so a TOC array placed on an
+    // 8-byte boundary stays aligned for every entry.
+    assert!(size_of::<BundleTocEntry>() == 32);
+    assert!(std::mem::align_of::<BundleTocEntry>() <= REQUIRED_ALIGN);
+};
+
+/// Derive the bundle key for one input. Length-prefixed so
+/// `(path="ab", entry="c")` and `(path="a", entry="bc")` can't alias.
+pub(crate) fn bundle_key_for(
+    input: &Path,
+    entry_id: Option<&[u8]>,
+) -> [u8; BUNDLE_KEY_LEN] {
+    let mut h = blake3::Hasher::new();
+    h.update(input.as_os_str().as_encoded_bytes());
+    if let Some(id) = entry_id {
+        h.update(&(id.len() as u64).to_le_bytes());
+        h.update(id);
+    } else {
+        h.update(&0u64.to_le_bytes());
+    }
+    let full = h.finalize();
+    let mut out = [0u8; BUNDLE_KEY_LEN];
+    out.copy_from_slice(&full.as_bytes()[..BUNDLE_KEY_LEN]);
+    out
+}
+
+/// Path to the bundle for a given output binary. The bundle lives
+/// next to the output (not in `$XDG_CACHE_HOME`) because it's
+/// per-output, not per-input — co-located with `.wild-hashes` for
+/// the same output.
+pub(crate) fn bundle_path_for_output(output: &Path) -> PathBuf {
+    let mut p = output.to_path_buf();
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(".wild-pi-cache");
+    p.set_file_name(name);
+    p
+}
+
+/// Read-only mmap-backed view of a bundle. The `HashMap` is built
+/// once at load time so per-input lookups are O(1); blob slices
+/// borrow into the leaked mmap and downcast trivially to any per-link
+/// `'data` lifetime.
+pub(crate) struct BundleView<'data> {
+    bytes: &'data [u8],
+    index: hashbrown::HashMap<[u8; BUNDLE_KEY_LEN], &'data [u8], foldhash::fast::FixedState>,
+}
+
+impl<'data> BundleView<'data> {
+    fn from_bytes(bytes: &'data [u8]) -> Option<Self> {
+        if bytes.len() < size_of::<BundleHeader>() {
+            return None;
+        }
+        if bytes.as_ptr() as usize % REQUIRED_ALIGN != 0 {
+            return None;
+        }
+        let header = unsafe { &*(bytes.as_ptr() as *const BundleHeader) };
+        if &header.magic != BUNDLE_MAGIC {
+            return None;
+        }
+        if header.schema != BUNDLE_SCHEMA {
+            return None;
+        }
+        let n = header.n_entries as usize;
+        let toc_off = header.toc_off as usize;
+        let toc_end = toc_off.checked_add(n.checked_mul(size_of::<BundleTocEntry>())?)?;
+        if toc_end > bytes.len() {
+            return None;
+        }
+        if toc_off % std::mem::align_of::<BundleTocEntry>() != 0 {
+            return None;
+        }
+        let blobs_off = header.blobs_off as usize;
+        let blobs_end = blobs_off.checked_add(header.blobs_len as usize)?;
+        if blobs_end > bytes.len() {
+            return None;
+        }
+        let toc = unsafe {
+            std::slice::from_raw_parts(
+                bytes.as_ptr().add(toc_off) as *const BundleTocEntry,
+                n,
+            )
+        };
+        let mut index = hashbrown::HashMap::with_capacity_and_hasher(n, Default::default());
+        for entry in toc {
+            let off = entry.blob_off as usize;
+            let len = entry.blob_len as usize;
+            // Bounds-check each blob against the file. A bad TOC
+            // entry rejects the WHOLE bundle so we never hand out a
+            // partial / inconsistent view.
+            let end = off.checked_add(len)?;
+            if end > bytes.len() {
+                return None;
+            }
+            let blob = &bytes[off..end];
+            // Each blob must independently parse as a v1 CacheView —
+            // this is the canary against silent format drift between
+            // bundle writer and per-blob writer.
+            CacheView::from_bytes(blob)?;
+            index.insert(entry.key, blob);
+        }
+        Some(Self { bytes, index })
+    }
+
+    /// O(1) lookup for one input's cached blob, ready to feed
+    /// [`CacheView::from_bytes`].
+    pub(crate) fn lookup(&self, key: &[u8; BUNDLE_KEY_LEN]) -> Option<&'data [u8]> {
+        self.index.get(key).copied()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    #[cfg(test)]
+    fn raw_bytes(&self) -> &'data [u8] {
+        self.bytes
+    }
+}
+
+/// Try to mmap and validate the bundle for `output`. Returns a
+/// leaked `&'static BundleView<'static>` so callers can share it
+/// across rayon workers and `'data` lifetimes without lifetime
+/// gymnastics. wild's a one-shot CLI — kernel reclaims the mapping
+/// at process exit.
+///
+/// Any I/O / validation failure → `None`; callers fall through to
+/// the re-parse path. Never returns an error: a stale or corrupt
+/// bundle MUST NOT prevent linking.
+pub(crate) fn try_load_bundle_view_mmap(
+    output: &Path,
+) -> Option<&'static BundleView<'static>> {
+    let path = bundle_path_for_output(output);
+    let file = std::fs::File::open(&path).ok()?;
+    // SAFETY: opened read-only and immediately leaked, so the mapping
+    // outlives every borrow we hand out and can't be mutated under
+    // our feet.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+    let bytes: &'static [u8] = leaked.as_ref();
+    let view = BundleView::from_bytes(bytes)?;
+    Some(Box::leak(Box::new(view)))
+}
+
+/// Builder for a fresh bundle. Accepts (key, blob_bytes) pairs, then
+/// emits the full bundle as one byte vec ready to write.
+pub(crate) struct BundleBuilder {
+    entries: Vec<([u8; BUNDLE_KEY_LEN], Vec<u8>)>,
+}
+
+impl BundleBuilder {
+    pub(crate) fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    pub(crate) fn push(&mut self, key: [u8; BUNDLE_KEY_LEN], blob: Vec<u8>) {
+        self.entries.push((key, blob));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Serialise into bundle bytes. Sorts by key so the on-disk order
+    /// is deterministic — useful for diffing two bundles bit-for-bit
+    /// in correctness tests.
+    pub(crate) fn finish(mut self) -> Vec<u8> {
+        self.entries.sort_by_key(|(k, _)| *k);
+        let n = self.entries.len();
+        let toc_off = size_of::<BundleHeader>();
+        let toc_size = n * size_of::<BundleTocEntry>();
+        let blobs_off_unaligned = toc_off + toc_size;
+        let blobs_off = blobs_off_unaligned.next_multiple_of(BUNDLE_BLOB_ALIGN);
+
+        // First pass: lay out blobs to determine total size and
+        // per-entry offsets.
+        let mut blob_layout: Vec<(u64, u64)> = Vec::with_capacity(n);
+        let mut cursor = blobs_off;
+        for (_, blob) in &self.entries {
+            let off = cursor;
+            let len = blob.len();
+            blob_layout.push((off as u64, len as u64));
+            cursor = (off + len).next_multiple_of(BUNDLE_BLOB_ALIGN);
+        }
+        let blobs_len = cursor - blobs_off;
+        let total = blobs_off + blobs_len;
+
+        let mut out = vec![0u8; total];
+
+        // Header.
+        let header = BundleHeader {
+            magic: *BUNDLE_MAGIC,
+            schema: BUNDLE_SCHEMA,
+            flags: 0,
+            n_entries: n as u32,
+            _pad: 0,
+            toc_off: toc_off as u64,
+            blobs_off: blobs_off as u64,
+            blobs_len: blobs_len as u64,
+        };
+        let hdr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &header as *const BundleHeader as *const u8,
+                size_of::<BundleHeader>(),
+            )
+        };
+        out[..size_of::<BundleHeader>()].copy_from_slice(hdr_bytes);
+
+        // TOC.
+        for (i, ((key, _), (off, len))) in self.entries.iter().zip(blob_layout.iter()).enumerate() {
+            let entry = BundleTocEntry {
+                key: *key,
+                blob_off: *off,
+                blob_len: *len,
+            };
+            let entry_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &entry as *const BundleTocEntry as *const u8,
+                    size_of::<BundleTocEntry>(),
+                )
+            };
+            let dst_off = toc_off + i * size_of::<BundleTocEntry>();
+            out[dst_off..dst_off + size_of::<BundleTocEntry>()].copy_from_slice(entry_bytes);
+        }
+
+        // Blobs (with inter-blob 8-byte padding zeroed by the initial
+        // `vec![0u8; total]` so we don't have to write padding bytes).
+        for ((_, blob), (off, len)) in self.entries.iter().zip(blob_layout.iter()) {
+            let off = *off as usize;
+            let len = *len as usize;
+            out[off..off + len].copy_from_slice(blob);
+        }
+        out
+    }
+
+    /// Atomically write to `path` (tmp + rename). Single-file write
+    /// is small enough to do safely; the previous fan-out scheme had
+    /// to skip rename for perf, but the bundle is one file so we
+    /// keep the strict-atomic write.
+    pub(crate) fn write_to(self, path: &Path) -> std::io::Result<()> {
+        let bytes = self.finish();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("wild-pi-cache.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+impl Default for BundleBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -566,75 +806,140 @@ mod tests {
     }
 
     #[test]
-    fn write_to_persists_and_reloads() {
-        let mut b = CacheBuilder::default();
-        b.add(b"_a", 1, 0, CachedSymbolKind::Defined);
-        b.add(b"_b", 2, 0x10, CachedSymbolKind::Undefined);
+    fn bundle_round_trip_persists_and_reloads() {
+        // End-to-end: build two blobs, push them into a bundle, write
+        // it to disk, read back via `BundleView::from_bytes`, look
+        // each up by key, replay through `CacheView::from_bytes` and
+        // confirm the symbol records survived intact.
+        let blob_a = {
+            let mut b = CacheBuilder::default();
+            b.add(b"_a", 1, 0, CachedSymbolKind::Defined);
+            b.finish()
+        };
+        let blob_b = {
+            let mut b = CacheBuilder::default();
+            b.add(b"_b", 2, 0x10, CachedSymbolKind::Undefined);
+            b.finish()
+        };
+        let key_a = bundle_key_for(Path::new("/fixture/a.o"), None);
+        let key_b = bundle_key_for(Path::new("/fixture/b.o"), None);
+        let mut bundle = BundleBuilder::new();
+        bundle.push(key_a, blob_a);
+        bundle.push(key_b, blob_b);
 
-        let tmp =
-            std::env::temp_dir().join(format!("wild-parsed-cache-{}.wildpi", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
+        // Write to a unique temp output path; bundle_path_for_output
+        // appends `.wild-pi-cache`.
+        let tmp_out = std::env::temp_dir()
+            .join(format!("wild-bundle-rt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&tmp_out);
+        let bundle_path = bundle_path_for_output(&tmp_out);
+        let _ = std::fs::remove_file(&bundle_path);
+        bundle.write_to(&bundle_path).expect("bundle write");
 
-        b.write_to(&tmp).expect("write");
-        // Direct write: no `.tmp` side-car should have been created
-        // (we skip the tmp-and-rename dance for perf — validation on
-        // read handles torn-write safety).
-        let leftover = tmp.with_extension("wildpi.tmp");
-        assert!(
-            !leftover.exists(),
-            "unexpected .tmp left behind at {leftover:?}"
-        );
+        // tmp+rename atomicity: no .tmp left behind on success.
+        let leftover = bundle_path.with_extension("wild-pi-cache.tmp");
+        assert!(!leftover.exists(), "leftover tmp at {leftover:?}");
 
-        let bytes = std::fs::read(&tmp).unwrap();
+        let bytes = std::fs::read(&bundle_path).unwrap();
         let buf = aligned(&bytes);
-        let view = CacheView::from_bytes(&buf).expect("view from file bytes");
+        let view = BundleView::from_bytes(&buf).expect("view");
         assert_eq!(view.len(), 2);
-        assert_eq!(view.get(0).unwrap().name, b"_a");
-        assert_eq!(view.get(1).unwrap().name, b"_b");
-        let _ = std::fs::remove_file(&tmp);
+
+        for (key, expected_name) in [(key_a, &b"_a"[..]), (key_b, &b"_b"[..])] {
+            let blob = view.lookup(&key).expect("lookup");
+            let cv = CacheView::from_bytes(blob).expect("blob view");
+            assert_eq!(cv.len(), 1);
+            assert_eq!(cv.get(0).unwrap().name, expected_name);
+        }
+        let _ = std::fs::remove_file(&bundle_path);
     }
 
     #[test]
-    fn cache_path_derivation_is_collision_free_for_same_basename() {
+    fn bundle_rejects_bad_magic() {
+        let mut bundle = BundleBuilder::new();
+        let blob = {
+            let mut b = CacheBuilder::default();
+            b.add(b"_x", 1, 0, CachedSymbolKind::Defined);
+            b.finish()
+        };
+        bundle.push(bundle_key_for(Path::new("/x"), None), blob);
+        let mut bytes = bundle.finish();
+        bytes[0] ^= 1;
+        let buf = aligned(&bytes);
+        assert!(BundleView::from_bytes(&buf).is_none());
+    }
+
+    #[test]
+    fn bundle_rejects_truncated() {
+        let mut bundle = BundleBuilder::new();
+        let blob = {
+            let mut b = CacheBuilder::default();
+            b.add(b"_x", 1, 0, CachedSymbolKind::Defined);
+            b.finish()
+        };
+        bundle.push(bundle_key_for(Path::new("/x"), None), blob);
+        let bytes = bundle.finish();
+        let truncated = &bytes[..bytes.len() - 5];
+        let buf = aligned(truncated);
+        assert!(BundleView::from_bytes(&buf).is_none());
+    }
+
+    #[test]
+    fn bundle_path_appends_extension() {
+        let p = bundle_path_for_output(Path::new("/tmp/myapp"));
+        assert_eq!(p, Path::new("/tmp/myapp.wild-pi-cache"));
+        let p = bundle_path_for_output(Path::new("/tmp/myapp.dylib"));
+        assert_eq!(p, Path::new("/tmp/myapp.dylib.wild-pi-cache"));
+    }
+
+    #[test]
+    fn bundle_lookup_misses_unknown_key() {
+        let mut bundle = BundleBuilder::new();
+        let blob = {
+            let mut b = CacheBuilder::default();
+            b.add(b"_x", 1, 0, CachedSymbolKind::Defined);
+            b.finish()
+        };
+        let known = bundle_key_for(Path::new("/known"), None);
+        bundle.push(known, blob);
+        let bytes = bundle.finish();
+        let buf = aligned(&bytes);
+        let view = BundleView::from_bytes(&buf).unwrap();
+        assert!(view.lookup(&known).is_some());
+        let absent = bundle_key_for(Path::new("/absent"), None);
+        assert!(view.lookup(&absent).is_none());
+    }
+
+    #[test]
+    fn bundle_key_is_collision_free_for_same_basename() {
         // The `libfoo-<hash>.rlib` cargo convention means multiple
         // inputs with the same basename live in different dirs.
-        // cache_path_for_input must disambiguate.
-        // Force XDG_CACHE_HOME so the test is deterministic.
-        let prev = std::env::var_os("XDG_CACHE_HOME");
-        unsafe {
-            std::env::set_var("XDG_CACHE_HOME", std::env::temp_dir());
-        }
-        let a = cache_path_for_input(Path::new("/tmp/build-a/libfoo-abc.rlib"), None);
-        let b = cache_path_for_input(Path::new("/tmp/build-b/libfoo-abc.rlib"), None);
-        let a = a.expect("a");
-        let b = b.expect("b");
+        // bundle_key_for must disambiguate via full-path hashing.
+        let a = bundle_key_for(Path::new("/tmp/build-a/libfoo-abc.rlib"), None);
+        let b = bundle_key_for(Path::new("/tmp/build-b/libfoo-abc.rlib"), None);
         assert_ne!(
             a, b,
-            "same-basename inputs from different dirs produced the same cache path"
+            "same-basename inputs from different dirs produced the same bundle key"
         );
-        // Same input twice → same cache path.
-        let a2 = cache_path_for_input(Path::new("/tmp/build-a/libfoo-abc.rlib"), None).unwrap();
-        assert_eq!(a, a2, "identical input path produced different cache paths");
-        // Same archive file, different member entries → distinct cache
-        // paths so rlib members don't collide on their parent's path.
-        let m1 =
-            cache_path_for_input(Path::new("/tmp/foo.rlib"), Some(b"first.o")).unwrap();
-        let m2 =
-            cache_path_for_input(Path::new("/tmp/foo.rlib"), Some(b"second.o")).unwrap();
+        // Same input twice → same key.
+        let a2 = bundle_key_for(Path::new("/tmp/build-a/libfoo-abc.rlib"), None);
+        assert_eq!(a, a2, "identical input path produced different bundle keys");
+        // Same archive file, different member entries → distinct keys.
+        let m1 = bundle_key_for(Path::new("/tmp/foo.rlib"), Some(b"first.o"));
+        let m2 = bundle_key_for(Path::new("/tmp/foo.rlib"), Some(b"second.o"));
         assert_ne!(
             m1, m2,
-            "archive-entry-disambiguated cache paths unexpectedly collided"
+            "archive-entry-disambiguated bundle keys unexpectedly collided"
         );
         // Member vs. whole-archive disambiguation: the archive-entry
         // case must also differ from the no-entry case.
-        let whole =
-            cache_path_for_input(Path::new("/tmp/foo.rlib"), None).unwrap();
-        assert_ne!(whole, m1, "entry-absent cache path collided with a member");
-        // Restore env.
-        match prev {
-            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
-        }
+        let whole = bundle_key_for(Path::new("/tmp/foo.rlib"), None);
+        assert_ne!(whole, m1, "entry-absent bundle key collided with a member");
+        // Length-prefix discipline: ("ab", c) and ("a", bc) must NOT
+        // alias even though their concatenation does.
+        let p1 = bundle_key_for(Path::new("/ab"), Some(b"c"));
+        let p2 = bundle_key_for(Path::new("/a"), Some(b"bc"));
+        assert_ne!(p1, p2, "length-prefix bundle keys aliased on concatenation");
     }
 
     #[test]

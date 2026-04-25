@@ -501,12 +501,20 @@ impl Linker {
         // active so the hashing cost vanishes on normal links.
         let clean_input_paths = compute_clean_input_paths::<P>(file_loader, args);
 
+        // Tier-1.5: load the per-output cache bundle once. The bundle
+        // is `&'static` (leaked mmap) and shared across rayon workers
+        // for the read path. `None` on first link, schema-mismatch, or
+        // any other failure — callers fall through to the re-parse +
+        // re-write path.
+        let bundle = crate::parsed_input_cache::try_load_bundle_view_mmap(args.output());
+
         symbol_db.add_inputs(
             &mut per_symbol_flags,
             &mut output_sections,
             &mut layout_rules_builder,
             loaded,
             clean_input_paths.as_ref(),
+            bundle,
         )?;
 
         // TODO: Doing this here means that we can't wrap symbols produced by the linker plugin.

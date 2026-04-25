@@ -58,7 +58,6 @@ use hashbrown::HashMap;
 use hashbrown::hash_map;
 use itertools::Itertools;
 use rayon::iter::IndexedParallelIterator as _;
-use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::IntoParallelRefMutIterator as _;
 use rayon::iter::ParallelIterator;
@@ -410,6 +409,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         layout_rules_builder: &mut LayoutRulesBuilder<'data>,
         loaded: LoadedInputs<'data, P>,
         clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+        bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
     ) -> Result {
         timing_phase!("Load inputs into symbol DB");
 
@@ -463,6 +463,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             &self.export_list,
             self.output_kind,
             clean_input_paths,
+            bundle,
         )?;
 
         populate_symbol_db(&mut self.buckets, &per_group_outputs);
@@ -1495,12 +1496,24 @@ fn read_symbols<'data, P: Platform>(
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
     clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
 ) -> Result<Vec<SymbolLoadOutputs<'data>>> {
     timing_phase!("Read symbols");
 
     let num_buckets = num_symbol_hash_buckets(args);
 
-    shards
+    // Run all groups in parallel. Each returns the symbol outputs PLUS
+    // any (key, blob) pairs the write/canary path produced — those get
+    // merged into one bundle below instead of fanning out N file writes
+    // (which on bevy-dylib was ~200 ms of fs::write storm).
+    type GroupOutput<'d> = (
+        SymbolLoadOutputs<'d>,
+        Vec<(
+            [u8; crate::parsed_input_cache::BUNDLE_KEY_LEN],
+            Vec<u8>,
+        )>,
+    );
+    let per_group: Vec<GroupOutput<'data>> = shards
         .par_iter_mut()
         .map(|shard| {
             read_symbols_for_group(
@@ -1511,9 +1524,41 @@ fn read_symbols<'data, P: Platform>(
                 args,
                 output_kind,
                 clean_input_paths,
+                bundle,
             )
         })
-        .collect::<Result<Vec<SymbolLoadOutputs>>>()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut outputs = Vec::with_capacity(per_group.len());
+    let mut bundle_builder = crate::parsed_input_cache::BundleBuilder::new();
+    for (out, pending) in per_group {
+        outputs.push(out);
+        for (key, blob) in pending {
+            bundle_builder.push(key, blob);
+        }
+    }
+
+    // Write the bundle once for the whole link. Tier-1.5 win: replaces
+    // 1649-file fan-out with a single atomic write.
+    if !bundle_builder.is_empty() {
+        let bundle_path =
+            crate::parsed_input_cache::bundle_path_for_output(args.output());
+        // Best-effort: any IO error drops the bundle silently. The
+        // next link will just re-parse — correctness invariant is "a
+        // missing or corrupt bundle MUST NOT prevent the link", so we
+        // never fail upward from here.
+        if let Err(e) = bundle_builder.write_to(&bundle_path) {
+            if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
+                eprintln!(
+                    "wild parse-skip: bundle write to {} failed: {}",
+                    bundle_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(outputs)
 }
 
 /// Env-var gates for tier-1 incremental-link parse-skip. Three
@@ -1559,82 +1604,14 @@ impl ParseSkipGates {
     }
 }
 
-/// Persist a freshly-captured [`CacheBuilder`] next to the input it
-/// was teed from. Failures are swallowed — a missing or unwritable
-/// cache dir is never a reason to fail the link. On success the cache
-/// is ready to be consumed by the replay path on a subsequent link.
-fn write_parsed_input_cache<'data, P: Platform>(
-    obj: &SequencedInputObject<'data, P>,
-    builder: crate::parsed_input_cache::CacheBuilder,
-) {
-    // Skip entries we can't key stably on disk — e.g. synthetic /
-    // in-memory inputs whose filename is empty. Those tend to be the
-    // prelude stub, which we don't parse via load_symbols_from_file
-    // anyway, so this is a belt-and-braces guard.
-    let path = obj.parsed.input.file.filename.as_path();
-    if path.as_os_str().is_empty() {
-        return;
-    }
-    // Archive members (rlib entries) share the archive's filename; the
-    // member identifier disambiguates them in the cache filename.
-    let entry_id = obj
-        .parsed
-        .input
-        .entry
-        .as_ref()
-        .map(|e| e.identifier.as_slice());
-    let Some(cache_path) =
-        crate::parsed_input_cache::cache_path_for_input(path, entry_id)
-    else {
-        return;
-    };
-    // Best-effort: any IO error drops the cache silently. The next
-    // link will just re-parse.
-    if builder.write_to(&cache_path).is_ok() {
-        crate::parse_skip::STATS
-            .written
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Try to load + validate a cache for `obj`, returning a fully-built
-/// `CacheView` with the arena's 'data lifetime. Backed by an mmap
-/// that's leaked for the process lifetime — so the returned view's
-/// name slices stay valid for as long as the symbol DB might hold
-/// them. `None` on cache miss or any validation failure (caller
-/// falls through to the re-parse path).
-///
-/// Returns the view directly rather than raw bytes so the replay
-/// loop can skip a redundant `CacheView::from_bytes` re-validation
-/// (the mmap loader already did it).
-fn try_load_parsed_input_cache<'data, P: Platform>(
-    obj: &SequencedInputObject<'data, P>,
-) -> Option<crate::parsed_input_cache::CacheView<'data>> {
-    let path = obj.parsed.input.file.filename.as_path();
-    if path.as_os_str().is_empty() {
-        return None;
-    }
-    let entry_id = obj
-        .parsed
-        .input
-        .entry
-        .as_ref()
-        .map(|e| e.identifier.as_slice());
-    // CacheView<'static> downcasts to CacheView<'data> by lifetime
-    // covariance — the leaked mmap outlives any per-link 'data.
-    crate::parsed_input_cache::try_load_cache_view_mmap(path, entry_id)
-}
-
 /// Orchestrates read / canary / write for a single object input. The
 /// combined logic lives here so the call-site in
 /// `read_symbols_for_group` stays a single line and the gates-driven
 /// branching is easy to audit.
 /// Returns the fresh [`CacheBuilder`] when the caller should persist
 /// it after the parse loop finishes, or `None` when replay fired or
-/// no write gate is active. Persistence is deferred + fanned out
-/// across rayon workers because 1000+ sequential `fs::write` +
-/// `fs::rename` calls are ~200 ms on bevy-dylib — enough to dwarf
-/// the parse savings unless parallelised.
+/// no write gate is active. Persistence is bubbled up by the caller
+/// to be merged into the per-output bundle (tier-1.5).
 fn run_object_parse_skip<'data, 'view, P: Platform>(
     obj: &SequencedInputObject<'data, P>,
     version_script: &VersionScript,
@@ -1758,7 +1735,14 @@ fn read_symbols_for_group<'data, P: Platform>(
     args: &P::Args,
     output_kind: OutputKind,
     clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
-) -> Result<SymbolLoadOutputs<'data>> {
+    bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
+) -> Result<(
+    SymbolLoadOutputs<'data>,
+    Vec<(
+        [u8; crate::parsed_input_cache::BUNDLE_KEY_LEN],
+        Vec<u8>,
+    )>,
+)> {
     verbose_timing_phase!(
         "Read group symbols",
         group_id = shard.group.group_id(),
@@ -1768,6 +1752,14 @@ fn read_symbols_for_group<'data, P: Platform>(
     let mut outputs = SymbolLoadOutputs {
         pending_symbols_by_bucket: vec![PendingSymbolHashBucket::default(); num_buckets],
     };
+
+    // (key, blob_bytes) pairs to merge into the bundle at end of link.
+    // Local to this group; merged into the global bundle by the
+    // caller. Allocated empty so non-Objects groups return cleanly.
+    let mut pending_blobs: Vec<(
+        [u8; crate::parsed_input_cache::BUNDLE_KEY_LEN],
+        Vec<u8>,
+    )> = Vec::new();
 
     // Pull `group` out of the shard as a Copy ref before we hand the
     // shard into the sink's &mut. Matching on `shard.group` after the
@@ -1781,45 +1773,52 @@ fn read_symbols_for_group<'data, P: Platform>(
         }
         Group::Objects(parsed_input_objects) => {
             let gates = ParseSkipGates::from_env();
-            // Pre-fetch cache views in parallel per object — turns a
-            // serial chain of 1000+ open+read calls into a
-            // rayon-parallel fan-out. Each parsed cache is mmap'd
-            // (not heap-Vec'd) and the mmap is leaked so the symbol
-            // names can be borrowed for the whole link without an
-            // arena copy. wild's a one-shot CLI so the kernel
-            // reclaims the mappings at exit.
-            //
-            // Skipped entirely when no read/canary gate is active:
-            // we only need cache files on the read or compare path,
-            // and pre-fetching would be wasted I/O otherwise.
-            let cached_views: Vec<Option<crate::parsed_input_cache::CacheView<'data>>> =
-                if gates.read || gates.canary {
-                    parsed_input_objects
-                        .par_iter()
-                        .map(|obj| {
-                            let input_is_clean = match clean_input_paths {
-                                Some(clean) => {
-                                    clean.contains(obj.parsed.input.file.filename.as_path())
-                                }
-                                None => false,
-                            };
-                            if !input_is_clean {
-                                return None;
+            // Tier-1.5 read path: one bundle for the whole link, mmap'd
+            // once at link start and passed in here. Per-input lookup
+            // is an O(1) `HashMap` hit on `bundle_key`. No filesystem
+            // I/O on the prefetch hot path — the only syscalls left
+            // are the single bundle mmap done once before
+            // `read_symbols`.
+            let cached_views: Vec<Option<crate::parsed_input_cache::CacheView<'data>>> = if (gates
+                .read
+                || gates.canary)
+                && let Some(b) = bundle
+            {
+                parsed_input_objects
+                    .iter()
+                    .map(|obj| {
+                        let input_is_clean = match clean_input_paths {
+                            Some(clean) => {
+                                clean.contains(obj.parsed.input.file.filename.as_path())
                             }
-                            try_load_parsed_input_cache(obj)
-                        })
-                        .collect()
-                } else {
-                    (0..parsed_input_objects.len()).map(|_| None).collect()
-                };
+                            None => false,
+                        };
+                        if !input_is_clean {
+                            return None;
+                        }
+                        let path = obj.parsed.input.file.filename.as_path();
+                        if path.as_os_str().is_empty() {
+                            return None;
+                        }
+                        let entry_id = obj
+                            .parsed
+                            .input
+                            .entry
+                            .as_ref()
+                            .map(|e| e.identifier.as_slice());
+                        let key = crate::parsed_input_cache::bundle_key_for(path, entry_id);
+                        let blob = b.lookup(&key)?;
+                        crate::parsed_input_cache::CacheView::from_bytes(blob)
+                    })
+                    .collect()
+            } else {
+                (0..parsed_input_objects.len()).map(|_| None).collect()
+            };
 
-            // Serial parse-or-replay loop. Builders returned here are
-            // BUFFERED for a parallel write pass below — inlining
-            // fs::write in this loop on bevy-dylib cost ~200 ms.
-            let mut pending_writes: Vec<(
-                &SequencedInputObject<'data, P>,
-                crate::parsed_input_cache::CacheBuilder,
-            )> = Vec::new();
+            // Serial parse-or-replay loop. Builders captured here are
+            // BUBBLED UP via `pending_blobs` so the caller can merge
+            // ALL groups' caches into a single bundle write at end of
+            // link.
             for (obj, cached) in parsed_input_objects.iter().zip(cached_views.iter()) {
                 if let Some(builder) = run_object_parse_skip(
                     obj,
@@ -1831,19 +1830,22 @@ fn read_symbols_for_group<'data, P: Platform>(
                     gates,
                     cached.as_ref(),
                 )? {
-                    pending_writes.push((obj, builder));
+                    let path = obj.parsed.input.file.filename.as_path();
+                    if path.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let entry_id = obj
+                        .parsed
+                        .input
+                        .entry
+                        .as_ref()
+                        .map(|e| e.identifier.as_slice());
+                    let key = crate::parsed_input_cache::bundle_key_for(path, entry_id);
+                    pending_blobs.push((key, builder.finish()));
+                    crate::parse_skip::STATS
+                        .written
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            }
-
-            // Fan cache writes across rayon workers. Each worker does
-            // its own create_dir_all + fs::write + fs::rename. Order
-            // is irrelevant — every cache file is addressed by a
-            // (path, entry_id) hash so there are no inter-file
-            // dependencies.
-            if !pending_writes.is_empty() {
-                pending_writes.into_par_iter().for_each(|(obj, builder)| {
-                    write_parsed_input_cache(obj, builder);
-                });
             }
         }
         Group::LinkerScripts(scripts) => {
@@ -1862,7 +1864,7 @@ fn read_symbols_for_group<'data, P: Platform>(
         }
     }
 
-    Ok(outputs)
+    Ok((outputs, pending_blobs))
 }
 
 #[cfg(feature = "plugins")]
