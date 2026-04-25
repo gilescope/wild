@@ -55,13 +55,26 @@ collapsing the syscall storm to a single mmap. Tax dropped from
 **Tier-2 foundation (landed 2026-04-25)** — capture + canary.
 `<output>.wild-layout` stores a per-section snapshot
 `(name, alignment, file_offset, file_size, mem_offset,
-mem_size)` after `produce_layout` finishes. Snapshot is
+mem_size)` after `produce_layout` finishes. Snapshot was
 2.8 KiB on bevy-dylib. `WILD_INCREMENTAL_LAYOUT_CANARY=1`
 re-runs layout and panics on any divergence vs the previous
-snapshot — proves layout determinism end-to-end. No
-behavioural reuse yet; tier 3 (per-section memcpy skip)
-consumes the snapshot to decide which sections of the previous
-output binary can be mmap-preserved.
+snapshot — proves layout determinism end-to-end.
+
+**Tier-3 phase 1 — contributors map (landed 2026-04-25)**:
+schema bumped v1 → v2; each `SnapshotSection` now carries the
+list of bundle keys for every input that contributed loaded
+sections to it. Contributors are sorted+deduped via
+`canonicalize()` so byte-equality of two snapshots reflects
+logical equality. Snapshot grew to 83 KiB on bevy-dylib (still
+trivial vs the 22 MiB parse cache).
+`LayoutSnapshot::dirty_section_indices(&clean_inputs)` returns
+section ordinals that have at least one dirty contributor —
+the predicate tier 3's writer will use to decide reuse.
+`WILD_INCREMENTAL_TIER3_PROBE=1` runs the dry-run intersection
+on a real link and reports `N/M sections reusable, B/T bytes
+(P%)`. On bevy-dylib all-clean: **55/55 sections, 100% bytes
+reusable** — confirms the dirty-bitmap mechanic on a real
+workload before writer integration. Cold path unchanged.
 
 ## What's landed
 

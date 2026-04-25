@@ -1,28 +1,38 @@
-//! Tier-2 foundation: per-output section-layout snapshot.
+//! Tier-2 foundation + tier-3 contributors map: per-output section
+//! layout snapshot.
 //!
-//! Captures every output section's `(name, alignment, file_offset,
-//! file_size, mem_offset, mem_size)` after `produce_layout` finishes.
-//! Persisted to `<output>.wild-layout`. On the next link the snapshot
-//! is loaded; tier 3 will use it to decide which sections of the
-//! previous output binary can be mmap-preserved instead of re-emitted.
+//! Captures, after `produce_layout` finishes, every output section's
+//! `(name, alignment, file_offset, file_size, mem_offset, mem_size)`
+//! AND the list of bundle-keyed input files that contributed bytes
+//! to it. Persisted to `<output>.wild-layout`. Next link can:
 //!
-//! This module is **capture + canary only** — no behavioural reuse
-//! yet. Shipping the storage layer first lets us prove round-trip
-//! correctness against real links (rust-analyzer, bevy-dylib) before
-//! anything starts trusting the snapshot for output construction.
+//! * Compare current vs previous layout to flag layout shifts (the
+//!   tier-2 canary path).
+//! * Combine the contributors map with the parse-skip dirty-input
+//!   set (`.wild-hashes`) to compute a per-section *dirty bitmap*.
+//!   Sections with no dirty contributors and unchanged layout are
+//!   safe for tier 3 to mmap-copy from the previous output.
 //!
-//! Format (schema v1):
+//! This module is **capture + canary only** today — no behavioural
+//! reuse yet. Shipping the storage layer first proves round-trip
+//! correctness on real links (bevy-dylib) before tier 3 starts
+//! trusting the snapshot for output construction.
+//!
+//! Format (schema v2):
 //!
 //! ```text
-//! +------------------- Header (48 bytes) ----------------------+
+//! +------------------- Header (64 bytes) ----------------------+
 //! | magic[8] = "WILDLO01"  schema u32  flags u32               |
 //! | section_count u32  _pad u32  sections_off u64              |
 //! | names_off u64  names_len u64                               |
+//! | contributors_off u64  contributors_len u64                 |
 //! +-- Sections (n × sizeof(SectionEntry) = 48 bytes each) -----+
 //! | name_off u32  name_len u32  alignment u64                  |
 //! | file_offset u64  file_size u64  mem_offset u64  mem_size u64
 //! +-- Names blob ----------------------------------------------+
 //! | concatenated section-name bytes                            |
+//! +-- Contributors blob (one record per section, in id order) -+
+//! | n_keys u32  _pad u32  keys: n_keys × [u8; 16]              |
 //! +------------------------------------------------------------+
 //! ```
 
@@ -31,8 +41,15 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const MAGIC: &[u8; 8] = b"WILDLO01";
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const REQUIRED_ALIGN: usize = 8;
+
+/// Per-input bundle key — same blake3-128 derivation as
+/// [`crate::parsed_input_cache::bundle_key_for`]. Re-exported here so
+/// the contributors map and the parse-skip cache speak the same key
+/// and can be cross-referenced without conversion.
+pub(crate) const KEY_LEN: usize = 16;
+pub(crate) type ContributorKey = [u8; KEY_LEN];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -45,11 +62,13 @@ struct Header {
     sections_off: u64,
     names_off: u64,
     names_len: u64,
+    contributors_off: u64,
+    contributors_len: u64,
 }
 
 const _: () = {
-    // 8 + 4 + 4 + 4 + 4 + 8 + 8 + 8 = 48.
-    assert!(size_of::<Header>() == 48);
+    // 8 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 = 64.
+    assert!(size_of::<Header>() == 64);
     assert!(std::mem::align_of::<Header>() <= REQUIRED_ALIGN);
 };
 
@@ -74,7 +93,11 @@ const _: () = {
 
 /// One section's resolved layout. The `name` is captured eagerly so a
 /// loaded snapshot stays meaningful even if the next link rearranges
-/// section IDs.
+/// section IDs. `contributors` is the set of bundle keys (one per
+/// input file) whose loaded sections fed bytes into this output
+/// section — empty for synthetic sections (prelude, epilogue,
+/// LINKEDIT regions). Sorted + deduped so equality compare is
+/// stable across links.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotSection {
     pub(crate) name: Vec<u8>,
@@ -83,6 +106,7 @@ pub(crate) struct SnapshotSection {
     pub(crate) file_size: u64,
     pub(crate) mem_offset: u64,
     pub(crate) mem_size: u64,
+    pub(crate) contributors: Vec<ContributorKey>,
 }
 
 /// Owned snapshot of every output section's layout. Used by both the
@@ -110,12 +134,57 @@ impl LayoutSnapshot {
         self.sections.is_empty()
     }
 
+    /// Sort + dedup every section's contributor list. Idempotent.
+    /// Must be called before any `PartialEq` compare or canary read,
+    /// because input-walk order at capture time isn't stable across
+    /// rayon-parallel layouts. `finish()` calls this internally for
+    /// the on-disk byte format; callers that compare in-memory
+    /// snapshots without serialising must invoke it explicitly.
+    pub(crate) fn canonicalize(&mut self) {
+        for s in &mut self.sections {
+            s.contributors.sort_unstable();
+            s.contributors.dedup();
+        }
+    }
+
+    /// Tier-3 helper: every section index whose contributor list
+    /// contains at least one *dirty* (i.e. not present in
+    /// `clean_inputs`) input. These sections cannot be reused from a
+    /// previous output binary; the writer must re-emit them.
+    ///
+    /// Sections with empty contributor lists (synthetic / writer-
+    /// generated) are *always* considered clean here — they have no
+    /// input dependencies, so their content depends only on the
+    /// resolved layout, which the layout snapshot already captures.
+    /// Tier 3's writer integration will gate reuse on
+    /// "section is clean here AND its `SnapshotSection` matches the
+    /// previous link's snapshot byte-for-byte".
+    pub(crate) fn dirty_section_indices(
+        &self,
+        clean_inputs: &hashbrown::HashSet<ContributorKey>,
+    ) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, s) in self.sections.iter().enumerate() {
+            if s.contributors.iter().any(|k| !clean_inputs.contains(k)) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
     /// Encode to a stable on-disk representation. Sections are
     /// emitted in the order they were pushed; that order is the
     /// canonical output-section order (see
     /// `OutputSections::ids_with_info`) so it's already
-    /// deterministic.
-    pub(crate) fn finish(self) -> Vec<u8> {
+    /// deterministic. Contributors are sorted before emit so two
+    /// runs with the same logical input set produce byte-identical
+    /// snapshots.
+    pub(crate) fn finish(mut self) -> Vec<u8> {
+        // Belt-and-braces: callers SHOULD have called `canonicalize`
+        // already, but `finish` repeats it so a forgetful call site
+        // can't ship a non-deterministic on-disk snapshot.
+        self.canonicalize();
+
         let n = self.sections.len();
         let header_size = size_of::<Header>();
         let sections_off = header_size;
@@ -141,7 +210,24 @@ impl LayoutSnapshot {
         }
 
         let names_len = names_blob.len();
-        let total = names_off + names_len;
+
+        // Build contributors blob: per-section { n_keys u32, _pad u32,
+        // keys: n × [u8;16] }. The pad keeps each section's record
+        // 8-byte aligned.
+        let contributors_off = names_off + names_len;
+        let contributors_off_aligned = contributors_off.next_multiple_of(REQUIRED_ALIGN);
+        let mut contributors_blob: Vec<u8> = Vec::new();
+        for s in &self.sections {
+            let n_keys = s.contributors.len() as u32;
+            contributors_blob.extend_from_slice(&n_keys.to_le_bytes());
+            contributors_blob.extend_from_slice(&[0u8; 4]); // _pad
+            for k in &s.contributors {
+                contributors_blob.extend_from_slice(k);
+            }
+        }
+        let contributors_len = contributors_blob.len();
+        let total = contributors_off_aligned + contributors_len;
+
         let mut out = vec![0u8; total];
 
         let header = Header {
@@ -153,6 +239,8 @@ impl LayoutSnapshot {
             sections_off: sections_off as u64,
             names_off: names_off as u64,
             names_len: names_len as u64,
+            contributors_off: contributors_off_aligned as u64,
+            contributors_len: contributors_len as u64,
         };
         let hdr_bytes = unsafe {
             std::slice::from_raw_parts(&header as *const Header as *const u8, header_size)
@@ -164,6 +252,8 @@ impl LayoutSnapshot {
         };
         out[sections_off..sections_off + sections_size].copy_from_slice(entries_bytes);
         out[names_off..names_off + names_len].copy_from_slice(&names_blob);
+        out[contributors_off_aligned..contributors_off_aligned + contributors_len]
+            .copy_from_slice(&contributors_blob);
 
         out
     }
@@ -202,6 +292,12 @@ impl LayoutSnapshot {
         if names_end > bytes.len() {
             return None;
         }
+        let contributors_off = header.contributors_off as usize;
+        let contributors_len = header.contributors_len as usize;
+        let contributors_end = contributors_off.checked_add(contributors_len)?;
+        if contributors_end > bytes.len() {
+            return None;
+        }
 
         let entries: &[SectionEntry] = unsafe {
             std::slice::from_raw_parts(
@@ -210,8 +306,10 @@ impl LayoutSnapshot {
             )
         };
         let names = &bytes[names_off..names_end];
+        let contributors_slice = &bytes[contributors_off..contributors_end];
 
         let mut sections = Vec::with_capacity(n);
+        let mut cursor = 0usize;
         for e in entries {
             let off = e.name_off as usize;
             let len = e.name_len as usize;
@@ -219,6 +317,30 @@ impl LayoutSnapshot {
             if end > names.len() {
                 return None;
             }
+
+            // Read this section's contributors record:
+            // n_keys u32 + _pad u32 + n_keys × [u8; KEY_LEN]
+            if cursor + 8 > contributors_slice.len() {
+                return None;
+            }
+            let n_keys = u32::from_le_bytes(
+                contributors_slice[cursor..cursor + 4].try_into().ok()?,
+            ) as usize;
+            cursor += 8; // skip n_keys + _pad
+            let keys_bytes = n_keys.checked_mul(KEY_LEN)?;
+            let keys_end = cursor.checked_add(keys_bytes)?;
+            if keys_end > contributors_slice.len() {
+                return None;
+            }
+            let mut contributors = Vec::with_capacity(n_keys);
+            for i in 0..n_keys {
+                let off = cursor + i * KEY_LEN;
+                let mut k = [0u8; KEY_LEN];
+                k.copy_from_slice(&contributors_slice[off..off + KEY_LEN]);
+                contributors.push(k);
+            }
+            cursor = keys_end;
+
             sections.push(SnapshotSection {
                 name: names[off..end].to_vec(),
                 alignment: e.alignment,
@@ -226,6 +348,7 @@ impl LayoutSnapshot {
                 file_size: e.file_size,
                 mem_offset: e.mem_offset,
                 mem_size: e.mem_size,
+                contributors,
             });
         }
 
@@ -287,6 +410,7 @@ mod tests {
             file_size: 0x4000,
             mem_offset: 0x100001000,
             mem_size: 0x4000,
+            contributors: vec![[1u8; KEY_LEN], [2u8; KEY_LEN]],
         });
         s.push(SnapshotSection {
             name: b"__cstring".to_vec(),
@@ -295,6 +419,7 @@ mod tests {
             file_size: 0x800,
             mem_offset: 0x100005000,
             mem_size: 0x800,
+            contributors: vec![[3u8; KEY_LEN]],
         });
         s
     }
@@ -402,5 +527,91 @@ mod tests {
         let a = fixture();
         let b = fixture();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn contributors_round_trip_through_disk_format() {
+        let s = fixture();
+        let bytes = s.finish();
+        let buf = aligned(&bytes);
+        let parsed = LayoutSnapshot::from_bytes(&buf).expect("parse");
+        assert_eq!(parsed.sections[0].contributors.len(), 2);
+        assert_eq!(parsed.sections[0].contributors[0], [1u8; KEY_LEN]);
+        assert_eq!(parsed.sections[0].contributors[1], [2u8; KEY_LEN]);
+        assert_eq!(parsed.sections[1].contributors.len(), 1);
+        assert_eq!(parsed.sections[1].contributors[0], [3u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn contributors_sort_dedup_makes_byte_equality_stable() {
+        // Two snapshots that differ only in contributor insertion
+        // order must serialise to byte-identical blobs after the
+        // sort+dedup the writer applies. Otherwise the canary's
+        // byte-compare would false-positive on rayon-induced
+        // shuffle.
+        let mk = |order: &[u8; 3]| {
+            let mut s = LayoutSnapshot::new();
+            s.push(SnapshotSection {
+                name: b"x".to_vec(),
+                alignment: 1,
+                file_offset: 0,
+                file_size: 0,
+                mem_offset: 0,
+                mem_size: 0,
+                contributors: order
+                    .iter()
+                    .map(|&b| [b; KEY_LEN])
+                    .chain(std::iter::once([order[0]; KEY_LEN])) // dup of first
+                    .collect(),
+            });
+            s.finish()
+        };
+        let a = mk(&[1, 2, 3]);
+        let b = mk(&[3, 1, 2]);
+        assert_eq!(a, b, "insertion-order should not affect on-disk bytes");
+    }
+
+    #[test]
+    fn dirty_section_indices_flags_only_sections_with_dirty_contributors() {
+        // s0 = clean inputs only → not dirty
+        // s1 = mix of clean + dirty → dirty
+        // s2 = synthetic (empty contributors) → not dirty
+        let mut snap = LayoutSnapshot::new();
+        let k1 = [1u8; KEY_LEN];
+        let k2 = [2u8; KEY_LEN];
+        let k3 = [3u8; KEY_LEN];
+        snap.push(SnapshotSection {
+            name: b"clean".to_vec(),
+            alignment: 1,
+            file_offset: 0,
+            file_size: 0,
+            mem_offset: 0,
+            mem_size: 0,
+            contributors: vec![k1, k2],
+        });
+        snap.push(SnapshotSection {
+            name: b"dirty".to_vec(),
+            alignment: 1,
+            file_offset: 0,
+            file_size: 0,
+            mem_offset: 0,
+            mem_size: 0,
+            contributors: vec![k1, k3], // k3 not in clean set
+        });
+        snap.push(SnapshotSection {
+            name: b"synth".to_vec(),
+            alignment: 1,
+            file_offset: 0,
+            file_size: 0,
+            mem_offset: 0,
+            mem_size: 0,
+            contributors: vec![],
+        });
+
+        let mut clean: hashbrown::HashSet<ContributorKey> = hashbrown::HashSet::new();
+        clean.insert(k1);
+        clean.insert(k2);
+        let dirty = snap.dirty_section_indices(&clean);
+        assert_eq!(dirty, vec![1]);
     }
 }

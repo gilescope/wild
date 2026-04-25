@@ -1557,24 +1557,58 @@ impl<'data, P: Platform> Layout<'data, P> {
         })
     }
 
-    /// Tier-2 capture: snapshot every output section's resolved
-    /// `(name, alignment, file_offset, file_size, mem_offset,
-    /// mem_size)` for persistence to `<output>.wild-layout`.
+    /// Tier-2 capture + tier-3 contributors: snapshot every output
+    /// section's resolved `(name, alignment, file_offset,
+    /// file_size, mem_offset, mem_size)` plus the bundle keys of
+    /// every input file that contributed loaded sections to it.
     /// Iteration order matches `OutputSectionMap::iter`, which is
     /// the canonical id order — deterministic across links so the
     /// canary's byte-compare is meaningful.
+    ///
+    /// Walks `group_layouts` once to build a per-section
+    /// contributors map; uses `bundle_key_for(path, entry_id)` so
+    /// contributors are keyed identically to the parse-skip cache —
+    /// tier 3 can intersect "dirty inputs" (from the cache key set)
+    /// with "section contributors" without a key-translation layer.
     pub(crate) fn to_layout_snapshot(&self) -> crate::layout_snapshot::LayoutSnapshot {
+        // Step 1: build a per-output-section contributors map by
+        // walking every loaded input section. Each input section's
+        // `part_id.output_section_id()` tells us which output
+        // section it feeds.
+        let mut contributors_map: hashbrown::HashMap<
+            crate::output_section_id::OutputSectionId,
+            Vec<crate::layout_snapshot::ContributorKey>,
+        > = hashbrown::HashMap::new();
+        for group in &self.group_layouts {
+            for file in &group.files {
+                let FileLayout::Object(obj) = file else {
+                    continue;
+                };
+                let key = crate::parsed_input_cache::bundle_key_for(
+                    obj.input.file.filename.as_path(),
+                    obj.input
+                        .entry
+                        .as_ref()
+                        .map(|e| e.identifier.as_slice()),
+                );
+                for slot in &obj.sections {
+                    if let crate::resolution::SectionSlot::Loaded(section) = slot {
+                        let osid = section.part_id.output_section_id();
+                        contributors_map.entry(osid).or_default().push(key);
+                    }
+                }
+            }
+        }
+
+        // Step 2: emit the snapshot in canonical section order.
         let mut snap = crate::layout_snapshot::LayoutSnapshot::new();
         self.section_layouts.for_each(|id, layout| {
-            // Use the output_sections' raw section name — the
-            // `display_name` accessor wraps in quotes which would
-            // bloat the snapshot and add no information. Empty-name
-            // sections (synthesised) get an empty byte slice.
             let name = self
                 .output_sections
                 .name(id)
                 .map(|n| n.bytes().to_vec())
                 .unwrap_or_default();
+            let contributors = contributors_map.remove(&id).unwrap_or_default();
             snap.push(crate::layout_snapshot::SnapshotSection {
                 name,
                 alignment: layout.alignment.value() as u64,
@@ -1582,8 +1616,14 @@ impl<'data, P: Platform> Layout<'data, P> {
                 file_size: layout.file_size as u64,
                 mem_offset: layout.mem_offset,
                 mem_size: layout.mem_size,
+                contributors,
             });
         });
+        // Canonicalise so PartialEq compares against on-disk
+        // snapshots cleanly — contributor insertion order is
+        // group-walk order, not deterministic in face of future
+        // parallelism in the capture path.
+        snap.canonicalize();
         snap
     }
 

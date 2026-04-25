@@ -623,6 +623,71 @@ impl Linker {
                      first divergence: {first_diff:?}"
                 );
             }
+            // Tier-3 dry-run: under WILD_INCREMENTAL_TIER3_PROBE=1,
+            // intersect the previous snapshot's contributors map with
+            // the current link's clean-input set and report how many
+            // sections (and bytes) tier 3's writer integration WOULD
+            // be able to mmap-preserve from the previous output.
+            // Read-only — doesn't change link behaviour. Lets us
+            // measure tier 3's potential ROI on a real bench before
+            // we integrate with the writer.
+            if std::env::var_os("WILD_INCREMENTAL_TIER3_PROBE").is_some()
+                && let Some(prev_snap) = layout_snapshot::read_snapshot(args.output())
+            {
+                // Build the clean-input key set. Archive members
+                // share their parent rlib's cleanness verdict (the
+                // whole rlib is either clean or dirty), but each
+                // member has its own bundle key. Walk the loaded
+                // group_layouts to get path + entry_id for every
+                // contributing input, then filter to those whose
+                // PARENT file is in `clean_input_paths`.
+                let clean_paths = clean_input_paths.as_ref();
+                let mut clean_keys: hashbrown::HashSet<layout_snapshot::ContributorKey> =
+                    hashbrown::HashSet::new();
+                for group in &layout.group_layouts {
+                    for file in &group.files {
+                        let layout::FileLayout::Object(obj) = file else {
+                            continue;
+                        };
+                        let path = obj.input.file.filename.as_path();
+                        if let Some(set) = clean_paths
+                            && !set.contains(path)
+                        {
+                            continue; // dirty rlib → member is dirty
+                        }
+                        let entry_id = obj
+                            .input
+                            .entry
+                            .as_ref()
+                            .map(|e| e.identifier.as_slice());
+                        clean_keys.insert(parsed_input_cache::bundle_key_for(path, entry_id));
+                    }
+                }
+
+                let dirty = prev_snap.dirty_section_indices(&clean_keys);
+                let total_sections = prev_snap.len();
+                let dirty_count = dirty.len();
+                let clean_count = total_sections - dirty_count;
+                let reusable_bytes: u64 = prev_snap
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !dirty.contains(i))
+                    .map(|(_, s)| s.file_size)
+                    .sum();
+                let total_bytes: u64 =
+                    prev_snap.sections.iter().map(|s| s.file_size).sum();
+                eprintln!(
+                    "wild tier-3 probe: {clean_count}/{total_sections} sections \
+                     reusable, {reusable_bytes} / {total_bytes} bytes ({pct:.1}%)",
+                    pct = if total_bytes == 0 {
+                        0.0
+                    } else {
+                        100.0 * reusable_bytes as f64 / total_bytes as f64
+                    }
+                );
+            }
+
             // Persist the fresh snapshot for the next link.
             if let Err(e) = layout_snapshot::write_snapshot(args.output(), snapshot) {
                 if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
