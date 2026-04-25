@@ -31,6 +31,7 @@ pub(crate) mod incremental_cache;
 pub(crate) mod input_data;
 pub(crate) mod layout;
 pub(crate) mod layout_rules;
+pub(crate) mod layout_snapshot;
 pub(crate) mod sdk_cache;
 pub(crate) mod suffix_share;
 // The ELF Gold-plugin LTO code lives physically under `lto/` as part
@@ -570,6 +571,69 @@ impl Linker {
             output_sections,
             &mut output,
         )?;
+
+        // Tier-2 capture: snapshot the resolved section layout to
+        // `<output>.wild-layout` so the next link can consume it
+        // (tier 3 will use it to mmap-preserve unchanged sections of
+        // the previous output binary). Best-effort — any IO failure
+        // is silent. Gated on the same parse-skip env vars as tier 1
+        // so cold/non-incremental links pay no overhead.
+        let layout_snapshot_active = std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some();
+        if layout_snapshot_active {
+            let snapshot = layout.to_layout_snapshot();
+            // Tier-2 canary: if the previous link's snapshot is on
+            // disk, byte-compare against the fresh one. Divergence
+            // means either layout went non-deterministic or the
+            // snapshot format drifted — both block tier 3 from
+            // safely consuming the snapshot, so we panic loud rather
+            // than silently corrupt.
+            if std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some()
+                && let Some(prev) = layout_snapshot::read_snapshot(args.output())
+                && prev != snapshot
+            {
+                let prev_n = prev.len();
+                let cur_n = snapshot.len();
+                let mut first_diff: Option<(usize, String)> = None;
+                for (i, (a, b)) in prev.sections.iter().zip(snapshot.sections.iter()).enumerate() {
+                    if a != b {
+                        first_diff = Some((
+                            i,
+                            format!(
+                                "name={:?}/{:?} file={:#x}/{:#x} size={:#x}/{:#x} mem={:#x}/{:#x}",
+                                String::from_utf8_lossy(&a.name),
+                                String::from_utf8_lossy(&b.name),
+                                a.file_offset,
+                                b.file_offset,
+                                a.file_size,
+                                b.file_size,
+                                a.mem_offset,
+                                b.mem_offset,
+                            ),
+                        ));
+                        break;
+                    }
+                }
+                panic!(
+                    "wild layout-canary mismatch: prev={prev_n} sections, cur={cur_n} sections; \
+                     first divergence: {first_diff:?}"
+                );
+            }
+            // Persist the fresh snapshot for the next link.
+            if let Err(e) = layout_snapshot::write_snapshot(args.output(), snapshot) {
+                if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
+                    eprintln!(
+                        "wild layout-snapshot: write to {} failed: {}",
+                        args.output().display(),
+                        e
+                    );
+                }
+            }
+        }
 
         P::write_output_file::<A>(&mut output, &layout)?;
         diff::maybe_diff()?;

@@ -47,10 +47,21 @@ overlaps with parse-side work elsewhere so the *visible* tax is
 ~25 ms. The hot CPU is `mmap` itself — 1649 syscalls each pay
 the kernel's per-process VM-map lock. Within-group serial mmap
 is *slower* (tested: 380 vs 370 ms) because we lose the
-per-shard concurrency. The remaining lever is **bundling**: one
-cache file per output binary (indexed by input hash) replaces
-1649 mmap syscalls with one. That's a schema bump, parked as
-"tier-1.5".
+per-shard concurrency. **Tier-1.5 (landed 2026-04-25)** replaces
+1649 cache files with one bundle at `<output>.wild-pi-cache`,
+collapsing the syscall storm to a single mmap. Tax dropped from
++25 ms to ~0 ms — break-even on the worst case.
+
+**Tier-2 foundation (landed 2026-04-25)** — capture + canary.
+`<output>.wild-layout` stores a per-section snapshot
+`(name, alignment, file_offset, file_size, mem_offset,
+mem_size)` after `produce_layout` finishes. Snapshot is
+2.8 KiB on bevy-dylib. `WILD_INCREMENTAL_LAYOUT_CANARY=1`
+re-runs layout and panics on any divergence vs the previous
+snapshot — proves layout determinism end-to-end. No
+behavioural reuse yet; tier 3 (per-section memcpy skip)
+consumes the snapshot to decide which sections of the previous
+output binary can be mmap-preserved.
 
 ## What's landed
 

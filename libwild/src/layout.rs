@@ -1557,6 +1557,36 @@ impl<'data, P: Platform> Layout<'data, P> {
         })
     }
 
+    /// Tier-2 capture: snapshot every output section's resolved
+    /// `(name, alignment, file_offset, file_size, mem_offset,
+    /// mem_size)` for persistence to `<output>.wild-layout`.
+    /// Iteration order matches `OutputSectionMap::iter`, which is
+    /// the canonical id order — deterministic across links so the
+    /// canary's byte-compare is meaningful.
+    pub(crate) fn to_layout_snapshot(&self) -> crate::layout_snapshot::LayoutSnapshot {
+        let mut snap = crate::layout_snapshot::LayoutSnapshot::new();
+        self.section_layouts.for_each(|id, layout| {
+            // Use the output_sections' raw section name — the
+            // `display_name` accessor wraps in quotes which would
+            // bloat the snapshot and add no information. Empty-name
+            // sections (synthesised) get an empty byte slice.
+            let name = self
+                .output_sections
+                .name(id)
+                .map(|n| n.bytes().to_vec())
+                .unwrap_or_default();
+            snap.push(crate::layout_snapshot::SnapshotSection {
+                name,
+                alignment: layout.alignment.value() as u64,
+                file_offset: layout.file_offset as u64,
+                file_size: layout.file_size as u64,
+                mem_offset: layout.mem_offset,
+                mem_size: layout.mem_size,
+            });
+        });
+        snap
+    }
+
     pub(crate) fn layout_data(&self) -> linker_layout::Layout {
         let files = self
             .group_layouts
