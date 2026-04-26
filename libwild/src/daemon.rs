@@ -354,8 +354,8 @@ fn run_link_in_process(req: &Request) -> Result<Response> {
     // (notably tracing's global subscriber from a prior link, which
     // caches a `dup(2)` of the redirected stderr) can't deadlock us
     // by keeping the pipe write end open indefinitely.
-    let stderr_bytes = drain_fd_with_timeout(stderr_pipe[0]);
-    let stdout_bytes = drain_fd_with_timeout(stdout_pipe[0]);
+    let stderr_bytes = drain_fd_nonblocking(stderr_pipe[0]);
+    let stdout_bytes = drain_fd_nonblocking(stdout_pipe[0]);
 
     let exit_code = match result {
         Ok(Ok(code)) => code,
@@ -375,34 +375,40 @@ fn run_link_in_process(req: &Request) -> Result<Response> {
     })
 }
 
-/// Drain a pipe read-fd until either EOF or 50 ms of no data. The
-/// timeout is the safety net for the hang we hit in earlier in-process
-/// burnins: tracing's global subscriber, installed during link N,
-/// holds an internal `dup(2)` of the then-redirected stderr fd. After
-/// we restore the daemon's terminal stderr, tracing still holds a
-/// reference to the pipe write end — `read()` on the pipe never sees
-/// EOF and a naive blocking drain hangs indefinitely. With a poll
-/// timeout, we settle for "drained whatever was produced + a short
-/// quiescence period" instead.
-fn drain_fd_with_timeout(fd: libc::c_int) -> Vec<u8> {
+/// Drain a pipe read-fd in non-blocking mode. The link's writes are
+/// synchronous — by the time we get here, anything the link produced
+/// is already in the pipe buffer. We just need to suck it out without
+/// blocking on a writer that never closes.
+///
+/// The "writer that never closes" case: tracing's global subscriber
+/// (installed during link N) holds an internal `dup(2)` of the
+/// then-redirected stderr fd. After we restore the daemon's terminal
+/// stderr, tracing still holds a refcount on the pipe's write end —
+/// the read side would never see EOF. A blocking read would hang;
+/// previously we used a 50 ms `poll` timeout as a safety net, but
+/// that taxed every successful link by the same 50 ms when the dup
+/// was actually present. Non-blocking + read-until-EAGAIN drains
+/// everything immediately and never blocks.
+fn drain_fd_nonblocking(fd: libc::c_int) -> Vec<u8> {
+    // Set O_NONBLOCK so a stuck-open writer can't pin us.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let r = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 50) };
-        if r <= 0 {
-            // 0 = timeout, <0 = error. Either way, stop draining.
-            break;
-        }
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+            continue;
         }
-        out.extend_from_slice(&buf[..n as usize]);
+        // n == 0: clean EOF. n < 0: errno EAGAIN/EWOULDBLOCK
+        // (writer still alive but no data) or another I/O error;
+        // either way we're done draining.
+        break;
     }
     unsafe { libc::close(fd) };
     out
