@@ -941,10 +941,20 @@ fn write_direct_inner<A: Arch<Platform = MachO>>(
     // (which drops contributions to those sections), the writer
     // never overwrites these bytes and never wastes work computing
     // them either. Lock once, copy all ranges, release.
+    //
+    // Skipped when `use_in_place` is set — `file_writer` opened the
+    // output `UpdateInPlace`, so the file ALREADY contains prev's
+    // bytes (they were never wiped). The mmap of that file gives
+    // us prev's content for free; copying onto itself would just
+    // dirty unchanged pages and force the kernel to write them
+    // back to disk.
     crate::tier3_skip::with(|state| {
         let Some(state) = state else {
             return;
         };
+        if state.use_in_place {
+            return;
+        }
         for &(off, size) in &state.ranges {
             let end = off + size;
             if end > buf.len() || end > state.prev_bytes.len() {

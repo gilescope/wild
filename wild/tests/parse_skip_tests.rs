@@ -279,9 +279,10 @@ fn parse_skip_gates_round_trip() {
     );
     assert!(ok, "tier-3 skip link failed:\n{out}");
     assert!(
-        out.contains("wild tier-3 skip: bypassed writer"),
+        out.contains("wild tier-3 skip:"),
         "tier-3 skip path didn't fire — expected `wild tier-3 skip: \
-         bypassed writer …` in stderr but got:\n{out}"
+         …` (either `bypassed writer …` or `in-place reuse …`) in \
+         stderr but got:\n{out}"
     );
     let new_size = std::fs::metadata(&write_out)
         .map(|m| m.len())
@@ -338,7 +339,7 @@ fn parse_skip_gates_round_trip() {
     );
     assert!(ok, "--incremental-cache=read-write link failed:\n{out}");
     assert!(
-        out.contains("wild tier-3 skip: bypassed writer"),
+        out.contains("wild tier-3 skip:"),
         "--incremental-cache=read-write didn't fire the writer-skip path:\n{out}"
     );
     assert_eq!(

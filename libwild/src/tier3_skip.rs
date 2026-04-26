@@ -46,6 +46,18 @@ pub(crate) struct State {
     /// hand out. Indexed by `(file_offset, file_size)` from
     /// `ranges`.
     pub(crate) prev_bytes: &'static [u8],
+    /// When `true`, `file_writer` opens the output path
+    /// `UpdateInPlace` (no rename, no truncate), preserving prev's
+    /// bytes on disk. The writer then overwrites only the changed
+    /// sections — the reusable bytes never leave the file. Saves
+    /// the per-link pre-fill memcpy (50 MB on bevy-class outputs
+    /// = ~17 ms wall) AND avoids re-writing the unchanged blocks
+    /// to disk.
+    ///
+    /// Tradeoff: not atomic. A writer crash mid-write leaves the
+    /// file at `<output>` partially-modified. Cold-link retry
+    /// recovers (whole-link skip rejects, full link rebuilds).
+    pub(crate) use_in_place: bool,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -77,6 +89,15 @@ pub(crate) fn with<R>(f: impl FnOnce(Option<&State>) -> R) -> R {
     f(guard.as_ref())
 }
 
+/// `true` if tier-3 has installed state that wants `file_writer` to
+/// open the output `UpdateInPlace` (no rename, no truncate). The
+/// existing bytes ARE the pre-fill — saves a 50 MB memcpy on
+/// bevy-class outputs. Queried by `file_writer::set_size`.
+pub(crate) fn wants_in_place() -> bool {
+    let guard = STATE.lock().expect("tier3_skip mutex poisoned");
+    guard.as_ref().is_some_and(|s| s.use_in_place)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +120,7 @@ mod tests {
             reusable_ids: reusable,
             ranges: vec![(0x1000, 0x4000)],
             prev_bytes: &[],
+            use_in_place: false,
         }));
         assert!(contains(TEXT));
         set(None);

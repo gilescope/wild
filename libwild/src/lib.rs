@@ -818,18 +818,29 @@ impl Linker {
                 && tier3_fully_reusable
                 && let Some(prev_bytes) = prev_output_mmap
             {
+                // mmap-COW path: tell `file_writer` to open the
+                // output `UpdateInPlace`. The file already contains
+                // prev's bytes, so no memcpy is needed — the writer
+                // closure becomes a no-op. Saves the 50 MB memcpy
+                // on bevy-class outputs.
+                tier3_skip::set(Some(tier3_skip::State {
+                    reusable_ids: hashbrown::HashSet::new(),
+                    ranges: Vec::new(),
+                    prev_bytes,
+                    use_in_place: true,
+                }));
                 output.set_size(prev_bytes.len() as u64);
-                output.write(&layout, |sized_output, _| {
-                    let dst: &mut [u8] = &mut sized_output.out;
-                    let n = prev_bytes.len().min(dst.len());
-                    dst[..n].copy_from_slice(&prev_bytes[..n]);
+                output.write(&layout, |_sized_output, _| {
+                    // Output file is already prev's bytes via
+                    // UpdateInPlace; nothing to do.
                     Ok(())
                 })?;
+                tier3_skip::set(None);
                 if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
                     || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
                 {
                     eprintln!(
-                        "wild tier-3 skip: bypassed writer, copied {} bytes from prev output",
+                        "wild tier-3 skip: in-place reuse of {} bytes from prev output",
                         prev_bytes.len()
                     );
                 }
@@ -890,6 +901,9 @@ impl Linker {
                         reusable_ids,
                         ranges,
                         prev_bytes,
+                        // mmap-COW: open the output `UpdateInPlace`
+                        // so prev's bytes ARE the pre-fill.
+                        use_in_place: true,
                     }));
                     true
                 } else {

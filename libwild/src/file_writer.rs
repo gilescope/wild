@@ -200,7 +200,20 @@ impl Output {
                     .expect("set_size must only be called once");
                 let path = self.path.clone();
 
-                let output_config = self.config;
+                let mut output_config = self.config;
+
+                // Tier-3 phase 3 mmap-COW: when partial writer-skip
+                // is active, override `UnlinkAndReplace` with
+                // `UpdateInPlace`. The previous output's bytes ARE
+                // the pre-fill — opening the file without truncate
+                // preserves them on disk. The writer overwrites
+                // only the dirty sections; the reusable ones are
+                // already correct. Saves the per-link 50 MB memcpy
+                // (~17 ms wall on bevy-class outputs) AND avoids
+                // re-writing the unchanged blocks.
+                if crate::tier3_skip::wants_in_place() {
+                    output_config.file_write_mode = FileWriteMode::UpdateInPlace;
+                }
 
                 rayon::spawn(move || {
                     verbose_timing_phase!("Create output file");
@@ -257,9 +270,16 @@ impl Output {
                 wait_for_sized_output(sized_output_recv)?
             }
             FileCreator::Regular { file_size } => {
-                delete_old_output(&self.path);
+                let in_place = crate::tier3_skip::wants_in_place();
+                if !in_place {
+                    delete_old_output(&self.path);
+                }
                 let file_size = file_size.context("set_size was never called")?;
-                self.create_file_non_lazily(file_size)?
+                let mut config = self.config;
+                if in_place {
+                    config.file_write_mode = FileWriteMode::UpdateInPlace;
+                }
+                SizedOutput::new(self.path.clone(), config, file_size)?
             }
         };
         write_fn(&mut sized_output, layout)?;
