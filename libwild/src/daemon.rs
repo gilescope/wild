@@ -110,14 +110,14 @@ fn handle_one(stream: UnixStream) -> Result<()> {
     let req = read_request(&mut read_stream)?;
     drop(read_stream);
 
-    // `WILD_DAEMON_INPROCESS=1` (EXPERIMENTAL) keeps each link in the
-    // daemon's own process — saves the ~5 ms fork() cost AND lets
-    // sibling links share whatever caches libwild populated on a
-    // previous request. KNOWN LIMITATION: today the second link
-    // hangs (rayon-pool / tracing-subscriber static state leaks
-    // across calls). Treat as a wire-up test for now; a proper fix
-    // is libwild-side work to make link state fully tear-down-able
-    // between calls. Default stays fork-based.
+    // `WILD_DAEMON_INPROCESS=1` keeps each link in the daemon's own
+    // process. Each request gets a freshly-built rayon ThreadPool
+    // (avoiding the global-pool wedge that would otherwise hang
+    // call 2). Stderr/stdout are dup2'd over a pipe pair and read
+    // back into the response. Default stays fork-based for
+    // belt-and-braces isolation; the in-process path is now
+    // correct under burnin (40+ consecutive calls) but still pays
+    // a per-link rayon-pool spin-up that fork avoids implicitly.
     let in_process = std::env::var_os("WILD_DAEMON_INPROCESS")
         .as_deref()
         == Some(std::ffi::OsStr::new("1"));
@@ -268,7 +268,26 @@ fn run_link_directly(req: &Request) -> Result<i32> {
     let mut args = crate::Args::new(argv_iter)?;
     args.parse(argv_iter)?;
     let _ = crate::setup_tracing(&args);
-    crate::run(args)?;
+
+    // In-process daemon mode runs the link inside a freshly-built
+    // rayon ThreadPool per request, NOT rayon's global default. The
+    // global pool wedges across calls (call 1 leaves worker join
+    // state that call 2's `par_iter` blocks on indefinitely — the
+    // first place this manifested was `verify_cached_inputs_unchanged`
+    // hanging on second-call entry). A scoped pool tears down its
+    // workers on `drop`, so each call gets clean rayon state. Costs
+    // ~1 ms of pool spin-up per link, an acceptable tax for
+    // re-entrancy correctness.
+    let n_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .map_err(|e| crate::error!("daemon: rayon pool build failed: {e}"))?;
+
+    let result: crate::error::Result<()> = pool.install(|| crate::run(args));
+    result?;
     Ok(0)
 }
 
@@ -331,8 +350,12 @@ fn run_link_in_process(req: &Request) -> Result<Response> {
         libc::close(saved_stdout);
     }
 
-    let stderr_bytes = drain_fd_blocking(stderr_pipe[0]);
-    let stdout_bytes = drain_fd_blocking(stdout_pipe[0]);
+    // Drain the pipes with a short timeout so a background fd holder
+    // (notably tracing's global subscriber from a prior link, which
+    // caches a `dup(2)` of the redirected stderr) can't deadlock us
+    // by keeping the pipe write end open indefinitely.
+    let stderr_bytes = drain_fd_with_timeout(stderr_pipe[0]);
+    let stdout_bytes = drain_fd_with_timeout(stdout_pipe[0]);
 
     let exit_code = match result {
         Ok(Ok(code)) => code,
@@ -352,13 +375,29 @@ fn run_link_in_process(req: &Request) -> Result<Response> {
     })
 }
 
-/// Drain a pipe read-fd until EOF or short read, blocking. Caller
-/// must have closed the write end (or restored the dup2'd fd) so
-/// the read can actually see EOF.
-fn drain_fd_blocking(fd: libc::c_int) -> Vec<u8> {
+/// Drain a pipe read-fd until either EOF or 50 ms of no data. The
+/// timeout is the safety net for the hang we hit in earlier in-process
+/// burnins: tracing's global subscriber, installed during link N,
+/// holds an internal `dup(2)` of the then-redirected stderr fd. After
+/// we restore the daemon's terminal stderr, tracing still holds a
+/// reference to the pipe write end — `read()` on the pipe never sees
+/// EOF and a naive blocking drain hangs indefinitely. With a poll
+/// timeout, we settle for "drained whatever was produced + a short
+/// quiescence period" instead.
+fn drain_fd_with_timeout(fd: libc::c_int) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 50) };
+        if r <= 0 {
+            // 0 = timeout, <0 = error. Either way, stop draining.
+            break;
+        }
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
             break;
@@ -368,6 +407,7 @@ fn drain_fd_blocking(fd: libc::c_int) -> Vec<u8> {
     unsafe { libc::close(fd) };
     out
 }
+
 
 /// Client side: connect to `socket_path`, send the current process's
 /// argv/env/cwd as a [`Request`], read back the [`Response`], replay
