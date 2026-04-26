@@ -57,11 +57,131 @@ Of the 261 extras, 59 trace to `libzstd_sys-*.rlib`. The rest span at least: `ra
 - **Not chained fixups in general.** Wild's bevy-dylib output also uses `LC_DYLD_CHAINED_FIXUPS` and runs cleanly.
 - **Not `-dead_strip`.** Stripping the flag from the link line doesn't change the missing-symbol count (432 vs 433).
 
-## What likely is the cause
+## Investigation update (2026-04-26)
 
-The pattern (some `t`-visibility symbols from the same `.o` file are kept while their `T`-visibility neighbours are demoted to `U`) points at an inconsistency between liveness tracking and symtab emission rather than archive extraction. `process_archive` in `libwild/src/input_data.rs` already loads every `.o` from each rlib up-front, so the `.o` files themselves are all in the symbol DB. The bug looks like a layout/output bug specific to archive-sourced external symbols whose function bodies wild decides to drop, where the dropped-symbol entry is left in the symtab as undefined external instead of being deleted alongside the body.
+**Theory that turned out wrong:** I suspected GOT-cursor spill —
+`create_resolution` over-allocating past `__got`'s reserved size.
+Confirmed false: tracing every `create_resolution` GOT allocation
+via the new `WILD_DEBUG_GOT_SPILL=1` env var shows exactly 252
+allocations on a wild self-link, all within `__got`'s 2016-byte
+reservation (highest address `0x1006c07d8`, end is `0x1006c07e0`).
+So the GOT allocator is fine.
 
-A targeted experiment that would confirm: in `libwild/src/macho_writer.rs`'s symtab emitter, find the path that emits `(undefined) external` symbols and check whether it's filtering out symbols that *did* have a definition in an archive but were stripped. If so, the fix is either to keep those bodies live (because *something* in the link still references the symbol — the U entry exists for a reason) or to delete the U entry when emitting.
+**What's confirmed:**
+
+- Trace inside `write_macho`'s chained-fixup encoder shows the
+  encoder writes the *correct* bytes (with `next_stride=2`) at
+  `__got` slot 0. A read-back immediately after the loop confirms
+  the slot has the encoded value.
+- The final binary's `__got` slot 0 has a **different** value — the
+  pre-encoder bytes that `write_got_entries` wrote (raw absolute
+  address with no `next_stride`). Something between the encoder
+  and the file flush overwrites `__got`.
+- `dyld_info -fixup_chains /tmp/wild-broken` shows seg[2]
+  (`__DATA_CONST,__got`) with a single chain start at offset 0
+  and only `next=0` everywhere. That makes sense: most slots have
+  the *raw absolute* bytes (untouched chained-fixup format would
+  be a rebase with target = absolute - image_base, and `next` set
+  by the encoder; we see neither).
+- The crash address `0x7272657274735f00` decodes to the bytes
+  `\0_strerr...` which match what's at file offset `0x6b4b70`
+  in the binary — the `__LINKEDIT` strtab containing the symbol
+  name string `_strerror_r\0`. So the runtime got that string-
+  table address as the value of some GOT slot, dereferenced it as
+  a Mutex pointer, and SIGSEGV'd.
+- 261 symbols (zstd internals + Rust-mangled names from
+  `regex_syntax` / `unsafe_libyaml` / `anyhow` / etc.) appear in
+  the binary's symtab as undefined external but NOT in the
+  chained-fixups imports table — dyld doesn't try to bind them.
+
+**Open question:** what writes to the `__got` slots *after* the
+chained-fixup encoder runs (line ~1947 of `macho_writer.rs`) but
+before the file is flushed? The post-encoder snapshot shows correct
+encoded bytes; the on-disk file shows raw absolute addresses. Either
+a second pass through `write_got_entries` runs (didn't see one in
+the call graph), or a tier-3 / mmap path overlays previous-run
+bytes back on top.
+
+A targeted next step: instrument `sized_output.flush()` and
+`crate::macho_codesign::sign_in_place` to log what they see at
+`file_off=0x6c0000` on entry; whichever shows the encoded bytes
+*not* present is the layer that overwrote them. The post-encoder
+snapshot already confirms the encoder put them there; it's the
+later layer that matters.
+
+## (Disproven "GOT spill" hypothesis below — kept as history)
+
+> **WRONG**: This section blamed `create_resolution` over-allocating
+> past `__got`'s reserved size. Disproven by `WILD_DEBUG_GOT_SPILL=1`
+> tracing — the allocator runs exactly 252 times on a self-link and
+> all addresses stay within the reserved 2016 bytes. The real bug is
+> in the chained-fixup write-back step, not the GOT allocator.
+
+Tracing wild's chained-fixup writer (`libwild/src/macho_writer.rs`,
+fn `write_macho`) reveals the bug isn't in the symtab emitter at all
+— it's in **GOT-slot allocation**. Each external symbol that needs a
+GOT entry calls `MachO::create_resolution`, which advances a cursor
+inside `memory_offsets[part_id::GOT]`. The size-estimation pass
+(`MachO::allocate_resolution` driven by `finalise_symbol_sizes` in
+`libwild/src/layout.rs`) is *supposed* to count exactly the same
+symbols and pre-reserve `GOT_size = needs_got_count × 8` bytes.
+
+For wild's self-link the two passes disagree massively. The
+allocated `__got` section is **2016 bytes** (252 entries) — that's
+what `dyld_info -segments /tmp/wild-broken` shows — yet
+`create_resolution` runs against the cursor for **6,627 fixups**
+(per a chained-fixup count trace). The cursor spills past `__got`'s
+end (`0x1006C07E0`) into `__DATA`, then past `__DATA`, finally into
+`__LINKEDIT` where the symtab string pool lives. `_strerror_r`'s
+"got_address" comes back as `0x10074a850`, which decodes as a file
+offset deep in the strtab — the bytes there happen to spell
+fragments of Rust mangled names. dyld faithfully writes these
+fragment-bytes into the slot at runtime; when the binary's stderr
+init code dereferences that slot it gets a Mutex pointer of
+`0x7272657274735f00` (`\0_strerr` ASCII) and crashes.
+
+Confirmation evidence:
+
+- A trace at the chained-fixup encoder shows it writes **correct**
+  bytes to `__got` slot 0 with `next_stride=2`. The post-encoder
+  read-back confirms.
+- `dyld_info -fixup_chains` on the broken binary shows seg[2]
+  (`__DATA_CONST`, where `__got` lives) has only `start[0]: 0x0000`
+  — a one-entry chain — but inspecting the raw bytes shows the
+  chain was emitted with `next=0` everywhere, terminating after the
+  first entry. dyld processes only that one slot; the rest stay as
+  their pre-encoder bytes (raw absolute addresses written by
+  `write_got_entries`).
+- The `_strerror_r` resolution has both PLT and GOT addresses
+  populated; the GOT address is well outside the bounds the layout
+  reserved.
+
+So actually two related bugs:
+
+1. **GOT-cursor spill.** `create_resolution` allocates GOT slots at
+   addresses past `__got`'s end. Every spilled symbol points into a
+   neighbouring section.
+2. **Chain encoding partial-overwrite.** The chained-fixup encoder
+   only links chains up to the SIZE the layout reserved for `__got`.
+   The 6,627 - 252 spilled fixups were never linked into a chain;
+   their slots stay at whatever bytes `apply_relocations` /
+   `write_got_entries` wrote. (The first slot looks correctly
+   chained because `dyld_info` reports `start[0]: 0x0000` and
+   `next=0` — a chain of one — which is technically valid encoding,
+   just incomplete.)
+
+The PRIMARY fix is bug 1: align `finalise_symbol_sizes`'s symbol
+iteration with `finalise_symbol_resolution`'s so the same set of
+symbols is counted as is allocated. Likely root: the size pass uses
+`is_canonical(symbol_id)` to filter (see `layout.rs:810`), while the
+resolution pass uses a different predicate. The two predicates need
+to converge.
+
+A guard rail to prevent silent corruption (NOT a fix) ships in this
+commit: setting `WILD_DEBUG_GOT_SPILL=1` traces every
+`create_resolution` GOT allocation to `/tmp/wild-got-spill.log`,
+making it easy to spot when the cursor crosses `__got`'s reserved
+end.
 
 ## Workaround
 

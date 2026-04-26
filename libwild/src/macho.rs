@@ -3950,6 +3950,34 @@ impl platform::Platform for MachO {
             *memory_offsets.get_mut(crate::part_id::GOT) += 8;
             got_address = Some(got_addr);
         }
+        // Diagnostic for the wild-on-wild self-link bug (filed in
+        // BUG-wild-on-wild.md). When this fires it means `create_
+        // resolution` is being called for more symbols than the
+        // size-estimation pass (`allocate_resolution` in
+        // `finalise_symbol_sizes`) counted — so the GOT/PLT_GOT
+        // cursors spill past the section's allocated memory and
+        // get_addresses end up pointing into adjacent sections
+        // (e.g. __LINKEDIT's strtab). Gated on env var so the
+        // user-driven repro path can capture an early bail with
+        // exact symbol info instead of producing a silently
+        // corrupt binary that segfaults at runtime. The proper
+        // fix lives in layout's two-pass disagreement and isn't
+        // landed yet — this is a guard rail.
+        if std::env::var_os("WILD_DEBUG_GOT_SPILL").is_some() {
+            use std::io::Write as _;
+            if let Some(addr) = got_address {
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/wild-got-spill.log")
+                {
+                    let _ = writeln!(
+                        log,
+                        "got_alloc addr=0x{addr:x} flags={flags:?} raw_value=0x{raw_value:x}"
+                    );
+                }
+            }
+        }
 
         crate::layout::Resolution {
             raw_value,
