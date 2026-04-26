@@ -935,6 +935,29 @@ fn write_direct_inner<A: Arch<Platform = MachO>>(
     precount: &MachOSymtabPrecount,
 ) -> Result {
     let buf: &mut [u8] = &mut sized_output.out[..];
+    // Tier-3 phase 3 pre-fill: copy the previous output's bytes
+    // into every reusable section's file range BEFORE the platform
+    // writer runs. Coupled with `split_output_for_objects`'s filter
+    // (which drops contributions to those sections), the writer
+    // never overwrites these bytes and never wastes work computing
+    // them either. Lock once, copy all ranges, release.
+    crate::tier3_skip::with(|state| {
+        let Some(state) = state else {
+            return;
+        };
+        for &(off, size) in &state.ranges {
+            let end = off + size;
+            if end > buf.len() || end > state.prev_bytes.len() {
+                // Out-of-range — silent skip rather than panic;
+                // the canary path catches the divergence loud
+                // when the user opts in. Phase 3 trusts the
+                // ranges came from a snapshot whose layout was
+                // proven to match.
+                continue;
+            }
+            buf[off..end].copy_from_slice(&state.prev_bytes[off..end]);
+        }
+    });
     let final_size = write_macho::<A>(
         &mut buf[..alloc_size],
         layout,
@@ -4636,6 +4659,28 @@ fn split_output_for_objects<'a>(
             contribs.push((obj_idx, sec_idx, file_offset, padded, output_addr));
         }
     }
+    // Tier-3 phase 3: when partial-skip state is installed, drop
+    // every contribution whose target output section is in the
+    // reusable set. The writer never iterates these — the bytes
+    // were pre-filled from the previous output before the writer
+    // ran, and skipping the iterations is where the perf win
+    // lives. Probe lifts a single lock for the whole filter so the
+    // hot path is one acquire instead of N.
+    let tier3_active = crate::tier3_skip::with(|s| s.is_some());
+    if tier3_active {
+        contribs.retain(|&(obj_idx, sec_idx, _, _, _)| {
+            let obj = &objects[obj_idx];
+            let Some(slot) = obj.sections.get(sec_idx) else {
+                return true;
+            };
+            let crate::resolution::SectionSlot::Loaded(section) = slot else {
+                return true;
+            };
+            let osid = section.part_id.output_section_id();
+            !crate::tier3_skip::contains(osid)
+        });
+    }
+
     contribs.sort_by_key(|&(_, _, off, _, _)| off);
 
     let mut by_object: Vec<Vec<SectionOutput<'a>>> =

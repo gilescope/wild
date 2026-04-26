@@ -147,13 +147,48 @@ impl LayoutSnapshot {
         }
     }
 
+    /// Phase-2b "wholesale prev → out copy" predicate: every section
+    /// has matching layout AND no dirty contributors. Synthetic
+    /// sections (empty contributors) are allowed because phase-2b
+    /// copies the entire output file from prev, so even synthetic
+    /// regions like the Mach-O header survive byte-equivalent.
+    /// Returns `true` only when EVERY section is either reusable or
+    /// purely synthetic.
+    pub(crate) fn is_fully_reusable(
+        prev: &LayoutSnapshot,
+        cur: &LayoutSnapshot,
+        clean_inputs: &hashbrown::HashSet<ContributorKey>,
+    ) -> bool {
+        if prev.sections.len() != cur.sections.len() {
+            return false;
+        }
+        prev.sections.iter().zip(&cur.sections).all(|(a, b)| {
+            a.name == b.name
+                && a.file_offset == b.file_offset
+                && a.file_size == b.file_size
+                && a.mem_offset == b.mem_offset
+                && a.mem_size == b.mem_size
+                && a.contributors.iter().all(|k| clean_inputs.contains(k))
+        })
+    }
+
     /// Tier-3 reuse predicate: section indices where ALL of the
     /// following hold against `prev` (the snapshot from the previous
     /// link, loaded from disk):
     ///
-    /// * Same `(file_offset, file_size, mem_offset, mem_size, name)`
+    /// * Same `(name, file_offset, file_size, mem_offset, mem_size)`
     ///   — the section hasn't moved or grown, so the bytes a cold
     ///   writer would emit live at the same spot they used to.
+    /// * The section has at least one contributor — synthetic /
+    ///   writer-generated sections (Mach-O header, LINKEDIT,
+    ///   codesign blob) have empty contributors and are never
+    ///   reusable for tier-3 purposes. The writer regenerates them
+    ///   every link with content that depends on the entire output
+    ///   (e.g. CDHash) or with non-deterministic fields (LC_UUID,
+    ///   build-version timestamp). Pre-filling them from prev would
+    ///   be silently overwritten by the writer; treating them as
+    ///   reusable would also cause spurious canary divergences on
+    ///   the UUID drift.
     /// * Every contributor key (in `prev`'s contributor list for
     ///   that section) is in `clean_inputs` — none of the inputs
     ///   feeding bytes here have changed since the previous link.
@@ -178,6 +213,9 @@ impl LayoutSnapshot {
                 || a.mem_offset != b.mem_offset
                 || a.mem_size != b.mem_size
             {
+                continue;
+            }
+            if a.contributors.is_empty() {
                 continue;
             }
             if a.contributors.iter().any(|k| !clean_inputs.contains(k)) {

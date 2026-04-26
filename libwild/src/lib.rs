@@ -57,6 +57,7 @@ pub(crate) mod output_section_part_map;
 pub(crate) mod output_trace;
 pub(crate) mod parse_skip;
 pub(crate) mod parsed_input_cache;
+pub(crate) mod tier3_skip;
 pub(crate) mod parsing;
 pub(crate) mod part_id;
 #[cfg(all(
@@ -624,6 +625,15 @@ impl Linker {
             Vec<usize>,
             layout_snapshot::LayoutSnapshot,
         )> = None;
+        // Phase 2b "wholesale prev → out copy" predicate: true iff
+        // every section's layout matches AND no contributor is
+        // dirty. Unlike `tier3_canary_state`'s reusable indices
+        // (phase 3), this allows synthetic sections (empty
+        // contributors, e.g. the Mach-O header / LINKEDIT region)
+        // because phase 2b copies the entire output file from prev
+        // — the synthetic regions inherit prev's bytes wholesale,
+        // which is byte-correct.
+        let mut tier3_fully_reusable = false;
         if layout_snapshot_active {
             let snapshot = layout.to_layout_snapshot();
             // Tier-2 canary: if the previous link's snapshot is on
@@ -763,6 +773,11 @@ impl Linker {
                     &snapshot,
                     &clean_keys,
                 );
+                tier3_fully_reusable = layout_snapshot::LayoutSnapshot::is_fully_reusable(
+                    &prev_snap,
+                    &snapshot,
+                    &clean_keys,
+                );
                 tier3_canary_state = Some((reusable, snapshot.clone()));
             }
 
@@ -800,8 +815,7 @@ impl Linker {
         // outputs).
         let did_speculative_skip =
             if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
-                && let Some((reusable, snap)) = tier3_canary_state.as_ref()
-                && reusable.len() == snap.sections.len()
+                && tier3_fully_reusable
                 && let Some(prev_bytes) = prev_output_mmap
             {
                 output.set_size(prev_bytes.len() as u64);
@@ -825,7 +839,70 @@ impl Linker {
             };
 
         if !did_speculative_skip {
-            P::write_output_file::<A>(&mut output, &layout)?;
+            // Tier-3 phase 3: partial writer-skip. When some
+            // sections are reusable but not ALL (so phase 2b's
+            // wholesale bypass can't fire), install per-section
+            // skip state so the platform writer:
+            //   (a) pre-fills reusable section ranges from
+            //       prev_bytes BEFORE its emit loop runs, and
+            //   (b) skips per-input-section iterations whose
+            //       target output section is reusable.
+            // Saves writer work proportional to the reusable
+            // fraction. Cleared after write returns so the global
+            // state doesn't leak across links.
+            let installed_tier3_state =
+                if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                    && let Some((reusable, snap)) = tier3_canary_state.as_ref()
+                    && !reusable.is_empty()
+                    && reusable.len() < snap.sections.len()
+                    && let Some(prev_bytes) = prev_output_mmap
+                {
+                    // Build the OutputSectionId set + the file
+                    // ranges to pre-fill, in one pass.
+                    let mut reusable_ids: hashbrown::HashSet<
+                        crate::output_section_id::OutputSectionId,
+                    > = hashbrown::HashSet::with_capacity(reusable.len());
+                    let mut ranges: Vec<(usize, usize)> =
+                        Vec::with_capacity(reusable.len());
+                    for &i in reusable {
+                        let s = &snap.sections[i];
+                        reusable_ids.insert(
+                            crate::output_section_id::OutputSectionId::from_u32(
+                                i as u32,
+                            ),
+                        );
+                        ranges.push((s.file_offset as usize, s.file_size as usize));
+                    }
+                    let total = snap.sections.len();
+                    let n = reusable.len();
+                    let bytes: u64 = ranges.iter().map(|&(_, sz)| sz as u64).sum();
+                    if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+                        || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                    {
+                        eprintln!(
+                            "wild tier-3 partial-skip: pre-filling {n}/{total} \
+                             sections ({bytes} bytes) from prev output; writer \
+                             will emit the remaining {} sections only",
+                            total - n
+                        );
+                    }
+                    tier3_skip::set(Some(tier3_skip::State {
+                        reusable_ids,
+                        ranges,
+                        prev_bytes,
+                    }));
+                    true
+                } else {
+                    false
+                };
+
+            let result = P::write_output_file::<A>(&mut output, &layout);
+
+            if installed_tier3_state {
+                tier3_skip::set(None);
+            }
+
+            result?;
         }
 
         // Tier-3 phase 2 canary: byte-compare the freshly-written
