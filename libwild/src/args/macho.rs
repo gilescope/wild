@@ -546,24 +546,43 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
         // complete picture. Without this, framework symbols populate
         // dylib_symbols but system lib symbols don't, causing false
         // "undefined symbol" errors.
-        if let Some(ref sdk) = sdk_root {
-            if args.dylib_symbols.is_empty() || args.syslibroot.is_none() {
-                let usr_lib = sdk.join("usr/lib");
-                if usr_lib.is_dir() {
-                    let system_tbd = usr_lib.join("libSystem.tbd");
-                    if system_tbd.exists() {
+        if let Some(ref sdk) = sdk_root
+            && (args.dylib_symbols.is_empty() || args.syslibroot.is_none())
+        {
+            let usr_lib = sdk.join("usr/lib");
+            if usr_lib.is_dir() {
+                let system_tbd = usr_lib.join("libSystem.tbd");
+                if system_tbd.exists() {
+                    // SDK-cache fast path: profile showed this walk
+                    // (libSystem.tbd + ~100 usr/lib/system/*.tbd YAML
+                    // parses) was 40% of total link time on bevy
+                    // because it bypassed the cache that the
+                    // `-lSystem` path already uses. Reuse the same
+                    // cache here — keyed on sysroot, validated against
+                    // libSystem.tbd's (size, mtime), populated on cache
+                    // miss after the full walk. Saves ~400 ms on a
+                    // bevy-class link.
+                    if let Some(cached) = crate::sdk_cache::load_sdk_symbols(sdk) {
+                        args.dylib_symbols.extend(cached);
+                        args.system_tbd_dir_walked =
+                            Some(Box::from(usr_lib.join("system").as_path()));
+                        args.sdk_cache_used = true;
+                    } else {
                         collect_tbd_symbols(&system_tbd, &mut args.dylib_symbols);
                         let system_dir = usr_lib.join("system");
-                        if system_dir.is_dir() {
-                            if let Ok(entries) = std::fs::read_dir(&system_dir) {
-                                for entry in entries.flatten() {
-                                    let p = entry.path();
-                                    if p.extension().map_or(false, |e| e == "tbd") {
-                                        collect_tbd_symbols(&p, &mut args.dylib_symbols);
-                                    }
+                        if system_dir.is_dir()
+                            && let Ok(entries) = std::fs::read_dir(&system_dir)
+                        {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e == "tbd") {
+                                    collect_tbd_symbols(&p, &mut args.dylib_symbols);
                                 }
                             }
                         }
+                        args.system_tbd_dir_walked =
+                            Some(Box::from(system_dir.as_path()));
+                        crate::sdk_cache::save_sdk_symbols(sdk, &args.dylib_symbols);
                     }
                 }
             }
@@ -921,6 +940,10 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             args.common.demangle = true;
             return Ok(());
         }
+        "--no-fork" => {
+            args.common.should_fork = false;
+            return Ok(());
+        }
         "-export_dynamic" => {
             args.export_dynamic = true;
             return Ok(());
@@ -1188,20 +1211,31 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
                 // `$XDG_CACHE_HOME/wild/sdk-<hex>.bin`, so every
                 // output binary linked against the same SDK
                 // benefits from the same cache entry.
-                if args.system_tbd_dir_walked.is_none() {
-                    if let Some(ref root) = args.syslibroot {
-                        if let Some(cached) = crate::sdk_cache::load_sdk_symbols(root) {
-                            args.dylib_symbols.extend(cached);
-                            // Record both walk-done and
-                            // sdk-cache-hit so the subsequent
-                            // -l<lib> calls (c/m/pthread) also
-                            // short-circuit cleanly.
-                            args.system_tbd_dir_walked =
-                                Some(Box::from(root.join("usr/lib/system").as_path()));
-                            args.sdk_cache_used = true;
-                            return Ok(());
-                        }
-                    }
+                if args.system_tbd_dir_walked.is_none()
+                    && let Some(ref root) = args.syslibroot
+                    && let Some(cached) = crate::sdk_cache::load_sdk_symbols(root)
+                {
+                    args.dylib_symbols.extend(cached);
+                    // Record both walk-done and sdk-cache-hit so the
+                    // subsequent -l<lib> calls (c/m/pthread) also
+                    // short-circuit cleanly.
+                    args.system_tbd_dir_walked =
+                        Some(Box::from(root.join("usr/lib/system").as_path()));
+                    args.sdk_cache_used = true;
+                    return Ok(());
+                }
+                // SDK cache already populated symbols — short-circuit
+                // before re-parsing libSystem.tbd. Hits when the
+                // SDK-root discovery (line 549) already loaded the
+                // cached symbols, OR when this is the second
+                // `-lSystem`/`-lc`/`-lm` after a successful first
+                // parse populated `sdk_cache_used`. Without this,
+                // the loop below re-parses libSystem.tbd via
+                // `collect_tbd_symbols` (~400 ms on bevy — was the
+                // dominant remaining hot spot in the cargo dev-loop
+                // profile after the line-549 fix).
+                if args.sdk_cache_used {
+                    return Ok(());
                 }
                 for dir in &search_paths {
                     let tbd_path = dir.join(format!("lib{lib}.tbd"));
