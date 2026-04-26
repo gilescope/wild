@@ -4,6 +4,15 @@
 the storage layer (`libwild/src/parsed_input_cache.rs`) is ready,
 nothing consumes it yet. This doc is the next session's spec.*
 
+**Status as of 2026-04-26:** tiers 1, 1.5, 2, 3p1, 3p2, 3p2b all
+shipped. Productised via `--incremental-cache=off|write|read-write`
+flag (commit `6ebc54b`). User-facing docs in `INCREMENTAL.md`
+(commit `b265332`). Tier 3 phase 3 (partial-section reuse via
+Mach-O writer skip) is parked — multi-session effort that
+requires modifying ~10 KLOC of writer code; the phase-2 byte-
+equivalence canary already proves the predicate is correct, so
+the safety bar is met for whoever picks it up.
+
 ## Status (2026-04-24) — SHIP-READY
 
 Infrastructure shipped across 7 commits (`f0120e6` refactor →
