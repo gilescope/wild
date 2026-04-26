@@ -99,6 +99,10 @@ fn check_text_files() -> Result {
         "external_test_suites",
         "fakes-debug",
         "fakes",
+        // Saved link invocations + scratch fixtures created by
+        // tier-3 perf measurement. Gitignored; not part of the
+        // canonical source tree.
+        "bench-fixtures",
     ];
 
     fn verify_path(path: &Path, problems: &mut Vec<String>) -> crate::error::Result {

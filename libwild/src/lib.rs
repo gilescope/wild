@@ -473,10 +473,14 @@ impl Linker {
         // are fully resolved. Catches cases where argv-level pre-load
         // couldn't see the real input set (e.g. `-l` dylib lookup
         // that resolved to a different dylib since last link).
-        if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
-            if try_whole_link_skip::<P>(file_loader, args) {
-                return Ok(LinkerOutput { layout: None });
-            }
+        // `WILD_INCREMENTAL_NO_POST_LOAD_SKIP=1` opts out so tier 3's
+        // narrower section-level skip can be exercised on workloads
+        // where whole-link-skip would otherwise win the race.
+        if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+            && std::env::var_os("WILD_INCREMENTAL_NO_POST_LOAD_SKIP").is_none()
+            && try_whole_link_skip::<P>(file_loader, args)
+        {
+            return Ok(LinkerOutput { layout: None });
         }
 
         let output_kind = OutputKind::new(args, file_loader);
@@ -521,7 +525,9 @@ impl Linker {
         // Gated on WILD_INCREMENTAL_TIER3_CANARY=1 so cold/normal
         // links stay zero-overhead.
         let prev_output_mmap: Option<&'static [u8]> =
-            if std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some() {
+            if std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+                || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+            {
                 std::fs::File::open(args.output())
                     .ok()
                     .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
@@ -608,7 +614,8 @@ impl Linker {
             || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some()
             || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some()
             || std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some()
-            || std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some();
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some();
         // Tier-3 phase 2 canary state: if set, contains
         // `(reusable_indices, current_snapshot)` so the post-write
         // path can byte-compare prev_output_mmap vs the freshly-
@@ -725,7 +732,8 @@ impl Linker {
             // for the post-write byte-compare. We need the SAME
             // clean-key derivation as the dry-run probe above
             // (handling archive members), so factor that out.
-            if std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+            if (std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+                || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some())
                 && let Some(prev_snap) = layout_snapshot::read_snapshot(args.output())
             {
                 let clean_paths = clean_input_paths.as_ref();
@@ -770,7 +778,55 @@ impl Linker {
             }
         }
 
-        P::write_output_file::<A>(&mut output, &layout)?;
+        // Tier-3 phase 2b: speculative writer-skip. If
+        //   * `WILD_INCREMENTAL_TIER3_SKIP=1` is set,
+        //   * every section is reusable (`reusable.len() == cur_snap.len()`),
+        //   * AND the previous output's bytes are mmap'd,
+        // then bypass the platform writer entirely and copy
+        // prev_bytes → output. The byte-equivalence canary
+        // (WILD_INCREMENTAL_TIER3_CANARY=1) has empirical evidence
+        // that every reusable section's prev bytes equal the writer's
+        // cold output; under the all-reusable case that proves the
+        // wholesale copy is byte-correct including codesign (the
+        // codesign references the file's content hash, which is the
+        // same for two byte-identical files).
+        //
+        // Cases this fires (where whole-link-skip wouldn't):
+        //   * args_hash differs slightly (e.g. wild upgrade) but
+        //     layout + content stayed stable.
+        //   * output_size verification falsely failed (timing).
+        //   * pre/post-load whole-link-skip explicitly disabled.
+        // Saves the entire writer phase (~280 ms on bevy-dylib-class
+        // outputs).
+        let did_speculative_skip =
+            if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                && let Some((reusable, snap)) = tier3_canary_state.as_ref()
+                && reusable.len() == snap.sections.len()
+                && let Some(prev_bytes) = prev_output_mmap
+            {
+                output.set_size(prev_bytes.len() as u64);
+                output.write(&layout, |sized_output, _| {
+                    let dst: &mut [u8] = &mut sized_output.out;
+                    let n = prev_bytes.len().min(dst.len());
+                    dst[..n].copy_from_slice(&prev_bytes[..n]);
+                    Ok(())
+                })?;
+                if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+                    || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                {
+                    eprintln!(
+                        "wild tier-3 skip: bypassed writer, copied {} bytes from prev output",
+                        prev_bytes.len()
+                    );
+                }
+                true
+            } else {
+                false
+            };
+
+        if !did_speculative_skip {
+            P::write_output_file::<A>(&mut output, &layout)?;
+        }
 
         // Tier-3 phase 2 canary: byte-compare the freshly-written
         // output's reusable sections against the previous output's

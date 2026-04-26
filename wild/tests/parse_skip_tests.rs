@@ -235,4 +235,51 @@ fn parse_skip_gates_round_trip() {
         42,
         "tier-3 canary exit code — output corrupted by inspection?"
     );
+
+    // Phase 6: TIER-3 SKIP — actual writer bypass. With every
+    // section reusable AND a prev_output mmap available, wild
+    // skips the platform writer entirely and copies prev bytes
+    // wholesale into the new output. Asserts:
+    //   * stderr names the skip path,
+    //   * the resulting binary runs and exits 42 (functional
+    //     correctness of the byte-copy + codesign preservation).
+    // Two cold runs of wild aren't necessarily byte-identical
+    // (wild's writer has pre-existing non-determinism in
+    // LC_UUID / timestamp regions), so we can't assert byte-
+    // equivalence vs a fresh cold link — but the canary above
+    // proved per-section bytes match, and the run + exit code
+    // here proves codesign + load commands stayed valid.
+    let prev_size = std::fs::metadata(&write_out)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let (ok, out) = link_with_wild(
+        &obj,
+        &write_out,
+        &[
+            ("WILD_INCREMENTAL_TIER3_SKIP", "1"),
+            ("WILD_INCREMENTAL_DEBUG", "1"),
+            ("WILD_INCREMENTAL_NO_EARLY_SKIP", "1"),
+            ("WILD_INCREMENTAL_PRE_LOAD_SKIP", "0"),
+            ("WILD_INCREMENTAL_NO_POST_LOAD_SKIP", "1"),
+        ],
+    );
+    assert!(ok, "tier-3 skip link failed:\n{out}");
+    assert!(
+        out.contains("wild tier-3 skip: bypassed writer"),
+        "tier-3 skip path didn't fire — expected `wild tier-3 skip: \
+         bypassed writer …` in stderr but got:\n{out}"
+    );
+    let new_size = std::fs::metadata(&write_out)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert_eq!(
+        prev_size, new_size,
+        "tier-3 skip output size shifted — speculative copy is supposed to \
+         preserve the previous binary's size byte-for-byte"
+    );
+    assert_eq!(
+        run_exit_code(&write_out),
+        42,
+        "tier-3 skip exit code — bypassed writer produced an unrunnable binary"
+    );
 }

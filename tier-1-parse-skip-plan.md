@@ -91,22 +91,63 @@ section. Reports `M/N sections byte-identical, X bytes
 verified safe to reuse`; emits a `first divergence at
 section #i` line if any reusable verdict disagreed with
 byte-equality. On the C-hello fixture: **51/51 sections,
-904 bytes byte-identical**. End-to-end test phase 5
-asserts the absence of any divergence message. This proves
-the reuse predicate is correctly conservative end-to-end,
-which unblocks phase 2b: actually skipping the writer for
-those sections and `memcpy`-ing from `prev_output_mmap`
-instead.
+904 bytes byte-identical**.
+
+**Tier-3 phase 2b — speculative writer-skip (landed 2026-04-26)**:
+when `WILD_INCREMENTAL_TIER3_SKIP=1` AND every section is
+reusable AND prev_output_mmap is available, bypass the
+platform writer entirely and `memcpy` prev → out. The output
+gets the previous link's bytes wholesale; the canary path
+already proved this is byte-equivalent (per-section) to a
+cold writer's output. Codesign verification still passes
+because Apple's CDHash is computed over file content and the
+new file's content equals the prev file's content.
+
+`WILD_INCREMENTAL_NO_POST_LOAD_SKIP=1` opt-out for the
+post-load whole-link skip so tier-3's narrower section-level
+skip can be exercised on workloads where whole-link-skip
+would otherwise win the race.
+
+Verified on `bench-fixtures/saved-rust-hello` (459 KiB Rust
+binary, 406 inputs):
+
+| path | wall-clock | size | sections verified |
+|---|---|---|---|
+| Cold | ~82 ms | 459 KB | — |
+| Tier-3 skip | ~79 ms | 459 KB | 54/54, 347 KB |
+
+Modest (3 ms) win on this small fixture — process startup
+dominates and the writer's actual work is only a few
+milliseconds. On bevy-dylib-class outputs (38 MB, 1649
+inputs) the writer takes ~280 ms cold while skip would take
+~10-15 ms (mmap + memcpy 38 MB), so the win there is
+expected to be ~250 ms.
+
+End-to-end test phase 6 asserts:
+
+* skip path fires (stderr contains `wild tier-3 skip:
+  bypassed writer`),
+* output size matches prev exactly,
+* binary still runs and exits with the expected code.
+
+**Caveat**: wild's writer has pre-existing non-determinism in
+LC_UUID / build-version timestamp regions, so two cold runs
+of the same fixture aren't byte-identical. The tier-3 skip
+preserves the *previous* link's UUID rather than minting a
+fresh one — which is functionally equivalent (the binary
+loads + runs + codesign-validates) but cosmetically distinct
+from a fresh cold link. The canary's *per-section*
+byte-equality holds regardless.
 
 ## What's landed
 
-+ Zero-copy on-disk format (`repr(C)` header + symbol array + names
+* Zero-copy on-disk format (`repr(C)` header + symbol array + names
   blob), mmap-compatible, schema v1.
-+ `CacheView<'data>` reader + `CacheBuilder` writer with
+* `CacheView<'data>` reader + `CacheBuilder` writer with
   name-dedup.
-+ `CacheBuilder::write_to(&Path)` (atomic tmp-and-rename).
-+ `cache_path_for_input(&Path)` — `$XDG_CACHE_HOME/wild/parsed-inputs/<blake3>.wildpi`.
-+ 12 unit tests: round-trip, name-dedup, bad-magic/schema, truncated,
+* `CacheBuilder::write_to(&Path)` (atomic tmp-and-rename).
+* `cache_path_for_input(&Path)` — `$XDG_CACHE_HOME/wild/parsed-inputs/<blake3>.wildpi`.
+* 12 unit tests: round-trip, name-dedup, bad-magic/schema, truncated,
   misaligned, unknown-kind, empty, zero-copy assertion, atomic write,
   path collision-freeness.
 
@@ -175,10 +216,10 @@ if let Some(cache_bytes) = try_load_cache(s.parsed.input.path()) {
 
 Under `WILD_INCREMENTAL_DEBUG=1`:
 
-+ Write path: `TeeSink` wraps the default sink, `CacheBuilder`
+* Write path: `TeeSink` wraps the default sink, `CacheBuilder`
   captures the parse output, `write_to(cache_path_for_input(input))`
   at end.
-+ Read path: only consume a cache file when the `.wild-hashes`
+* Read path: only consume a cache file when the `.wild-hashes`
   side-car reports the input clean. Otherwise fall through to
   re-parse (and refresh the cache from that parse).
 
@@ -213,13 +254,13 @@ them as equivalent.
 
 ## File layout the next session touches
 
-+ `libwild/src/symbol_db.rs` — trait extraction + teeing sink.
-+ `libwild/src/platform.rs` — default sink impl on the pair.
-+ `libwild/src/input_data.rs` — mmap-hold for cache files.
-+ `libwild/src/lib.rs` — gate, canary wiring.
-+ `libwild/src/parsed_input_cache.rs` — maybe extend with
+* `libwild/src/symbol_db.rs` — trait extraction + teeing sink.
+* `libwild/src/platform.rs` — default sink impl on the pair.
+* `libwild/src/input_data.rs` — mmap-hold for cache files.
+* `libwild/src/lib.rs` — gate, canary wiring.
+* `libwild/src/parsed_input_cache.rs` — maybe extend with
   `try_load_cache(&Path) -> Option<Mmap>`.
-+ `libwild/tests/incremental_parse_skip.rs` (new) — canary
+* `libwild/tests/incremental_parse_skip.rs` (new) — canary
   integration test.
 
 ## Measurement script
@@ -249,9 +290,9 @@ a bad binary.
 
 ## After tier-1
 
-+ Tier 2 (sticky layout) is the next beat — persist section
+* Tier 2 (sticky layout) is the next beat — persist section
   offsets + symbol addresses, reuse for clean-input subsets.
-+ Tier 3 (per-section memcpy skip) builds on tier-1's clean-input
+* Tier 3 (per-section memcpy skip) builds on tier-1's clean-input
   bit to skip content-addressed sections like `__cstring`.
-+ Both need tier 1's per-input clean/dirty verdict to mean what
+* Both need tier 1's per-input clean/dirty verdict to mean what
   this module says it means. Ship that foundation first.

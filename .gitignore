@@ -1,5 +1,6 @@
 /target
 /target2
+/bench-fixtures
 sample-link*
 *.strace
 flamegraph.svg
