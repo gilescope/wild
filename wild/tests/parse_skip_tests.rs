@@ -190,4 +190,49 @@ fn parse_skip_gates_round_trip() {
         42,
         "read-gate exit code — cache replay produced a broken binary"
     );
+
+    // Phase 5: TIER-3 CANARY — byte-compare reusable sections in the
+    // freshly-written output against the previous output's bytes.
+    // Two consecutive links capture the snapshot and then verify
+    // tier-3 reuse is empirically safe. A divergence message in
+    // stderr means the dirty-bitmap predicate would let tier 3
+    // reuse a section whose bytes actually differ — fails this
+    // test before phase 2b's writer-skip is allowed to ship.
+    //
+    // First link: write a layout snapshot so the second link has
+    // a `prev` to compare against.
+    let (ok, out) = link_with_wild(
+        &obj,
+        &write_out,
+        &[
+            ("WILD_INCREMENTAL_LAYOUT_CANARY", "1"),
+            ("WILD_INCREMENTAL_PARSE_SKIP_READ", "1"),
+        ],
+    );
+    assert!(ok, "tier-3 canary seed link failed:\n{out}");
+
+    let (ok, out) = link_with_wild(
+        &obj,
+        &write_out,
+        &[
+            ("WILD_INCREMENTAL_TIER3_CANARY", "1"),
+            ("WILD_INCREMENTAL_PARSE_SKIP_READ", "1"),
+        ],
+    );
+    assert!(ok, "tier-3 canary link failed:\n{out}");
+    // The tier-3 canary line is "wild tier-3 canary: M/N sections
+    // byte-identical, X bytes verified safe to reuse". A first-
+    // divergence line only appears when M != N. Asserting the
+    // absence of "first divergence" is the canary's "all reusable
+    // sections checked out" pass criterion.
+    assert!(
+        !out.contains("first divergence"),
+        "tier-3 canary reported a section whose 'reusable' verdict \
+         disagreed with byte-equality — phase 2b reuse would corrupt:\n{out}"
+    );
+    assert_eq!(
+        run_exit_code(&write_out),
+        42,
+        "tier-3 canary exit code — output corrupted by inspection?"
+    );
 }

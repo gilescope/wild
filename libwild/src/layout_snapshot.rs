@@ -112,7 +112,7 @@ pub(crate) struct SnapshotSection {
 /// Owned snapshot of every output section's layout. Used by both the
 /// writer (capturing fresh layout) and the canary path (comparing
 /// fresh against on-disk).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LayoutSnapshot {
     pub(crate) sections: Vec<SnapshotSection>,
 }
@@ -145,6 +145,47 @@ impl LayoutSnapshot {
             s.contributors.sort_unstable();
             s.contributors.dedup();
         }
+    }
+
+    /// Tier-3 reuse predicate: section indices where ALL of the
+    /// following hold against `prev` (the snapshot from the previous
+    /// link, loaded from disk):
+    ///
+    /// * Same `(file_offset, file_size, mem_offset, mem_size, name)`
+    ///   — the section hasn't moved or grown, so the bytes a cold
+    ///   writer would emit live at the same spot they used to.
+    /// * Every contributor key (in `prev`'s contributor list for
+    ///   that section) is in `clean_inputs` — none of the inputs
+    ///   feeding bytes here have changed since the previous link.
+    ///
+    /// Returns `Vec<usize>` of indices into `prev.sections` that are
+    /// safe for tier 3's writer to mmap-copy from the previous
+    /// output. Sections beyond `min(prev.len, cur.len)` are never
+    /// reusable (the section count itself shifted).
+    pub(crate) fn reusable_section_indices(
+        prev: &LayoutSnapshot,
+        cur: &LayoutSnapshot,
+        clean_inputs: &hashbrown::HashSet<ContributorKey>,
+    ) -> Vec<usize> {
+        let n = prev.sections.len().min(cur.sections.len());
+        let mut out = Vec::new();
+        for i in 0..n {
+            let a = &prev.sections[i];
+            let b = &cur.sections[i];
+            if a.name != b.name
+                || a.file_offset != b.file_offset
+                || a.file_size != b.file_size
+                || a.mem_offset != b.mem_offset
+                || a.mem_size != b.mem_size
+            {
+                continue;
+            }
+            if a.contributors.iter().any(|k| !clean_inputs.contains(k)) {
+                continue;
+            }
+            out.push(i);
+        }
+        out
     }
 
     /// Tier-3 helper: every section index whose contributor list

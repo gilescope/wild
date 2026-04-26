@@ -509,6 +509,30 @@ impl Linker {
         // re-write path.
         let bundle = crate::parsed_input_cache::try_load_bundle_view_mmap(args.output());
 
+        // Tier-3 canary: mmap the PREVIOUS output binary BEFORE
+        // `produce_layout` triggers its rename-and-recreate. The mmap
+        // holds an inode reference, so even after the file is renamed
+        // to `<output>.delete` and unlinked, our pages stay valid
+        // until process exit. Used for the post-write byte-
+        // equivalence check that proves the dirty-bitmap predicate is
+        // correctly conservative — if every "reusable" section has
+        // bytes byte-identical to those a cold writer just emitted,
+        // tier-3 phase 2b's actual section-skip is empirically safe.
+        // Gated on WILD_INCREMENTAL_TIER3_CANARY=1 so cold/normal
+        // links stay zero-overhead.
+        let prev_output_mmap: Option<&'static [u8]> =
+            if std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some() {
+                std::fs::File::open(args.output())
+                    .ok()
+                    .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
+                    .map(|m| {
+                        let leaked: &'static memmap2::Mmap = Box::leak(Box::new(m));
+                        leaked.as_ref() as &'static [u8]
+                    })
+            } else {
+                None
+            };
+
         symbol_db.add_inputs(
             &mut per_symbol_flags,
             &mut output_sections,
@@ -583,7 +607,16 @@ impl Linker {
             || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some()
             || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some()
             || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some()
-            || std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some();
+            || std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some();
+        // Tier-3 phase 2 canary state: if set, contains
+        // `(reusable_indices, current_snapshot)` so the post-write
+        // path can byte-compare prev_output_mmap vs the freshly-
+        // written output for every "would-be reusable" section.
+        let mut tier3_canary_state: Option<(
+            Vec<usize>,
+            layout_snapshot::LayoutSnapshot,
+        )> = None;
         if layout_snapshot_active {
             let snapshot = layout.to_layout_snapshot();
             // Tier-2 canary: if the previous link's snapshot is on
@@ -688,6 +721,43 @@ impl Linker {
                 );
             }
 
+            // Tier-3 phase 2 canary: stash (reusable_indices, snapshot)
+            // for the post-write byte-compare. We need the SAME
+            // clean-key derivation as the dry-run probe above
+            // (handling archive members), so factor that out.
+            if std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+                && let Some(prev_snap) = layout_snapshot::read_snapshot(args.output())
+            {
+                let clean_paths = clean_input_paths.as_ref();
+                let mut clean_keys: hashbrown::HashSet<layout_snapshot::ContributorKey> =
+                    hashbrown::HashSet::new();
+                for group in &layout.group_layouts {
+                    for file in &group.files {
+                        let layout::FileLayout::Object(obj) = file else {
+                            continue;
+                        };
+                        let path = obj.input.file.filename.as_path();
+                        if let Some(set) = clean_paths
+                            && !set.contains(path)
+                        {
+                            continue;
+                        }
+                        let entry_id = obj
+                            .input
+                            .entry
+                            .as_ref()
+                            .map(|e| e.identifier.as_slice());
+                        clean_keys.insert(parsed_input_cache::bundle_key_for(path, entry_id));
+                    }
+                }
+                let reusable = layout_snapshot::LayoutSnapshot::reusable_section_indices(
+                    &prev_snap,
+                    &snapshot,
+                    &clean_keys,
+                );
+                tier3_canary_state = Some((reusable, snapshot.clone()));
+            }
+
             // Persist the fresh snapshot for the next link.
             if let Err(e) = layout_snapshot::write_snapshot(args.output(), snapshot) {
                 if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
@@ -701,6 +771,85 @@ impl Linker {
         }
 
         P::write_output_file::<A>(&mut output, &layout)?;
+
+        // Tier-3 phase 2 canary: byte-compare the freshly-written
+        // output's reusable sections against the previous output's
+        // pages. If every reusable section is byte-identical, tier
+        // 3's writer-skip integration is empirically safe — the
+        // dirty-bitmap predicate is correctly conservative on this
+        // workload.
+        if let (Some((reusable, snap)), Some(prev_bytes)) =
+            (tier3_canary_state.as_ref(), prev_output_mmap)
+        {
+            // Re-open the new output so we can mmap it post-write.
+            // The file_writer dropped its mmap in `flush()`, but
+            // the bytes are committed to disk now.
+            let new_mmap = std::fs::File::open(args.output())
+                .ok()
+                .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok());
+            if let Some(new_mmap) = new_mmap {
+                let new_bytes: &[u8] = &new_mmap;
+                let total_reusable = reusable.len();
+                let mut byte_matched = 0usize;
+                let mut bytes_verified: u64 = 0;
+                let mut first_diverged: Option<(usize, String)> = None;
+                for &i in reusable {
+                    let s = &snap.sections[i];
+                    let off = s.file_offset as usize;
+                    let size = s.file_size as usize;
+                    if off.saturating_add(size) > prev_bytes.len()
+                        || off.saturating_add(size) > new_bytes.len()
+                    {
+                        // A reusable section's range falls off the
+                        // end of either output — file size mismatch
+                        // we'd want to know about. Count as
+                        // diverged and capture the first occurrence.
+                        if first_diverged.is_none() {
+                            first_diverged = Some((
+                                i,
+                                format!(
+                                    "{:?} off={off:#x} size={size:#x} prev_len={} new_len={}",
+                                    String::from_utf8_lossy(&s.name),
+                                    prev_bytes.len(),
+                                    new_bytes.len(),
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
+                    if prev_bytes[off..off + size] == new_bytes[off..off + size] {
+                        byte_matched += 1;
+                        bytes_verified += size as u64;
+                    } else if first_diverged.is_none() {
+                        // Find the first byte that differs for the
+                        // diagnostic — diff::maybe_diff is global
+                        // but the canary wants section-local detail.
+                        let first_byte_off = (0..size)
+                            .find(|j| prev_bytes[off + j] != new_bytes[off + j])
+                            .unwrap_or(0);
+                        first_diverged = Some((
+                            i,
+                            format!(
+                                "{:?} off={off:#x} size={size:#x} first_diff_at=+{first_byte_off:#x}",
+                                String::from_utf8_lossy(&s.name)
+                            ),
+                        ));
+                    }
+                }
+                eprintln!(
+                    "wild tier-3 canary: {byte_matched}/{total_reusable} sections \
+                     byte-identical, {bytes_verified} bytes verified safe to reuse"
+                );
+                if let Some((idx, detail)) = first_diverged
+                    && byte_matched != total_reusable
+                {
+                    eprintln!(
+                        "wild tier-3 canary: first divergence at section #{idx}: {detail}"
+                    );
+                }
+            }
+        }
+
         diff::maybe_diff()?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.

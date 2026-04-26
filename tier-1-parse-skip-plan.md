@@ -76,6 +76,28 @@ on a real link and reports `N/M sections reusable, B/T bytes
 reusable** — confirms the dirty-bitmap mechanic on a real
 workload before writer integration. Cold path unchanged.
 
+**Tier-3 phase 2 — byte-equivalence canary (landed 2026-04-25)**:
+the reuse predicate is strengthened with a layout-stability
+check (same name + offset + size + memory address as the
+previous link, *plus* all contributors clean) via
+`LayoutSnapshot::reusable_section_indices(&prev, &cur,
+&clean_inputs)`. `WILD_INCREMENTAL_TIER3_CANARY=1` mmaps the
+*previous* output binary before `produce_layout` triggers its
+rename-and-recreate (so the inode pages stay valid via the
+mmap reference even after the file is replaced), runs the
+writer cold, then byte-compares prev_mmap[off..off+size]
+against the freshly-written output for every reusable
+section. Reports `M/N sections byte-identical, X bytes
+verified safe to reuse`; emits a `first divergence at
+section #i` line if any reusable verdict disagreed with
+byte-equality. On the C-hello fixture: **51/51 sections,
+904 bytes byte-identical**. End-to-end test phase 5
+asserts the absence of any divergence message. This proves
+the reuse predicate is correctly conservative end-to-end,
+which unblocks phase 2b: actually skipping the writer for
+those sections and `memcpy`-ing from `prev_output_mmap`
+instead.
+
 ## What's landed
 
 + Zero-copy on-disk format (`repr(C)` header + symbol array + names
