@@ -182,7 +182,7 @@ pub(crate) fn load_sdk_symbols(sysroot: &Path) -> Option<crate::args::macho::Dyl
         if cursor + len > buf.len() {
             return None;
         }
-        out.insert(buf[cursor..cursor + len].to_vec());
+        out.insert(Arc::<[u8]>::from(&buf[cursor..cursor + len]));
         cursor += len;
     }
 
@@ -225,7 +225,7 @@ pub(crate) fn save_sdk_symbols(sysroot: &Path, symbols: &crate::args::macho::Dyl
     // Sorted symbols → determinism. Byte-equal cache across runs
     // makes CI diff-tooling possible and enables future content-hash
     // caching of the cache itself.
-    let mut sorted: Vec<&Vec<u8>> = symbols.iter().collect();
+    let mut sorted: Vec<&[u8]> = symbols.iter().map(|s| s.as_ref()).collect();
     sorted.sort();
     let mut buf = Vec::with_capacity(40 + symbols.iter().map(|s| s.len() + 2).sum::<usize>());
     buf.extend_from_slice(SDK_CACHE_MAGIC);
@@ -376,7 +376,7 @@ pub(crate) fn load_tbd_symbols(
         if cursor + len > buf.len() {
             return None;
         }
-        symbols.insert(buf[cursor..cursor + len].to_vec());
+        symbols.insert(Arc::<[u8]>::from(&buf[cursor..cursor + len]));
         cursor += len;
     }
 
@@ -421,7 +421,7 @@ pub(crate) fn save_tbd_symbols(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
-    let mut sorted: Vec<&Vec<u8>> = symbols.iter().collect();
+    let mut sorted: Vec<&[u8]> = symbols.iter().map(|s| s.as_ref()).collect();
     sorted.sort();
     let inst_bytes = install_name.unwrap_or(&[]);
     if inst_bytes.len() > u16::MAX as usize {

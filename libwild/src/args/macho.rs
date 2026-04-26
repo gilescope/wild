@@ -18,7 +18,16 @@ use std::sync::Arc;
 /// come from trusted on-disk TBD content; the std HashSet's SipHash
 /// only buys DoS resistance we don't need and was ~12 % of wild's
 /// bevy-dylib wall-clock (profiled via samply).
-pub(crate) type DylibSymbols = hashbrown::HashSet<Vec<u8>, foldhash::fast::FixedState>;
+///
+/// Entries are `Arc<[u8]>` (not `Vec<u8>`) so the in-process daemon's
+/// SDK/TBD memory cache can hand out refcount-bumped shares of
+/// already-parsed symbol bytes without per-entry allocation. The
+/// Borrow impl on `Arc<[u8]>` keeps `set.contains(&[u8])` working the
+/// same as before. On a bevy-class link this halves `pending
+/// frameworks` (the 17×TBD copy-merge loop) by removing the
+/// per-symbol Vec clone — that loop emerged as the dominant
+/// remaining cost after the v4 mem-cache hoist.
+pub(crate) type DylibSymbols = hashbrown::HashSet<std::sync::Arc<[u8]>, foldhash::fast::FixedState>;
 
 /// What kind of LC_LOAD_* command to emit for a dylib dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1157,7 +1166,8 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
     if arg == "-U" {
         if let Some(sym) = input.next() {
             let name = sym.as_ref().as_bytes().to_vec();
-            args.dylib_symbols.insert(name.clone());
+            args.dylib_symbols
+                .insert(std::sync::Arc::<[u8]>::from(name.as_slice()));
             args.dynamic_undefined_symbols.push(name);
         }
         return Ok(());
@@ -1453,7 +1463,9 @@ fn collect_tbd_symbols_with_directives(
     );
     // Apply hide directives after all symbols are collected.
     for sym in &hide_list {
-        symbols.remove(sym);
+        // `sym` is a `Vec<u8>`; the set entries are `Arc<[u8]>` so we
+        // borrow as `&[u8]` to match the set's `Borrow` impl.
+        symbols.remove(sym.as_slice());
     }
 }
 
@@ -1547,7 +1559,7 @@ fn process_tbd_symbol(
             let ver = parse_macho_version(ver_str);
             if target_version >= ver {
                 if let Some(real) = rest.rsplit_once('$') {
-                    symbols.insert(real.1.as_bytes().to_vec());
+                    symbols.insert(std::sync::Arc::<[u8]>::from(real.1.as_bytes()));
                 }
             }
         }
@@ -1582,7 +1594,7 @@ fn process_tbd_symbol(
         }
     } else {
         // Regular symbol
-        symbols.insert(sym.as_bytes().to_vec());
+        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
     }
 }
 
@@ -1623,10 +1635,10 @@ fn collect_tbd_symbols_impl(
                         continue;
                     }
                     for sym in &exp.symbols {
-                        symbols.insert(sym.as_bytes().to_vec());
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                     for sym in &exp.weak_symbols {
-                        symbols.insert(sym.as_bytes().to_vec());
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                 }
                 for exp in &v4.re_exports {
@@ -1634,17 +1646,17 @@ fn collect_tbd_symbols_impl(
                         continue;
                     }
                     for sym in &exp.symbols {
-                        symbols.insert(sym.as_bytes().to_vec());
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                     for sym in &exp.weak_symbols {
-                        symbols.insert(sym.as_bytes().to_vec());
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                 }
             }
             text_stub_library::TbdVersionedRecord::V3(v3) => {
                 for exp in &v3.exports {
                     for sym in &exp.symbols {
-                        symbols.insert(sym.as_bytes().to_vec());
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                 }
             }
@@ -2003,7 +2015,8 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
     args.add_dylib(name, DylibLoadKind::Normal);
     let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
     for sym in &exported_symbols {
-        args.dylib_symbols.insert(sym.clone());
+        args.dylib_symbols
+            .insert(std::sync::Arc::<[u8]>::from(sym.as_slice()));
         args.dylib_symbol_provenance.insert(sym.clone(), dylib_idx);
     }
 
@@ -2161,7 +2174,7 @@ fn collect_dylib_reexport_symbols(
             off += sz;
         }
         for sym in exported {
-            symbols.insert(sym);
+            symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_slice()));
         }
         // For nested re-exports, combine rpaths and use this dylib's dir as loader_path.
         let mut combined_rpaths = rpaths.to_vec();
