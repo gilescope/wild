@@ -1031,6 +1031,21 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
 
     parser
         .declare_with_param()
+        .long("incremental-cache")
+        .help(
+            "Incremental linking mode: off | write | read-write (rw). \
+             Default: off. `write` populates `<output>.wild-pi-cache` + \
+             `.wild-layout` for the next link. `read-write` ALSO replays \
+             cached parses and skips the writer when every section is \
+             reusable. Legacy WILD_INCREMENTAL_* env vars still work.",
+        )
+        .execute(|args, _modifier_stack, value| {
+            args.common.incremental_cache = super::IncrementalCacheMode::parse(value)?;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("dynamic-linker")
         .help("Set dynamic linker path")
         .execute(|args, _modifier_stack, value| {

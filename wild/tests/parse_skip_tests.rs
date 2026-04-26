@@ -72,14 +72,28 @@ fn compile(src_path: &Path, build: &Path) -> PathBuf {
 /// Link `obj` with wild into `output`, optionally with env vars set.
 /// Returns stdout+stderr for the caller to assert on.
 fn link_with_wild(obj: &Path, output: &Path, envs: &[(&str, &str)]) -> (bool, String) {
+    link_with_wild_extra(obj, output, envs, &[])
+}
+
+/// Variant of `link_with_wild` that also passes extra args directly
+/// to wild (via `-Wl,…` so clang forwards them). Used to exercise
+/// the `--incremental-cache` flag without going through env vars.
+fn link_with_wild_extra(
+    obj: &Path,
+    output: &Path,
+    envs: &[(&str, &str)],
+    wild_args: &[&str],
+) -> (bool, String) {
     let wild = wild_binary_path();
-    // Use clang as the driver so -syslibroot + crt handling is
-    // done for us — mirrors how rustc invokes linkers in practice.
     let mut cmd = Command::new("clang");
     cmd.arg(format!("-fuse-ld={}", wild.display()))
         .arg(obj)
         .arg("-o")
         .arg(output);
+    for arg in wild_args {
+        // `-Wl,foo` tells clang to pass `foo` to the linker.
+        cmd.arg(format!("-Wl,{arg}"));
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -281,5 +295,55 @@ fn parse_skip_gates_round_trip() {
         run_exit_code(&write_out),
         42,
         "tier-3 skip exit code — bypassed writer produced an unrunnable binary"
+    );
+
+    // Phase 7: --incremental-cache=read-write FLAG
+    // Productisation gate. The flag must reach `Args::parse` and
+    // translate into the same env-var gates the older tests used.
+    // Two consecutive links: first seeds with `=write`, second
+    // fires the read-side skip via `=read-write`. We pass the flag
+    // through clang via `-Wl,…` so the integration is end-to-end
+    // (driver → linker), matching how `cargo build` would emit it
+    // when wild is wired in via RUSTFLAGS.
+    let flag_out = build.join("flag-out");
+    let _ = std::fs::remove_file(&flag_out);
+    let _ = std::fs::remove_file(flag_out.with_extension("wild-hashes"));
+    let _ = std::fs::remove_file(flag_out.with_extension("wild-layout"));
+    let _ = std::fs::remove_file(flag_out.with_extension("wild-pi-cache"));
+    let (ok, out) = link_with_wild_extra(
+        &obj,
+        &flag_out,
+        &[("WILD_INCREMENTAL_DEBUG", "1")],
+        &["--incremental-cache=write"],
+    );
+    assert!(ok, "--incremental-cache=write seed link failed:\n{out}");
+    assert!(
+        flag_out.with_extension("wild-pi-cache").exists(),
+        "--incremental-cache=write didn't produce a parse-skip bundle"
+    );
+    assert!(
+        flag_out.with_extension("wild-layout").exists(),
+        "--incremental-cache=write didn't produce a layout snapshot"
+    );
+
+    let (ok, out) = link_with_wild_extra(
+        &obj,
+        &flag_out,
+        &[
+            ("WILD_INCREMENTAL_NO_EARLY_SKIP", "1"),
+            ("WILD_INCREMENTAL_PRE_LOAD_SKIP", "0"),
+            ("WILD_INCREMENTAL_NO_POST_LOAD_SKIP", "1"),
+        ],
+        &["--incremental-cache=read-write"],
+    );
+    assert!(ok, "--incremental-cache=read-write link failed:\n{out}");
+    assert!(
+        out.contains("wild tier-3 skip: bypassed writer"),
+        "--incremental-cache=read-write didn't fire the writer-skip path:\n{out}"
+    );
+    assert_eq!(
+        run_exit_code(&flag_out),
+        42,
+        "exit code via --incremental-cache=read-write"
     );
 }

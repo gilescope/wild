@@ -86,6 +86,11 @@ pub struct CommonArgs {
     /// counters, if any.
     pub(crate) time_phase_options: Option<Vec<CounterKind>>,
 
+    /// Incremental linking mode (tiers 1 / 1.5 / 2 / 3 cache + skip
+    /// machinery). Off by default; opt-in via `--incremental-cache=MODE`
+    /// or one of the legacy `WILD_INCREMENTAL_*` env vars.
+    pub(crate) incremental_cache: IncrementalCacheMode,
+
     /// Warnings that we encountered either during argument parsing, or during subsequent linker
     /// execution based on those arguments.
     #[debug(skip)]
@@ -159,11 +164,23 @@ impl Args {
         // Skip the program name.
         input.next();
 
-        match self {
+        let result = match self {
             Args::Elf(args) => args.parse(input),
             Args::MachO(args) => args.parse(input),
             Args::Wasm(args) => args.parse(input),
-        }
+        };
+
+        // Translate `--incremental-cache=MODE` into the legacy
+        // WILD_INCREMENTAL_* env vars so the gate-checking sites
+        // (lib.rs whole-link skip, symbol_db.rs ParseSkipGates,
+        // tier-3 capture/skip paths) keep one source of truth.
+        // Env vars set externally by the caller take precedence —
+        // we only set what's missing. Safe: parse runs before any
+        // thread is spawned by `activate_thread_pool`, so the
+        // unsafe set_var window is single-threaded.
+        translate_incremental_flag(self.common().incremental_cache);
+
+        result
     }
 
     /// Set the version identifier of the linker.
@@ -279,8 +296,87 @@ impl Default for CommonArgs {
             numeric_experiments: Vec::new(),
             sym_info: None,
             time_phase_options: None,
+            incremental_cache: IncrementalCacheMode::default(),
             warning_callback: Box::new(default_warning_callback),
             version: std::borrow::Cow::Borrowed("unknown version"),
+        }
+    }
+}
+
+/// User-facing incremental-cache control. The legacy
+/// `WILD_INCREMENTAL_*` env vars still work (they're how power users
+/// discovered the feature during tier-1 → tier-3 development). The
+/// flag is the canonical interface going forward; env vars override
+/// the flag when set, so a CI job can opt in at build time without
+/// rebuilding the linker driver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum IncrementalCacheMode {
+    /// Cold link every time. Layout snapshot + parse-skip cache are
+    /// not consulted, not written. Wild's behaviour matches the
+    /// pre-incremental codebase.
+    #[default]
+    Off,
+    /// Tee the parse + layout into `<output>.wild-pi-cache` /
+    /// `<output>.wild-layout` for the next link. Don't replay or
+    /// skip writer work this link.
+    Write,
+    /// Replay the parse-skip cache (skip per-input `load_symbols`)
+    /// AND do the speculative writer-skip when every section is
+    /// reusable. Implies `Write` so the next link sees fresh data.
+    ReadWrite,
+}
+
+impl IncrementalCacheMode {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
+        match s {
+            "off" | "false" | "0" => Ok(Self::Off),
+            "write" => Ok(Self::Write),
+            "read-write" | "rw" | "on" | "true" | "1" => Ok(Self::ReadWrite),
+            other => bail!(
+                "Unrecognised --incremental-cache mode `{other}`. \
+                 Expected one of: off, write, read-write"
+            ),
+        }
+    }
+
+    pub(crate) fn writes_cache(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub(crate) fn reads_cache(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
+/// Set legacy `WILD_INCREMENTAL_*` env vars from the parsed
+/// `--incremental-cache` flag. Only sets what isn't already set by
+/// the user, so an explicit env-var override (handy for CI) wins.
+/// Called from `Args::parse`, which runs before any thread spawn,
+/// so the `set_var` calls are sound.
+fn translate_incremental_flag(mode: IncrementalCacheMode) {
+    if matches!(mode, IncrementalCacheMode::Off) {
+        return;
+    }
+    // SAFETY: called from Args::parse, before any thread spawns.
+    unsafe {
+        if mode.writes_cache()
+            && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_none()
+            && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_none()
+        {
+            std::env::set_var("WILD_INCREMENTAL_PARSE_SKIP_WRITE", "1");
+        }
+        if mode.reads_cache()
+            && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_none()
+        {
+            std::env::set_var("WILD_INCREMENTAL_PARSE_SKIP_READ", "1");
+        }
+        // ReadWrite implies the speculative writer-skip too — that's
+        // the actual perf win. Users who only want parse-skip can
+        // still force it off via `WILD_INCREMENTAL_TIER3_SKIP=0`.
+        if mode.reads_cache()
+            && std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_none()
+        {
+            std::env::set_var("WILD_INCREMENTAL_TIER3_SKIP", "1");
         }
     }
 }

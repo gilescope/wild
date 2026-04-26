@@ -667,6 +667,16 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             }
             return Ok(());
         }
+        "--incremental-cache" => {
+            // Mach-O ld-style: separate value. `--incremental-cache=…`
+            // (joined form) is handled by the generic `--key=value`
+            // splitter higher up.
+            if let Some(val) = input.next() {
+                args.common.incremental_cache =
+                    super::IncrementalCacheMode::parse(val.as_ref())?;
+            }
+            return Ok(());
+        }
         "-exported_symbols_list" => {
             if let Some(val) = input.next() {
                 // Copy the list into the save-dir so WILD_SAVE_BASE
@@ -1085,6 +1095,14 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
     // Handle --time=<value> form
     if let Some(val) = arg.strip_prefix("--time=") {
         args.common.time_phase_options = Some(super::parse_time_phase_options(val)?);
+        return Ok(());
+    }
+
+    // Handle --incremental-cache=<mode> joined form. The separate
+    // `--incremental-cache MODE` form is handled in `parse_one_arg`'s
+    // string-match table above.
+    if let Some(val) = arg.strip_prefix("--incremental-cache=") {
+        args.common.incremental_cache = super::IncrementalCacheMode::parse(val)?;
         return Ok(());
     }
 
