@@ -269,15 +269,15 @@ fn run_link_directly(req: &Request) -> Result<i32> {
     args.parse(argv_iter)?;
     let _ = crate::setup_tracing(&args);
 
-    // In-process daemon mode runs the link inside a freshly-built
-    // rayon ThreadPool per request, NOT rayon's global default. The
-    // global pool wedges across calls (call 1 leaves worker join
-    // state that call 2's `par_iter` blocks on indefinitely — the
-    // first place this manifested was `verify_cached_inputs_unchanged`
-    // hanging on second-call entry). A scoped pool tears down its
-    // workers on `drop`, so each call gets clean rayon state. Costs
-    // ~1 ms of pool spin-up per link, an acceptable tax for
-    // re-entrancy correctness.
+    // In-process daemon mode builds a fresh rayon ThreadPool for
+    // every request and runs the link inside `pool.install`. The
+    // pool drops on return so each request gets clean rayon state.
+    //
+    // We tried sharing one pool across requests for ~1 ms savings;
+    // it re-introduces the same multi-call wedge that v3 fixed —
+    // the burnin test (`in_process_daemon_handles_multiple_calls`)
+    // hangs on iteration 2. Per-request build is cheap enough
+    // (~1 ms) that the safety is worth it.
     let n_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);

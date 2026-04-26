@@ -26,13 +26,68 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 const SDK_CACHE_MAGIC: &[u8; 8] = b"WILDSDK1";
 const SDK_CACHE_SCHEMA: u32 = 1;
+
+/// Process-resident in-memory cache of parsed TBD symbol sets, keyed
+/// on the `.tbd` path. Saves the per-link disk-cache load on every
+/// `link_framework` call.
+///
+/// On a bevy-class link the disk-backed cache costs ~1.5 ms per TBD
+/// (open file + headers + symbol decode); 17 frameworks turns that
+/// into the 26 ms `pending frameworks` stage observed in profiles of
+/// the in-process daemon. Hoisting to a process-resident map drops
+/// the second-and-subsequent invocations of `load_tbd_symbols` on
+/// the same path to a single hash lookup + stat.
+///
+/// Why path-keyed (not (path, size, mtime)-keyed): the cache value
+/// records `(size, mtime_ns)` of the source TBD at the time of the
+/// most recent disk-cache load; on lookup we re-stat the source and
+/// invalidate if either drifted. That preserves the same correctness
+/// invariant `load_tbd_symbols` already enforces against the disk
+/// cache, without forcing the caller to compute a key.
+///
+/// We store `Arc` rather than the bare value so concurrent callers
+/// don't clone the symbol set (which is a HashSet<Vec<u8>> with ~10k
+/// entries on macOS) — they share a frozen view.
+struct TbdMemEntry {
+    size: u64,
+    mtime_ns: i128,
+    install_name: Option<Vec<u8>>,
+    symbols: Arc<crate::args::macho::DylibSymbols>,
+}
+
+static TBD_MEM_CACHE: Mutex<Option<HashMap<PathBuf, TbdMemEntry>>> = Mutex::new(None);
+
+/// Same idea for the system-wide SDK symbol bundle. One sysroot per
+/// machine in practice, but keep keying explicit so a daemon serving
+/// multiple toolchains stays correct.
+struct SdkMemEntry {
+    libsystem_size: u64,
+    libsystem_mtime_ns: i128,
+    symbols: Arc<crate::args::macho::DylibSymbols>,
+}
+
+static SDK_MEM_CACHE: Mutex<Option<HashMap<PathBuf, SdkMemEntry>>> = Mutex::new(None);
+
+fn stat_size_mtime(path: &Path) -> Option<(u64, i128)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime_ns = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    Some((md.len(), mtime_ns))
+}
 
 /// Root directory for wild's on-disk caches. Respects
 /// `$XDG_CACHE_HOME` on Linux/macOS; falls back to `~/.cache/wild/`
@@ -70,6 +125,23 @@ pub(crate) fn sdk_cache_path(sysroot: &Path) -> Option<PathBuf> {
 /// drift) returns `None` and the caller falls through to the
 /// full walk.
 pub(crate) fn load_sdk_symbols(sysroot: &Path) -> Option<crate::args::macho::DylibSymbols> {
+    // Process-resident fast path. As with `load_tbd_symbols`, the
+    // disk-backed cache itself costs ~3 ms to deserialise on a
+    // bevy-class link; for the daemon's in-process repeated links
+    // we want zero file I/O.
+    let libsystem = sysroot.join("usr/lib/libSystem.tbd");
+    let now_stat = stat_size_mtime(&libsystem);
+    if let Some((cur_size, cur_mtime)) = now_stat {
+        let guard = SDK_MEM_CACHE.lock().expect("sdk mem cache poisoned");
+        if let Some(map) = guard.as_ref()
+            && let Some(entry) = map.get(sysroot)
+            && entry.libsystem_size == cur_size
+            && entry.libsystem_mtime_ns == cur_mtime
+        {
+            return Some((*entry.symbols).clone());
+        }
+    }
+
     let cache_path = sdk_cache_path(sysroot)?;
     let mut f = std::fs::File::open(&cache_path).ok()?;
     let mut buf = Vec::new();
@@ -113,6 +185,21 @@ pub(crate) fn load_sdk_symbols(sysroot: &Path) -> Option<crate::args::macho::Dyl
         out.insert(buf[cursor..cursor + len].to_vec());
         cursor += len;
     }
+
+    // Populate the in-memory cache for the next link.
+    if let Some((cur_size, cur_mtime)) = stat_size_mtime(&libsystem) {
+        let mut guard = SDK_MEM_CACHE.lock().expect("sdk mem cache poisoned");
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(
+            sysroot.to_path_buf(),
+            SdkMemEntry {
+                libsystem_size: cur_size,
+                libsystem_mtime_ns: cur_mtime,
+                symbols: Arc::new(out.clone()),
+            },
+        );
+    }
+
     Some(out)
 }
 
@@ -206,9 +293,35 @@ fn tbd_cache_path(tbd_path: &Path) -> Option<PathBuf> {
 /// Load the cached `(install_name, symbols)` pair for a `.tbd` file
 /// if the on-disk file's `(size, mtime_ns)` still matches what was
 /// recorded.
+///
+/// Returns the symbols as an `Arc<DylibSymbols>` so the in-process
+/// daemon's mem-cache fast path can hand back a refcount-bumped
+/// share rather than a full HashSet clone. Disk-cache hits wrap a
+/// freshly-deserialised set in a fresh `Arc`, so the caller's API
+/// stays uniform across the two paths.
 pub(crate) fn load_tbd_symbols(
     tbd_path: &Path,
-) -> Option<(Option<Vec<u8>>, crate::args::macho::DylibSymbols)> {
+) -> Option<(Option<Vec<u8>>, Arc<crate::args::macho::DylibSymbols>)> {
+    // Process-resident fast path: short-circuits the disk-backed
+    // cache load entirely when the same daemon already decoded this
+    // TBD on a previous link AND the source `.tbd` hasn't moved
+    // since (re-stat below catches any drift). On a bevy-class link
+    // this turns the 26 ms `pending frameworks` stage into ~1 ms.
+    let now_stat = stat_size_mtime(tbd_path);
+    if let Some((cur_size, cur_mtime)) = now_stat {
+        let guard = TBD_MEM_CACHE.lock().expect("tbd mem cache poisoned");
+        if let Some(map) = guard.as_ref()
+            && let Some(entry) = map.get(tbd_path)
+            && entry.size == cur_size
+            && entry.mtime_ns == cur_mtime
+        {
+            // Refcount bump only — no HashSet clone. The caller
+            // iterates into its own `dylib_symbols` set.
+            return Some((entry.install_name.clone(), Arc::clone(&entry.symbols)));
+        }
+        drop(guard);
+    }
+
     let cache_path = tbd_cache_path(tbd_path)?;
     let mut f = std::fs::File::open(&cache_path).ok()?;
     let mut buf = Vec::new();
@@ -266,7 +379,25 @@ pub(crate) fn load_tbd_symbols(
         symbols.insert(buf[cursor..cursor + len].to_vec());
         cursor += len;
     }
-    Some((install_name, symbols))
+
+    // Wrap in `Arc` and populate the in-memory cache. The same `Arc`
+    // is shared with the caller and stored — no extra HashSet copy.
+    let symbols_arc = Arc::new(symbols);
+    if let Some((cur_size, cur_mtime)) = stat_size_mtime(tbd_path) {
+        let mut guard = TBD_MEM_CACHE.lock().expect("tbd mem cache poisoned");
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(
+            tbd_path.to_path_buf(),
+            TbdMemEntry {
+                size: cur_size,
+                mtime_ns: cur_mtime,
+                install_name: install_name.clone(),
+                symbols: Arc::clone(&symbols_arc),
+            },
+        );
+    }
+
+    Some((install_name, symbols_arc))
 }
 
 /// Persist the parsed `(install_name, symbols)` pair for a `.tbd`

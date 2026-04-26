@@ -1801,7 +1801,12 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
                 if let Some(dylib_path) = install_name {
                     args.add_dylib(dylib_path, DylibLoadKind::Normal);
                 }
-                args.dylib_symbols.extend(symbols);
+                // Iterate the Arc'd HashSet by reference so the
+                // mem-cache fast path doesn't pay a full HashSet
+                // clone on top of the per-symbol Vec clones that
+                // `extend` already does.
+                args.dylib_symbols
+                    .extend(symbols.iter().cloned());
                 return Ok(());
             }
             // Miss: parse the .tbd, then persist the result for
