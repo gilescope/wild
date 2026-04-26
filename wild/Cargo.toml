@@ -27,6 +27,10 @@ name = "parse_skip_tests"
 path = "tests/parse_skip_tests.rs"
 
 [[test]]
+name = "trait_change_test"
+path = "tests/trait_change_test.rs"
+
+[[test]]
 name = "lld_macho_tests"
 path = "tests/lld_macho_tests.rs"
 harness = false
