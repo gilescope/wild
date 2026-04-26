@@ -3,6 +3,8 @@ pub use args::Args;
 pub(crate) mod arch;
 pub(crate) mod archive;
 pub mod args;
+#[cfg(unix)]
+pub mod daemon;
 pub(crate) mod debug_trace;
 pub(crate) mod diagnostics;
 pub(crate) mod diff;
@@ -402,10 +404,15 @@ impl Linker {
         file_loader.verify_inputs_unchanged()?;
 
         // Incremental link — persist the signature + input hashes
-        // for the next link. Skipped entirely when the env var is
-        // unset; on skip-paths the prior cache is already current,
-        // so we only persist on a full-link path.
-        if result.is_ok() && std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
+        // for the next link. Fires whenever the user opted into a
+        // cache-writing mode (`--incremental-cache=write|read-write`,
+        // or the legacy `WILD_INCREMENTAL_DEBUG=1` env var). On
+        // skip-paths the prior cache is already current, so we only
+        // persist on a full-link path.
+        let should_persist = result.is_ok()
+            && (args.common().incremental_cache.writes_cache()
+                || std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some());
+        if should_persist {
             persist_link_cache::<P>(&file_loader, args);
         }
 
@@ -454,7 +461,9 @@ impl Linker {
         // as defence-in-depth for paths where the pre-load check
         // can't run (first link, cache v-mismatch, explicit
         // WILD_INCREMENTAL_PRE_LOAD_SKIP=0 opt-out).
-        if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+        let pre_load_skip_active = args.common().incremental_cache.reads_cache()
+            || std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some();
+        if pre_load_skip_active
             && std::env::var_os("WILD_INCREMENTAL_PRE_LOAD_SKIP").as_deref()
                 != Some(std::ffi::OsStr::new("0"))
             && try_pre_load_skip::<P>(args)

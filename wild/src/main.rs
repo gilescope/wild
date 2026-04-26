@@ -7,6 +7,39 @@ static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 fn main() {
+    // `wild --serve <socket>` enters daemon mode: bind a Unix socket
+    // and serve link requests in a fork-per-connection loop. We
+    // dispatch *before* libwild::init_timing / Args::parse so the
+    // server's own startup isn't billed to the first client.
+    #[cfg(unix)]
+    if let Some(socket_path) = parse_serve_arg() {
+        if let Err(error) = libwild::daemon::serve(&socket_path) {
+            libwild::error::report_error_and_exit(&error);
+        }
+        return;
+    }
+
+    // `WILD_SERVER=<socket>` enters client mode: ship our argv/env/cwd
+    // to the daemon and replay its captured stderr/stdout. On socket
+    // failure we fall through to a direct in-process link so a stale
+    // env var (e.g. daemon stopped between cargo invocations) doesn't
+    // break the build.
+    #[cfg(unix)]
+    if let Some(socket_path) = std::env::var_os("WILD_SERVER") {
+        let path = std::path::PathBuf::from(socket_path);
+        match libwild::daemon::dispatch_to_daemon(&path) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!(
+                    "wild: WILD_SERVER={} unreachable ({:?}); falling back to direct link",
+                    path.display(),
+                    e
+                );
+                // Drop into the normal direct-link path below.
+            }
+        }
+    }
+
     if let Err(error) = run() {
         libwild::error::report_error_and_exit(&error)
     }
@@ -14,6 +47,25 @@ fn main() {
 
 /// The current Wild version as written by build.rs.
 const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
+
+/// Returns `Some(path)` when argv contains `--serve <path>` or
+/// `--serve=<path>`. We scan manually rather than going through
+/// `Args::parse` so daemon mode doesn't pay the cost of full link-arg
+/// parsing — and so flags like `-L`, which depend on a real link
+/// context, can't error out a daemon-startup invocation.
+#[cfg(unix)]
+fn parse_serve_arg() -> Option<std::path::PathBuf> {
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        if let Some(rest) = arg.strip_prefix("--serve=") {
+            return Some(std::path::PathBuf::from(rest));
+        }
+        if arg == "--serve" {
+            return iter.next().map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
 
 fn run() -> libwild::error::Result {
     #[cfg(feature = "dhat")]

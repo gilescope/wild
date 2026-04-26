@@ -31,6 +31,10 @@ name = "trait_change_test"
 path = "tests/trait_change_test.rs"
 
 [[test]]
+name = "daemon_test"
+path = "tests/daemon_test.rs"
+
+[[test]]
 name = "lld_macho_tests"
 path = "tests/lld_macho_tests.rs"
 harness = false
