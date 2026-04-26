@@ -5102,6 +5102,9 @@ fn layout_section_parts<P: Platform>(
                     mem_offset = location.address;
                 }
 
+                let section_start_file_offset = file_offset;
+                let section_start_mem_offset = mem_offset;
+
                 records_out[part_id_range.clone()]
                     .iter_mut()
                     .zip(&sizes[part_id_range.clone()])
@@ -5183,6 +5186,42 @@ fn layout_section_parts<P: Platform>(
                             file_offset += mem_size as usize;
                         }
                     });
+
+                // Tier-4 (incremental-only): pad each ALLOC section's
+                // end to a 4 KiB boundary so a small input-content
+                // change doesn't cascade through every subsequent
+                // section's `file_offset`. tier-3's reuse predicate
+                // (`reusable_section_indices`) requires byte-identical
+                // (file_offset, file_size, mem_offset, mem_size) on
+                // both sides — without this, a 1-byte edit to a
+                // function shifts every downstream section and tier 3
+                // sees zero reusable sections (observed on bevy:
+                // touch main.rs → 0/55 sections reusable). Cold
+                // links don't pay the bloat — gated on
+                // `incremental_cache.writes_cache()`.
+                //
+                // Bevy bloat estimate: ~110 KiB on a 50 MiB output
+                // (0.2%). The Mach-O loader honours each section's
+                // declared `size` field, so the trailing
+                // zero-padding is harmless. mem_offset is rounded
+                // alongside file_offset to keep the segment's
+                // file ↔ memory delta invariant.
+                if args.common().incremental_cache.writes_cache()
+                    && file_offset > section_start_file_offset
+                {
+                    let merge_target =
+                        output_sections.primary_output_section(section_id);
+                    let section_flags = output_sections.section_flags(merge_target);
+                    if section_flags.is_alloc() && !args.should_output_partial_object() {
+                        const TIER4_PAD: usize = 4096;
+                        let padded_file_end =
+                            file_offset.next_multiple_of(TIER4_PAD);
+                        let pad_bytes = padded_file_end - file_offset;
+                        file_offset = padded_file_end;
+                        mem_offset += pad_bytes as u64;
+                    }
+                }
+                let _ = section_start_mem_offset;
             }
         };
     }
