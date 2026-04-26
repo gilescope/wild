@@ -2501,6 +2501,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wild-client"
+version = "0.8.0"
+
+[[package]]
 name = "wild-linker"
 version = "0.8.0"
 dependencies = [
