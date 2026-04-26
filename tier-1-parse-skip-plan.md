@@ -13,6 +13,32 @@ filter) verified end-to-end on rust-hello with one fake-dirty
 input: 6/54 sections pre-filled (16 KiB byte-identical), 48
 sections re-emitted by writer, output runs.
 
+**Bevy-dylib measurement (50 MB Rust binary, ~600 inputs)**:
+real cargo dev-loop relink (touch `src/main.rs`, `cargo build
+--release`) shows NO improvement from `--incremental-cache=
+read-write` vs cold writer: ~1290 ms median both ways. Two
+likely reasons:
+
+1. rustc captures linker stderr and only forwards on failure,
+   so we can't directly observe whether tier-3 fired through
+   the cargo invocation. The mechanism is verified to fire on
+   manual wild invocations (rust-hello fixture) but the bevy
+   path may be hitting an edge case (e.g. all sections appear
+   dirty when main.rs's contributing input changes, leaving
+   nothing for the partial-reuse path).
+2. Even if tier-3 fires, the writer's per-section emit may not
+   be the dominant cost on bevy. The link is ~1.3 s of which
+   probably 600 ms is wild itself; the writer is maybe 400 ms;
+   skipping per-input-section iterations saves a fraction. The
+   50 MB pre-fill costs ~30 ms which partially offsets.
+
+Future work (not blocking current ship): instrument wild to
+log via a side channel (file or named pipe) so the cargo path
+can be observed; add a tier-3 mode flag that ALSO mmap-COWs
+the prev output as the new output's initial state instead of
+zero-init+memcpy (saves the 30 ms pre-fill cost on
+bevy-class outputs).
+
 ## Status (2026-04-24) — SHIP-READY
 
 Infrastructure shipped across 7 commits (`f0120e6` refactor →
