@@ -5,6 +5,7 @@ pub(crate) mod archive;
 pub mod args;
 #[cfg(unix)]
 pub mod daemon;
+pub mod daemon_protocol;
 pub(crate) mod debug_trace;
 pub(crate) mod diagnostics;
 pub(crate) mod diff;

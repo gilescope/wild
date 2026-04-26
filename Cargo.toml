@@ -5,6 +5,7 @@ members = [
     "linker-trace",
     "linker-utils",
     "wild",
+    "wild-client",
     "libwild",
     "benchmarks/runner",
     "wilt",
