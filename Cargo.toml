@@ -111,6 +111,16 @@ zstd = "0.13.0"
 [profile.release]
 codegen-units = 1
 
+# Custom profile used to build the thin daemon-client binary
+# (`wild-client`). Aggressive size + startup optimisations: full LTO,
+# `panic = "abort"` to drop unwind tables, and symbol strip. Inherits
+# release for everything else (codegen-units = 1, opt-level = 3).
+[profile.thin-bin]
+inherits = "release"
+panic = "abort"
+lto = "fat"
+strip = "symbols"
+
 [profile.release-debug]
 inherits = "release"
 debug = true

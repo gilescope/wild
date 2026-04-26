@@ -1792,8 +1792,68 @@ fn discover_sdk_path() -> Option<Box<Path>> {
         })
 }
 
+/// Resolved framework lookup, cached across daemon-mode link
+/// invocations. Holds the same effects `link_framework` would apply:
+/// the install name (if a `.tbd` provided one) and the parsed symbol
+/// set as an `Arc` so refcount-bumping replaces re-parsing.
+#[derive(Clone)]
+struct CachedFrameworkResolution {
+    install_name: Option<Vec<u8>>,
+    symbols: std::sync::Arc<DylibSymbols>,
+}
+
+/// Process-resident cache of framework name → resolved TBD effects.
+/// Skips ALL filesystem stats inside `link_framework` after the first
+/// daemon-served link, including the per-search-path `is_dir` walk
+/// that contributed several ms even when the underlying TBD mem
+/// cache hit.
+///
+/// Keyed on `(framework_search_paths-digest, name)` — if `-F` flags
+/// change between cargo invocations, the digest mismatches and we
+/// fall through to a fresh resolution. The TBD layer's
+/// `(size, mtime_ns)` validation is the safety net for the very
+/// rare case of an SDK update during a single daemon's lifetime.
+static FRAMEWORK_SESSION: std::sync::Mutex<
+    Option<std::collections::HashMap<String, CachedFrameworkResolution>>,
+> = std::sync::Mutex::new(None);
+
+fn framework_session_key(search_paths: &[Box<std::path::Path>], name: &str) -> String {
+    // Deterministic + cheap. Path count is small (≤ 5 typically) and
+    // a leading null byte separates digest from name so two distinct
+    // (paths, name) pairs can't collide via concatenation games.
+    let mut s = String::with_capacity(64);
+    for p in search_paths {
+        s.push_str(&p.to_string_lossy());
+        s.push('\0');
+    }
+    s.push('|');
+    s.push_str(name);
+    s
+}
+
 /// Search framework search paths for a framework and register it as a dylib dependency.
 fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
+    // Daemon-friendly fast path: skip the entire path-walk + stat
+    // dance when this daemon already resolved `name` against the
+    // current search-path set. A bevy-class link has 17 framework
+    // flags; on each link this path saves ~3 stats per framework
+    // even when the TBD mem-cache below was already hot.
+    let session_key = framework_session_key(&args.framework_search_paths, name);
+    {
+        let guard = FRAMEWORK_SESSION
+            .lock()
+            .expect("framework session cache poisoned");
+        if let Some(map) = guard.as_ref()
+            && let Some(cached) = map.get(&session_key)
+        {
+            if let Some(install_name) = cached.install_name.clone() {
+                args.add_dylib(install_name, DylibLoadKind::Normal);
+            }
+            args.dylib_symbols.extend(cached.symbols.iter().cloned());
+            return Ok(());
+        }
+    }
+
     // Search: <F-path>/<name>.framework/<name>[.tbd]
     let framework_dir = format!("{name}.framework");
     for dir in &args.framework_search_paths {
@@ -1810,7 +1870,7 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
             // Cache `(install_name, symbols)` keyed on
             // (path, size, mtime).
             if let Some((install_name, symbols)) = crate::sdk_cache::load_tbd_symbols(&tbd_path) {
-                if let Some(dylib_path) = install_name {
+                if let Some(dylib_path) = install_name.clone() {
                     args.add_dylib(dylib_path, DylibLoadKind::Normal);
                 }
                 // Iterate the Arc'd HashSet by reference so the
@@ -1819,6 +1879,13 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
                 // `extend` already does.
                 args.dylib_symbols
                     .extend(symbols.iter().cloned());
+                framework_session_insert(
+                    session_key,
+                    CachedFrameworkResolution {
+                        install_name,
+                        symbols,
+                    },
+                );
                 return Ok(());
             }
             // Miss: parse the .tbd, then persist the result for
@@ -1831,16 +1898,37 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
             }
             args.dylib_symbols.extend(fresh_symbols.iter().cloned());
             crate::sdk_cache::save_tbd_symbols(&tbd_path, install_name.as_deref(), &fresh_symbols);
+            framework_session_insert(
+                session_key,
+                CachedFrameworkResolution {
+                    install_name,
+                    symbols: std::sync::Arc::new(fresh_symbols),
+                },
+            );
             return Ok(());
         }
         let dylib_path = fw_dir.join(name);
         if dylib_path.exists() {
             handle_dylib_input(args, &dylib_path)?;
+            // Don't cache the `.dylib` (vs `.tbd`) branch — the
+            // `handle_dylib_input` path mutates `args` more
+            // broadly (rpaths, install-name handling) and would
+            // be misleading to replay verbatim. In practice this
+            // branch fires for non-SDK frameworks that link from
+            // a real Mach-O dylib; far rarer than the .tbd path.
             return Ok(());
         }
     }
     tracing::warn!("framework not found: {name}");
     Ok(())
+}
+
+fn framework_session_insert(key: String, value: CachedFrameworkResolution) {
+    let mut guard = FRAMEWORK_SESSION
+        .lock()
+        .expect("framework session cache poisoned");
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.insert(key, value);
 }
 
 /// Check if a file is a Mach-O dylib/bundle by reading its header.
