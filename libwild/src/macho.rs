@@ -3229,6 +3229,27 @@ impl platform::Platform for MachO {
         // flag + send a symbol request. FDE `pc_begin` relocs
         // (type UNSIGNED, r_length=3, not pc-rel) are skipped, so
         // we don't pull functions in via this pass.
+        //
+        // KNOWN GAP (see `parse_cie_aug` in macho_writer.rs and
+        // `WILD_STRICT_PERSONALITY` env-var gate): rustc-emitted
+        // Rust object files don't use ARM64_RELOC_POINTER_TO_GOT
+        // for the CIE personality pointer. Instead they emit a
+        // SUBTRACTOR + UNSIGNED pair (`_rust_eh_personality -
+        // ltmp18`, r_length=3, !pcrel) so the personality is
+        // encoded as a section-relative offset, not as a GOT
+        // indirection. This filter matches neither member of the
+        // pair, so wild's scan never asks for a personality GOT
+        // slot. Net effect: the FDE personality field carries
+        // unrelocated bytes; the downstream `is_plausible_got_vm`
+        // filter drops the FDE's `__unwind_info` personality
+        // index. Most frames are fine (Apple's libunwind uses
+        // `__unwind_info` as the primary index, "no personality"
+        // is a valid encoding), but `catch_unwind` boundaries
+        // inside the affected object can't run their personality
+        // routine. To fix properly: also handle the SUBTRACTOR +
+        // UNSIGNED pair pattern here when both members are extern
+        // and the UNSIGNED targets an `eh_personality`-shaped
+        // symbol. Until then the breakage is contained but real.
         if is_eh_frame {
             if let Some(sec_obj) = state.object.sections.get(section.index.0) {
                 if let Ok(relocs) = sec_obj.relocations(le, state.object.data) {

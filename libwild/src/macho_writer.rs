@@ -6662,29 +6662,63 @@ fn parse_cie_aug(data: &[u8], cie_pos: usize, eh_frame_vm_addr: u64) -> CieAugIn
                         // Debug-only invariant: the resolved
                         // personality should point into __got or
                         // __TEXT. If this fires, the CIE reloc
-                        // scan in `load_object_section_relocations`
-                        // missed a POINTER_TO_GOT and the
-                        // personality field was written with a raw
-                        // VA. Downgraded to a one-shot warn while
-                        // debugging the wild-on-wild bug — proc-
-                        // macro dylib links (e.g. `paste`) trip
-                        // this on a subset of CIE personality
-                        // relocs that the downstream
-                        // `is_plausible_got_vm` filter drops anyway.
-                        // The downgrade lets the v9 invariant pass
-                        // surface other failures further down the
-                        // pipeline.
+                        // scan in `MachO::load_object_section_relocations`
+                        // (libwild/src/macho.rs:3232 onwards) missed
+                        // a POINTER_TO_GOT and the personality field
+                        // was written with a raw VA / unrelocated
+                        // bytes from the input `.o`. Currently
+                        // tolerated: the downstream
+                        // `is_plausible_got_vm` filter (line ~6858)
+                        // drops the bogus value before
+                        // `__unwind_info` records it, so the FDE
+                        // exists in `__eh_frame` but no
+                        // `__unwind_info` entry references the
+                        // broken personality. Net effect: panic
+                        // unwinding through these frames falls back
+                        // to "no personality" — works for most code
+                        // but breaks the rare frame whose
+                        // exception-handling actually depends on
+                        // running the personality routine (e.g.
+                        // catch_unwind boundaries inside the
+                        // affected object). Known reproducer: any
+                        // proc-macro dylib link with `paste` in
+                        // dependency tree. Real fix lives in the
+                        // reloc-scan filter — likely needs to
+                        // accept additional `(r_type, r_length,
+                        // r_pcrel, r_extern)` combinations beyond
+                        // `(7, 2, true, true)`.
+                        //
+                        // Gate: `WILD_STRICT_PERSONALITY=1` makes
+                        // this fatal in debug mode so contributors
+                        // working on the reloc-scan can see it
+                        // immediately. Default debug mode prints a
+                        // one-shot warn to stderr but doesn't bail
+                        // — that lets v9-style downstream invariant
+                        // checks reach later in the pipeline
+                        // without being shadowed by this earlier
+                        // bug.
                         if cfg!(debug_assertions)
                             && !(target_vm >= 0x1_0000_0000
                                 && (target_vm - 0x1_0000_0000) < (1u64 << 31))
                         {
+                            if std::env::var_os("WILD_STRICT_PERSONALITY").is_some() {
+                                panic!(
+                                    "parse_cie_aug: CIE personality resolves to \
+                                     {target_vm:#x}, outside the expected __got / \
+                                     __TEXT window — reloc scan likely missed the \
+                                     CIE POINTER_TO_GOT. Set
+                                     WILD_STRICT_PERSONALITY=1 to debug; the fix \
+                                     is in MachO::load_object_section_relocations \
+                                     (`is_eh_frame` branch)."
+                                );
+                            }
                             static WARNED: std::sync::Once = std::sync::Once::new();
                             WARNED.call_once(|| {
                                 eprintln!(
                                     "wild-debug: CIE personality {target_vm:#x} \
-                                     outside __got/__TEXT (one-shot warn; reloc \
-                                     scan missed a POINTER_TO_GOT) — see \
-                                     macho_writer.rs::parse_cie_aug"
+                                     outside __got/__TEXT (one-shot warn). Set \
+                                     WILD_STRICT_PERSONALITY=1 for an immediate \
+                                     panic. See `parse_cie_aug` in macho_writer.rs."
                                 );
                             });
                         }
