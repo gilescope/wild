@@ -1,4 +1,14 @@
-# Wild-on-wild self-link bug
+# Wild-on-wild self-link bug — FIXED 2026-04-27
+
+**Status: fixed.** Root cause and patch summary at the top; the rest of this file preserves the (sometimes wrong) intermediate diagnoses for history.
+
+The fix lives in `libwild/src/macho_writer.rs::write_exe_symtab`'s "symtab: filter orphan N_UNDF_EXT" step. The existing N_UNDF|N_EXT collection mirrored every undefined-external from every input `.o` into the output symtab. Many of those `U` references pointed at symbols whose definitions lived in archive members or atoms wild's GC dropped — leaving the `U` entry orphaned: no chained-fixup import, no `-U`-list entry, no defined-locally fallback. The added post-filter drops those orphans before the symtab is written.
+
+Diagnosis path that worked: peppered the writer with `debug_assert`s ("invariants we expect to hold if our mental model is right"), built wild in debug mode, used it as the linker for a release rebuild. The orphan-detector assert tripped immediately with 262 bad symbols and a clear stack trace. The earlier hypotheses ("GOT-cursor spill", "chained-fixup encoder bug") were both disproven by other asserts that did NOT trip.
+
+Regression test: `wild/tests/wild_on_wild_test.rs` builds a tiny rust binary depending on `zstd` (the original trigger archive), links via wild, runs it. Pre-fix this SIGSEGVs at startup; post-fix it exits 31 cleanly.
+
+---
 
 When the `wild` linker is used to link itself (`cargo build --release -p wild-linker` with `RUSTFLAGS=-C link-arg=-fuse-ld=<wild>`), the resulting `wild` binary is corrupt and segfaults on startup.
 

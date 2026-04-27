@@ -35,6 +35,10 @@ name = "daemon_test"
 path = "tests/daemon_test.rs"
 
 [[test]]
+name = "wild_on_wild_test"
+path = "tests/wild_on_wild_test.rs"
+
+[[test]]
 name = "lld_macho_tests"
 path = "tests/lld_macho_tests.rs"
 harness = false
