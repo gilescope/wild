@@ -3253,18 +3253,82 @@ impl platform::Platform for MachO {
         if is_eh_frame {
             if let Some(sec_obj) = state.object.sections.get(section.index.0) {
                 if let Ok(relocs) = sec_obj.relocations(le, state.object.data) {
-                    for r in relocs {
+                    // First pass: ARM64_RELOC_POINTER_TO_GOT — the
+                    // historical encoding used by clang-emitted CIEs
+                    // (SDK / system libraries).
+                    //
+                    // Second pass: ARM64_RELOC_SUBTRACTOR (5) +
+                    // ARM64_RELOC_UNSIGNED (0) pair — the encoding
+                    // rustc emits for `_rust_eh_personality`. The
+                    // SUBTRACTOR comes first naming the subtrahend
+                    // (typically an `ltmp*` local section anchor),
+                    // the UNSIGNED follows at the same r_address
+                    // naming the target (the personality fn). Both
+                    // r_length=3, !pcrel. The two members must be
+                    // adjacent and share an r_address — that's how
+                    // ld64 has parsed them since at least 2010.
+                    //
+                    // For wild's purposes the only thing the scan
+                    // needs to do is request the personality symbol
+                    // so it acquires a resolution. The reloc-write
+                    // path then computes `target - subtrahend` and
+                    // patches the CIE field in `__eh_frame`. No GOT
+                    // slot is needed (the encoding is direct, not
+                    // GOT-indirect), so we do NOT set the GOT flag
+                    // for the pair case — only send the symbol
+                    // request.
+                    let relocs: Vec<object::macho::Relocation<object::Endianness>> =
+                        relocs.iter().copied().collect();
+                    for (idx, r) in relocs.iter().enumerate() {
                         let ri = r.info(le);
-                        if ri.r_type != 7 || ri.r_length != 2 || !ri.r_pcrel || !ri.r_extern {
+                        if ri.r_type == 7
+                            && ri.r_length == 2
+                            && ri.r_pcrel
+                            && ri.r_extern
+                        {
+                            let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
+                            let local_id = state.symbol_id_range.input_to_id(sym_idx);
+                            let sym_id = resources.symbol_db.definition(local_id);
+                            let atomic = resources.per_symbol_flags.get_atomic(sym_id);
+                            let prev = atomic.fetch_or(crate::value_flags::ValueFlags::GOT);
+                            if !prev.has_resolution() {
+                                queue.send_symbol_request::<A>(sym_id, resources, scope);
+                            }
                             continue;
                         }
-                        let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
-                        let local_id = state.symbol_id_range.input_to_id(sym_idx);
-                        let sym_id = resources.symbol_db.definition(local_id);
-                        let atomic = resources.per_symbol_flags.get_atomic(sym_id);
-                        let prev = atomic.fetch_or(crate::value_flags::ValueFlags::GOT);
-                        if !prev.has_resolution() {
-                            queue.send_symbol_request::<A>(sym_id, resources, scope);
+                        // SUBTRACTOR + UNSIGNED pair: SUBTRACTOR
+                        // first at index `idx`, UNSIGNED at idx+1.
+                        // Both r_length=3, both r_extern=true,
+                        // sharing r_address. The UNSIGNED's symbol
+                        // is the target we care about.
+                        if ri.r_type == 5
+                            && ri.r_length == 3
+                            && !ri.r_pcrel
+                            && ri.r_extern
+                            && idx + 1 < relocs.len()
+                        {
+                            let next = relocs[idx + 1].info(le);
+                            if next.r_type == 0
+                                && next.r_length == 3
+                                && !next.r_pcrel
+                                && next.r_extern
+                                && next.r_address == ri.r_address
+                            {
+                                let sym_idx =
+                                    object::SymbolIndex(next.r_symbolnum as usize);
+                                let local_id =
+                                    state.symbol_id_range.input_to_id(sym_idx);
+                                let sym_id = resources.symbol_db.definition(local_id);
+                                let prev = resources
+                                    .per_symbol_flags
+                                    .get_atomic(sym_id)
+                                    .get();
+                                if !prev.has_resolution() {
+                                    queue.send_symbol_request::<A>(
+                                        sym_id, resources, scope,
+                                    );
+                                }
+                            }
                         }
                     }
                 }

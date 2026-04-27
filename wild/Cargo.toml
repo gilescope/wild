@@ -39,6 +39,10 @@ name = "wild_on_wild_test"
 path = "tests/wild_on_wild_test.rs"
 
 [[test]]
+name = "personality_test"
+path = "tests/personality_test.rs"
+
+[[test]]
 name = "lld_macho_tests"
 path = "tests/lld_macho_tests.rs"
 harness = false
