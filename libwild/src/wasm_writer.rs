@@ -202,10 +202,14 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
 
     // GC: remove unreferenced functions (spec §9.1).
     if layout.symbol_db.args.should_gc_sections() {
+        let function_origin = std::mem::take(&mut merged.function_origin);
         gc_functions(
             &mut merged,
             layout.symbol_db.args.should_export_all_dynamic_symbols(),
+            layout.symbol_db.args.print_gc_sections,
+            &function_origin,
         );
+        merged.function_origin = function_origin;
     }
 
     // Pad call_indirect / return_call_indirect tableidx LEBs to 5 bytes
@@ -3916,6 +3920,11 @@ struct MergedModule {
     /// private, never exported even under `--export-all` /
     /// `--export-dynamic`.
     local_functions: std::collections::HashSet<Vec<u8>>,
+    /// Map from function name to the basename of the input file that
+    /// defined it. Populated during merge_inputs alongside
+    /// function_name_map. Used by `--print-gc-sections` to attribute
+    /// dropped functions to their source object.
+    function_origin: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     /// Function names whose defining symbol carried `WASM_SYM_BINDING_WEAK`
     /// (flag 0x01). When two names map to the same output function index
     /// (a weak alias scenario like `alias_fn = direct_fn`), the canonical
@@ -5032,7 +5041,12 @@ fn mark_used_types<'a>(
     type_used
 }
 
-fn gc_functions(merged: &mut MergedModule, export_all_dynamic: bool) {
+fn gc_functions(
+    merged: &mut MergedModule,
+    export_all_dynamic: bool,
+    print_gc_sections: bool,
+    function_origin: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) {
     let num_funcs = merged.functions.len();
     if num_funcs == 0 {
         return;
@@ -5144,6 +5158,32 @@ fn gc_functions(merged: &mut MergedModule, export_all_dynamic: bool) {
     let keep_count = reachable.iter().filter(|&&r| r).count();
     if keep_count == num_funcs {
         return;
+    }
+
+    // `--print-gc-sections`: emit one line per defined function we're
+    // about to drop. Format matches lld:
+    //   removing unused section <input-basename>:(<funcname>)
+    // Multiple names mapping to the same dropped index (aliases) all
+    // get a line. Sorted by output function index for deterministic
+    // ordering across runs.
+    if print_gc_sections {
+        let mut dropped: Vec<(u32, Vec<u8>)> = Vec::new();
+        for (name, &out_idx) in &merged.function_name_map {
+            if let Some(local) = to_local(out_idx) {
+                if !reachable[local] {
+                    dropped.push((out_idx, name.clone()));
+                }
+            }
+        }
+        dropped.sort();
+        for (_, name) in &dropped {
+            let origin = function_origin
+                .get(name)
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .unwrap_or_else(|| "?".into());
+            let nm = String::from_utf8_lossy(name);
+            println!("removing unused section {origin}:({nm})");
+        }
     }
 
     // Build wasm-binary-index → new-wasm-binary-index map. Imports
@@ -5801,6 +5841,10 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let mut function_is_weak: std::collections::HashMap<Vec<u8>, bool> = Default::default();
     // Track functions with hidden visibility (flag 0x04) — excluded from --export-dynamic.
     let mut function_is_hidden: std::collections::HashSet<Vec<u8>> = Default::default();
+    // Map from function name to the basename of the input that
+    // defined it. Used by `--print-gc-sections` to attribute dropped
+    // functions to their source.
+    let mut function_origin: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
     // Function symbols carrying `WASM_SYM_BINDING_LOCAL` (flag 0x02).
     // lld excludes these from `--export-all` / `--export-dynamic`
     // even though they're "defined" — local linkage means TU-private,
@@ -5847,6 +5891,78 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                     e.to_string()
                 )
             })?;
+
+            // `-y SYM` / `--trace-symbol=SYM` diagnostics. Per file,
+            // walk the symbol table and emit one line per matching
+            // symbol — `definition of <SYM>` for defined symbols,
+            // `reference to <SYM>` for undefined ones (kind-1 ABSOLUTE
+            // synth refs are skipped — they're a wild-internal book-
+            // keeping shape that has no lld counterpart). Order
+            // matches lld's output: per-input definitions first, then
+            // references; files in command-line order.
+            if !layout.symbol_db.args.trace_symbols.is_empty() {
+                let basename = obj
+                    .input
+                    .file
+                    .filename
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "?".into());
+                let trace = &layout.symbol_db.args.trace_symbols;
+                // Definitions first (matches lld's per-file order).
+                for sym in &parsed.symbols {
+                    if sym.name.is_empty() {
+                        continue;
+                    }
+                    let is_undef = (sym.flags & 0x10) != 0;
+                    let is_absolute = (sym.flags & 0x200) != 0;
+                    if is_undef || is_absolute {
+                        continue;
+                    }
+                    let name = std::str::from_utf8(&sym.name).unwrap_or("");
+                    if trace.iter().any(|s| s == name) {
+                        println!("{basename}: definition of {name}");
+                    }
+                }
+                // Then undefined references. Name resolution mirrors
+                // the rest of the writer: for undefined function/global
+                // symbols without WASM_SYM_EXPLICIT_NAME (flag 0x40)
+                // the parser keeps `sym.name` empty and the actual
+                // name lives in `import_function_names` /
+                // `import_global_names` at `sym.index`.
+                let resolve_name = |sym: &WasmSymbolInfo| -> Vec<u8> {
+                    if !sym.name.is_empty() {
+                        return sym.name.clone();
+                    }
+                    match sym.kind {
+                        0 => parsed
+                            .import_function_names
+                            .get(sym.index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                        2 => parsed
+                            .import_global_names
+                            .get(sym.index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    }
+                };
+                for sym in &parsed.symbols {
+                    let is_undef = (sym.flags & 0x10) != 0;
+                    if !is_undef {
+                        continue;
+                    }
+                    let name_bytes = resolve_name(sym);
+                    if name_bytes.is_empty() {
+                        continue;
+                    }
+                    let name = std::str::from_utf8(&name_bytes).unwrap_or("");
+                    if trace.iter().any(|s| s == name) {
+                        println!("{basename}: reference to {name}");
+                    }
+                }
+            }
 
             // Spec §8 / memory64: reject mem64 inputs when the link isn't
             // configured for memory64 (pass `--features=+memory64`,
@@ -5907,6 +6023,16 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                         } else {
                             function_is_local.remove(name);
                         }
+                        // Source-of-origin for `--print-gc-sections`.
+                        function_origin.insert(
+                            name.clone(),
+                            obj.input
+                                .file
+                                .filename
+                                .file_name()
+                                .map(|s| s.to_string_lossy().as_bytes().to_vec())
+                                .unwrap_or_else(|| b"?".to_vec()),
+                        );
                         if name == entry_name {
                             entry_function_index = Some(output_idx);
                         }
@@ -9196,6 +9322,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         explicit_export_indices,
         hidden_functions: function_is_hidden,
         local_functions: function_is_local,
+        function_origin,
         weak_function_names,
         no_strip_indices,
         exported_indices,

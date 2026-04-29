@@ -125,6 +125,21 @@ pub struct WasmArgs {
     /// mutable globals like `__stack_pointer` are eligible for export
     /// regardless of input target_features.
     pub(crate) extra_features: Vec<String>,
+    /// `-y SYM` / `--trace-symbol=SYM` / `--trace-symbol SYM` /
+    /// `-ySYM`: emit one line per input that defines or references
+    /// SYM, in the form `<basename>: definition of SYM` or
+    /// `<basename>: reference to SYM`. lld prints these to stdout
+    /// (FileCheck pipes them in via `wasm-ld … -y SYM | FileCheck`).
+    /// Useful for debugging "where is this symbol coming from" or
+    /// "why does the linker think there's a definition I didn't
+    /// write." Empty by default.
+    pub(crate) trace_symbols: Vec<String>,
+    /// `--print-gc-sections`: emit one line per defined function the
+    /// GC pass dropped, in the form
+    /// `removing unused section <basename>:(<name>)`. Useful for
+    /// debugging "why was my function dropped" — combined with
+    /// `--no-gc-sections` to prove a function wasn't actually GC'd.
+    pub(crate) print_gc_sections: bool,
 }
 
 impl Default for WasmArgs {
@@ -172,6 +187,8 @@ impl Default for WasmArgs {
             lto: crate::lto::LtoConfig::default(),
             lld_compat: false,
             extra_features: Vec::new(),
+            trace_symbols: Vec::new(),
+            print_gc_sections: false,
         }
     }
 }
@@ -581,10 +598,23 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             // following symbol name isn't mistaken for a positional
             // input file.
             "-y" | "-trace-symbol" | "--trace-symbol" => {
-                iter.next();
+                if let Some(name) = iter.next() {
+                    args.trace_symbols.push(name.as_ref().to_string());
+                }
             }
-            _ if arg.starts_with("-y") => {} // -ysym (glued form)
-            _ if arg.starts_with("--trace-symbol=") => {}
+            _ if arg.starts_with("-y") => {
+                // `-yfoo` glued form.
+                args.trace_symbols.push(arg[2..].to_string());
+            }
+            _ if arg.starts_with("--trace-symbol=") => {
+                args.trace_symbols
+                    .push(arg["--trace-symbol=".len()..].to_string());
+            }
+            _ if arg.starts_with("-trace-symbol=") => {
+                // Single-dash glued form, used in trace-symbol.s.
+                args.trace_symbols
+                    .push(arg["-trace-symbol=".len()..].to_string());
+            }
             _ if arg.starts_with("--wrap=") => {}
             "-wrap" | "--wrap" => {
                 iter.next();
@@ -600,8 +630,8 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                     iter.next();
                 }
             }
-            "--print-gc-sections" => {}
-            "--no-print-gc-sections" => {}
+            "--print-gc-sections" => args.print_gc_sections = true,
+            "--no-print-gc-sections" => args.print_gc_sections = false,
             "--compress-relocations" => args.compress_relocations = true,
             _ if arg.starts_with("--compress-relocations") => args.compress_relocations = true,
             _ if arg.starts_with("-M") | arg.starts_with("--Map") => {

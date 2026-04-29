@@ -256,6 +256,19 @@ const KNOWN_PASSING: &[&str] = &[
     // and the stripped object-crate fabricated unnamed wasm-globals
     // pseudo-symbols stop tripping the `duplicate symbol` check.
     "mutable-global-exports",
+    // `-y SYM` / `--trace-symbol=SYM` / `-trace-symbol=SYM` emit
+    // `<basename>: definition of SYM` and `<basename>: reference to
+    // SYM` per input that defines/references SYM. Order matches lld:
+    // per-file definitions first, then references, files in command-
+    // line order. Useful for debugging "where did this symbol come
+    // from".
+    "trace-symbol",
+    // `--print-gc-sections` emits `removing unused section
+    // <basename>:(<funcname>)` for each function the GC pass drops.
+    // Format matches lld; ordered by output function index for
+    // determinism. `undefined-weak-call.s` covers the diagnostic +
+    // weak-undef stub-vs-GC interaction.
+    "undefined-weak-call",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
