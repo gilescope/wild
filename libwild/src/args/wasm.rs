@@ -64,6 +64,10 @@ pub struct WasmArgs {
     pub(crate) allow_multiple_definitions: bool,
     /// Symbols to force undefined (-u/--undefined).
     pub(crate) force_undefined: Vec<String>,
+    /// `--unresolved-symbols=ignore-all` / `--warn-unresolved-symbols`:
+    /// stub out *all* undefined function symbols (not just weak ones)
+    /// instead of emitting env imports. Matches lld's behaviour.
+    pub(crate) stub_unresolved_functions: bool,
     /// Shared memory mode (--shared-memory).
     pub(crate) shared_memory: bool,
     /// Import memory from environment (--import-memory).
@@ -136,6 +140,7 @@ impl Default for WasmArgs {
             initial_heap: None,
             allow_multiple_definitions: false,
             force_undefined: Vec::new(),
+            stub_unresolved_functions: false,
             shared_memory: false,
             import_memory: false,
             import_memory_name: None,
@@ -502,7 +507,24 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
 
             // --- PIC ---
             "--experimental-pic" | "-pie" | "--pie" => args.is_pic = true,
-            _ if arg.starts_with("--unresolved-symbols=") => {}
+            _ if arg.starts_with("--unresolved-symbols=") => {
+                let val = &arg["--unresolved-symbols=".len()..];
+                match val {
+                    "ignore-all" => {
+                        args.allow_undefined = true;
+                        args.stub_unresolved_functions = true;
+                    }
+                    "report-all" => {} // default
+                    "import-dynamic" => {} // not yet implemented
+                    "ignore-in-shared-libs" => {}
+                    "ignore-in-object-files" => {}
+                    _ => {}
+                }
+            }
+            "--warn-unresolved-symbols" => {
+                args.allow_undefined = true;
+                args.stub_unresolved_functions = true;
+            }
             "--fatal-warnings" => {}
             "--no-fatal-warnings" => {}
             _ if arg.starts_with("--features=") => {
