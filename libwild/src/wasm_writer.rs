@@ -177,8 +177,28 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         return write_relocatable::<A>(sized_output, layout);
     }
 
+    // Diagnose cross-input function signature mismatches before any
+    // emit work — wasm-ld surfaces these as warnings to stderr in
+    // both exec and -r modes (the resulting trap stub keeps the
+    // module typecheckable; the warning lets the user know the link
+    // resolved a symbol non-trivially).
+    {
+        let pre = compute_sig_mismatch_stubs(layout);
+        emit_sig_mismatch_warnings(&pre.sig_mismatch_diagnostics, &pre.sig_mismatch_types);
+    }
+
     // Collect functions from all input objects.
     let mut merged = merge_inputs(layout)?;
+
+    // Reorder synthesized functions to the front of `merged.functions`.
+    // lld places synthetics (`__wasm_call_ctors`, `__wasm_init_memory`,
+    // `__wasm_init_tls`, `__wasm_apply_global_tls_relocs`) at the
+    // lowest defined-function indices (after the imports). Wild's
+    // `merge_inputs` appends them at the tail, but tests like
+    // `tls.s` ASM-CHECK exact `call <idx>` operands against lld's
+    // layout. Reorder here, post-merge, before any pass reads
+    // body call operands.
+    reorder_synth_functions_first(&mut merged);
 
     // GC: remove unreferenced functions (spec §9.1).
     if layout.symbol_db.args.should_gc_sections() {
@@ -187,6 +207,32 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             layout.symbol_db.args.should_export_all_dynamic_symbols(),
         );
     }
+
+    // Pad call_indirect / return_call_indirect tableidx LEBs to 5 bytes
+    // in every body. Has to happen before any custom-section reloc
+    // re-patch (which uses CODE-relative body offsets) so the offsets
+    // those passes compute reflect the final byte-padded bodies.
+    for f in merged.functions.iter_mut() {
+        let _ = pad_call_indirect_tableidx_in_body(&mut f.body);
+    }
+
+    if layout.symbol_db.args.should_gc_sections() {
+        // GC remapped function indices and changed body offsets in the
+        // merged CODE section, but `merge_inputs` had already patched
+        // function-related relocs in custom sections (`.debug_info`
+        // etc.) using PRE-GC values. Re-patch those now so debug
+        // readers see post-GC body offsets and 0xFFFFFFFF tombstones
+        // for symbols whose function got dropped. Runs after the
+        // tableidx-padding pass so body offsets are final.
+        repatch_custom_section_function_relocs(layout, &mut merged);
+    }
+
+    // Reorder TYPE entries to match lld's first-registration ordering
+    // (call_indirect TYPE relocs first, then imports, then defined
+    // functions). Runs post-GC so dropped types/functions don't leak
+    // into the new order.
+    rebuild_types_in_usage_order(layout, &mut merged);
+
     // A shared library always implies PIC; a PIE executable does too.
     // Consumed by phase B (element segment init expression) and beyond.
     let _is_pic = is_shared || layout.symbol_db.args.is_pic;
@@ -449,11 +495,37 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
 
         // Linker-defined global exports (__stack_pointer, __data_end, __heap_base).
         // Placed early in export list (after memory) to match wasm-ld ordering.
-        // With --export-dynamic, all globals are exported.
+        //
+        // Auto-export semantics (lld/wasm/Writer.cpp::calculateExports,
+        // Apache-2.0 with LLVM Exceptions):
+        // - `--export-all` exports every defined global, regardless of
+        //   visibility or mutability.
+        // - `--export-dynamic` exports non-hidden defined globals, but
+        //   GATES linker-synthesized mutable globals (no backing input
+        //   file) on the `mutable-globals` target feature being declared
+        //   by some input. Without that feature the wasm runtime can't
+        //   import a mutable global, so exporting one produces a module
+        //   that won't instantiate. Examples: assembly inputs without
+        //   `.target_features` skip this gate (no mutable-globals → no
+        //   __stack_pointer export); llc-emitted .o files set the
+        //   feature and pass.
         if !is_shared {
-            let export_all_globals = layout.symbol_db.args.should_export_all_dynamic_symbols();
+            let export_all = layout.symbol_db.args.export_all;
+            let export_dynamic =
+                layout.symbol_db.args.should_export_all_dynamic_symbols() && !export_all;
+            let synth_mutable_gate = if export_dynamic {
+                has_mutable_globals_feature(layout)
+            } else {
+                true
+            };
             for (i, global) in merged.globals.iter().enumerate() {
-                if global.exported || export_all_globals {
+                let synth_mutable_blocked = global.mutable
+                    && !global.exported
+                    && global.name.starts_with(b"__")
+                    && export_dynamic
+                    && !synth_mutable_gate;
+                let do_export = global.exported || ((export_all || export_dynamic) && !synth_mutable_blocked);
+                if do_export {
                     let global_idx = merged.num_imported_globals + i as u32;
                     if !exports.iter().any(|(n, _, _)| *n == global.name) {
                         exports.push((global.name.clone(), EXPORT_GLOBAL, global_idx));
@@ -549,7 +621,16 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 })
                 .map(|(name, &idx)| (name.clone(), idx))
                 .collect();
-            names.sort_by_key(|(_, idx)| *idx);
+            // Sort by output function index, then by name. The
+            // name-tiebreak matters for aliases: when two symbols
+            // map to the same function (e.g. `alias_fn` and
+            // `direct_fn` both at idx 1 under a weak alias),
+            // alphabetical order makes wild's output match lld's
+            // (and incidentally is reproducible across runs since
+            // function_name_map is a HashMap).
+            names.sort_by(|(a_name, a_idx), (b_name, b_idx)| {
+                a_idx.cmp(b_idx).then_with(|| a_name.cmp(b_name))
+            });
             for (name, idx) in names {
                 if !exports.iter().any(|(n, _, _)| *n == name) {
                     exports.push((name, EXPORT_FUNC, idx));
@@ -725,23 +806,130 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         }
     }
 
+    // `--emit-relocs`: emit linking + reloc.CODE + reloc.DATA
+    // BEFORE the name section. wasm-ld's emit order is
+    // `.debug_info`, `linking`, `reloc.CODE`, `reloc.<custom>`,
+    // `name`; obj2yaml validates this layout.
+    if !is_shared && layout.symbol_db.args.emit_relocs {
+        let emit = gather_emit_relocs(layout, &merged);
+        let segment_names: Vec<Vec<u8>> = Vec::new();
+        let dummy_data_segments: Vec<(Vec<u8>, u32)> = Vec::new();
+        let comdat_groups: Vec<OutputComdatGroup> = Vec::new();
+        let link_data = build_linking_section_payload(
+            &emit.sym_entries,
+            &segment_names,
+            &dummy_data_segments,
+            &comdat_groups,
+        );
+        let mut custom_payload = Vec::new();
+        write_name(&mut custom_payload, b"linking");
+        custom_payload.extend_from_slice(&link_data);
+        write_section(&mut out, 0, &custom_payload);
+
+        // Compute the CODE section's index in the output. Standard
+        // sections only — count the ones we've actually emitted up
+        // to (and including) CODE. For our typical exec layout:
+        // TYPE, IMPORT, FUNCTION, MEMORY/TABLE/GLOBAL, EXPORT,
+        // ELEM, CODE, DATA. CODE's index is the count of standard
+        // sections emitted before it; reloc.CODE references it by
+        // that index.
+        // For now we rely on the fact that TYPE/FUNCTION/MEMORY/
+        // EXPORT/CODE are always emitted in fixed positions when
+        // present. A future refactor would track this incrementally
+        // like `write_relocatable` does.
+        let code_section_index = compute_code_section_index_in_output(&merged);
+        let data_section_index = compute_data_section_index_in_output(&merged);
+        if let Some(idx) = code_section_index
+            && !emit.output_code_relocs.is_empty()
+        {
+            let payload = build_reloc_section_payload(idx, &emit.output_code_relocs);
+            let mut cp = Vec::new();
+            write_name(&mut cp, b"reloc.CODE");
+            cp.extend_from_slice(&payload);
+            write_section(&mut out, 0, &cp);
+        }
+        if let Some(idx) = data_section_index
+            && !emit.output_data_relocs.is_empty()
+        {
+            let payload = build_reloc_section_payload(idx, &emit.output_data_relocs);
+            let mut cp = Vec::new();
+            write_name(&mut cp, b"reloc.DATA");
+            cp.extend_from_slice(&payload);
+            write_section(&mut out, 0, &cp);
+        }
+        // reloc.<custom_section_name> for each custom section that
+        // had relocs survive the merge (typically `.debug_info` /
+        // `.debug_line`). Emit in deterministic name order so output
+        // is reproducible across runs.
+        let mut cnames: Vec<&Vec<u8>> = emit.output_custom_relocs.keys().collect();
+        cnames.sort();
+        for cname in cnames {
+            let relocs = &emit.output_custom_relocs[cname];
+            if relocs.is_empty() {
+                continue;
+            }
+            let Some(idx) = compute_custom_section_index_in_output(&merged, cname) else {
+                continue;
+            };
+            let payload = build_reloc_section_payload(idx, relocs);
+            let mut cp = Vec::new();
+            let mut reloc_name = b"reloc.".to_vec();
+            reloc_name.extend_from_slice(cname);
+            write_name(&mut cp, &reloc_name);
+            cp.extend_from_slice(&payload);
+            write_section(&mut out, 0, &cp);
+        }
+    }
+
     // Name section (custom section "name") — maps function indices to names.
     if !layout.symbol_db.args.should_strip_all() && !merged.functions.is_empty() {
         let mut name_payload = Vec::new();
 
+        // Module name subsection (id=0): contains the output file's
+        // basename. lld's `NameSection` emits this and it's visible
+        // in obj2yaml's `ModuleName:` field. The size of this
+        // subsection (which scales with the basename length) is what
+        // pushes some name sections past the 128-byte threshold,
+        // turning the section's size LEB from 1 byte to 2 bytes
+        // (obj2yaml's `HeaderSecSizeEncodingLen: 2`).
+        let output_basename: Vec<u8> = layout
+            .symbol_db
+            .args
+            .output
+            .file_name()
+            .map(|n| n.as_encoded_bytes().to_vec())
+            .unwrap_or_default();
+        if !output_basename.is_empty() {
+            let mut module_sub = Vec::new();
+            write_leb128(&mut module_sub, output_basename.len() as u32);
+            module_sub.extend_from_slice(&output_basename);
+            name_payload.push(0); // subsection id = WASM_NAMES_MODULE
+            write_leb128(&mut name_payload, module_sub.len() as u32);
+            name_payload.extend_from_slice(&module_sub);
+        }
+
         // Function names subsection (id=1). When multiple symbol names
-        // point at the same function (e.g. `.set alias, target`), the
-        // wasm name section may only list one name per function index;
-        // emit the alphabetically first to be deterministic and to
-        // match wasm-ld's convention of keeping the canonical
-        // (shorter, typically leading-underscore) name.
+        // point at the same function index (a weak alias scenario like
+        // `alias_fn = direct_fn`), the wasm name section emits one
+        // representative name. lld picks the strong (canonical) name
+        // over weak aliases, breaking ties alphabetically.
         let mut func_names = Vec::new();
         let mut per_idx: std::collections::HashMap<u32, &[u8]> = Default::default();
         for (name, &idx) in &merged.function_name_map {
+            let is_weak = merged.weak_function_names.contains(name);
             per_idx
                 .entry(idx)
                 .and_modify(|existing| {
-                    if name.as_slice() < *existing {
+                    let existing_weak = merged
+                        .weak_function_names
+                        .iter()
+                        .any(|w| w.as_slice() == *existing);
+                    let prefer_new = match (is_weak, existing_weak) {
+                        (false, true) => true,                      // strong beats weak
+                        (true, false) => false,                     // keep strong
+                        _ => name.as_slice() < *existing,           // tie → alphabetical
+                    };
+                    if prefer_new {
                         *existing = name.as_slice();
                     }
                 })
@@ -761,13 +949,28 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         write_leb128(&mut name_payload, func_names.len() as u32);
         name_payload.extend_from_slice(&func_names);
 
-        // Subsection 7: global names (only when globals are defined).
-        if !merged.globals.is_empty() && !is_shared {
-            let mut global_names = Vec::new();
-            write_leb128(&mut global_names, merged.globals.len() as u32);
+        // Subsection 7: global names. Imported globals come first
+        // (their LLVM-level names from `import_global_names`),
+        // followed by defined globals at their absolute index
+        // (= `num_imported_globals + i`).
+        let mut global_name_entries: Vec<(u32, &[u8])> = Vec::new();
+        for (i, name) in merged.import_global_names.iter().enumerate() {
+            if !name.is_empty() {
+                global_name_entries.push((i as u32, name.as_slice()));
+            }
+        }
+        if !is_shared {
             for (i, g) in merged.globals.iter().enumerate() {
-                write_leb128(&mut global_names, i as u32);
-                write_name(&mut global_names, &g.name);
+                let abs_idx = merged.num_imported_globals + i as u32;
+                global_name_entries.push((abs_idx, g.name.as_slice()));
+            }
+        }
+        if !global_name_entries.is_empty() {
+            let mut global_names = Vec::new();
+            write_leb128(&mut global_names, global_name_entries.len() as u32);
+            for (idx, name) in &global_name_entries {
+                write_leb128(&mut global_names, *idx);
+                write_name(&mut global_names, name);
             }
             name_payload.push(7);
             write_leb128(&mut name_payload, global_names.len() as u32);
@@ -905,19 +1108,189 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     sized_output: &mut crate::file_writer::SizedOutput,
     layout: &Layout<'_, Wasm>,
 ) -> crate::error::Result {
+    // Pre-pass: detect names that appear with mismatched function
+    // sigs across inputs. The main pass below uses this to (a) elide
+    // the conflicting imports and (b) synthesize trap stubs as the
+    // first defined functions, matching wasm-ld's `-r` layout. Costs
+    // one extra parse per input, which trades against an order-of-
+    // magnitude cleaner main loop.
+    let pre = compute_sig_mismatch_stubs(layout);
+    emit_sig_mismatch_warnings(&pre.sig_mismatch_diagnostics, &pre.sig_mismatch_types);
+    let approx_total_funcs = pre.approx_total_funcs;
+    let approx_total_segs = pre.approx_total_segs;
+    let total_input_func_imports = pre.total_input_func_imports;
+    let max_table_reach = pre.max_table_reach;
+    let sig_mismatch_stubs = pre.sig_mismatch_stubs;
+    let sig_mismatch_names: std::collections::HashSet<Vec<u8>> =
+        sig_mismatch_stubs.iter().map(|(n, _)| n.clone()).collect();
+    // Final func-imports count after eliding sig-mismatched
+    // imports. Used as a constant `num_func_imports` for symbol
+    // index calculations so DEF symbols computed during the first
+    // file's walk are correct even before later files' imports
+    // are added.
+    let num_func_imports_final: u32 =
+        total_input_func_imports.saturating_sub(sig_mismatch_stubs.len() as u32);
+    // Map: sig-mismatched name → function index of its synthesized
+    // stub. Stubs occupy the first M defined-function slots
+    // (function indices `num_func_imports_final` .. `+M`), matching
+    // wasm-ld's layout where the stub appears before all real defs.
+    let mut stub_func_idx_by_name: std::collections::HashMap<Vec<u8>, u32> =
+        Default::default();
+    // Sentinel base for "redirect this UNDEF symbol to the eventual
+    // stub slot at end-of-table". The actual symbol-table slot of
+    // the stub isn't known until the main walk completes, so we
+    // record sentinel values during the walk and patch them up
+    // after the deferred stubs are appended.
+    const STUB_SENTINEL_BASE: u32 = u32::MAX - 65536;
+    let stub_sentinel = |i: u32| STUB_SENTINEL_BASE + i;
+    let mut stub_sentinel_by_name: std::collections::HashMap<Vec<u8>, u32> =
+        Default::default();
+    for (i, (name, _)) in sig_mismatch_stubs.iter().enumerate() {
+        stub_sentinel_by_name.insert(name.clone(), stub_sentinel(i as u32));
+    }
+
     // Parse all input objects and merge types/functions.
     let mut types: Vec<FuncType> = Vec::new();
     let mut functions: Vec<(u32, Vec<u8>)> = Vec::new(); // (type_index, body)
-    let mut symbol_entries: Vec<(u8, Vec<u8>, u32, u32)> = Vec::new(); // (kind, name, flags, index)
-    let mut imports: Vec<(Vec<u8>, Vec<u8>, u8, u32)> = Vec::new(); // (module, field, kind, type_index)
+    let mut symbol_entries: Vec<SymEntry> = Vec::new();
+    let mut imports: Vec<(Vec<u8>, Vec<u8>, u8, u32, Vec<u8>)> = Vec::new(); // (module, field, kind, type_index, kind_tail)
     let mut num_func_imports = 0u32;
+    // Defined globals emitted in the -r output's GLOBAL section.
+    // Currently used to internalise GOT.mem.<tls> / GOT.data.<tls>
+    // imports — under shared-memory, lld emits these as defined
+    // mutable i32 globals named `GOT.data.internal.<name>` whose
+    // value is set per-thread by `__wasm_apply_global_tls_relocs`
+    // (left as 0 in the -r output; the next link step or runtime
+    // fixes them up).
+    let mut defined_globals: Vec<(Vec<u8>, u8 /*valtype*/, bool /*mutable*/, u64 /*init*/)> =
+        Vec::new();
+    // Map: original GOT.mem/GOT.data <field> → defined-global idx in
+    // the OUTPUT global namespace (after imports). Used to redirect
+    // symbol-table entries that pointed at the dropped import.
+    let mut got_tls_internalised: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    // Names of TLS data symbols across all inputs. Detected once in
+    // the pre-pass below so the import walk can recognise GOT.mem
+    // imports for TLS targets and convert them to defined globals.
+    let mut tls_data_names: std::collections::HashSet<Vec<u8>> = Default::default();
+    {
+        for group in &layout.group_layouts {
+            for file in &group.files {
+                let FileLayout::Object(obj) = file else {
+                    continue;
+                };
+                let data = obj.object.data;
+                if data.len() < 8 || &data[..4] != b"\0asm" {
+                    continue;
+                }
+                let Ok(parsed) = parse_wasm_sections(data) else {
+                    continue;
+                };
+                for sym in &parsed.symbols {
+                    if sym.kind == 1 && (sym.flags & 0x10) == 0 && !sym.name.is_empty() {
+                        if let Some(seg) = parsed.data_segments.get(sym.segment_index as usize) {
+                            let is_tls = seg.is_tls || seg.name.starts_with(b".tdata");
+                            if is_tls {
+                                tls_data_names.insert(sym.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut data_segments: Vec<(Vec<u8>, u32)> = Vec::new(); // (data, alignment)
     let mut segment_names: Vec<Vec<u8>> = Vec::new();
     let mut code_relocs: Vec<WasmReloc> = Vec::new();
     let mut custom_sections: Vec<CustomSection> = Vec::new();
     let mut custom_section_index: std::collections::HashMap<Vec<u8>, usize> = Default::default();
-    let mut total_functions = 0u32;
     let mut total_data_segments = 0u32;
+    // Output-side "absolute" byte position inside the section's
+    // *contents* (the count LEB at the head occupies bytes
+    // 0..N). Reloc offsets in input objects are similarly relative
+    // to their section contents, so the delta to apply to a reloc
+    // is `output_pos_of_body - input_pos_of_body` for the body/seg
+    // containing the reloc's offset. The count-LEB width is sized
+    // from the pre-pass's upper-bound function/segment counts so it
+    // stays correct when inputs cross the 128-/16384-element LEB
+    // boundary (the `many-functions` regression).
+    let total_funcs_for_count = approx_total_funcs + sig_mismatch_stubs.len() as u32;
+    let code_count_leb_bytes = leb128_len(total_funcs_for_count) as u32;
+    let data_count_leb_bytes = leb128_len(approx_total_segs) as u32;
+    let mut output_code_pos: u32 = code_count_leb_bytes;
+    let mut output_data_pos: u32 = data_count_leb_bytes;
+    // Per-input-file (offset_delta, prior_symbol_count). Built while
+    // we walk inputs; consumed by the reloc-section emit pass at the
+    // end, so we don't have to walk every input twice.
+    let mut per_file_remap: Vec<(u32, u32)> = Vec::new();
+    // Code-section relocations after offset/symbol-index remapping —
+    // ready to be written as a `reloc.CODE` custom section.
+    let mut output_code_relocs: Vec<WasmReloc> = Vec::new();
+    // Data-section relocations, equivalent shape to code relocs.
+    let mut output_data_relocs: Vec<WasmReloc> = Vec::new();
+    // COMDAT groups carried through to the merged linking section.
+    // First definer wins; later inputs' duplicate groups are skipped.
+    let mut output_comdat_groups: Vec<OutputComdatGroup> = Vec::new();
+    // Cross-input symbol resolution by name. Once a name has been
+    // claimed by an output symbol-table slot, later inputs reusing
+    // the name are unified into that slot rather than duplicated —
+    // mirrors what wild's executable-side `symbol_db` does, scoped
+    // here to the `-r` path's flat symbol table. Promotes UNDEFINED
+    // → DEFINED when a later input provides a definition; redirects
+    // dropped (COMDAT-loser) symbols' relocs to the surviving twin.
+    let mut name_to_output_sym_idx: std::collections::HashMap<Vec<u8>, u32> =
+        Default::default();
+    // COMDAT first-definition tracker — feeds `compute_comdat_skip_sets`
+    // exactly the way `merge_inputs` does, so the executable and the
+    // `-r` path land on identical winners for the same input order.
+    let mut seen_comdat_groups: std::collections::HashSet<Vec<u8>> = Default::default();
+    // Sig-mismatch rename slots, deferred to the end of the symbol
+    // table so the natural-symbol ordering isn't perturbed when an
+    // input introduces a `signature_mismatch:<name>` entry. Each
+    // tuple is `(name, flags, stub_func_idx)`. Pre-pass synthesizes
+    // entries for cross-file sig-mismatches; the in-flight
+    // detection (in the symbol walk) is now disabled since pre-pass
+    // catches the same cases earlier.
+    let mut pending_sig_mismatch: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+    // Synthesize stubs upfront so they take the first defined-
+    // function slots (function indices `num_func_imports_final`
+    // through `+M-1`). Push to `functions` Vec at the very start
+    // before any file's defs, advance output_code_pos by their
+    // framing, and stage `pending_sig_mismatch` entries for the
+    // post-walk symbol-table append.
+    for (i, (name, sig)) in sig_mismatch_stubs.iter().enumerate() {
+        // locals_count(0) + unreachable + end. Emitter prefixes the
+        // body with its size LEB but doesn't add the locals_count.
+        let stub_body: Vec<u8> = vec![0x00, 0x00, 0x0B];
+        let frame = leb128_len(stub_body.len() as u32) as u32 + stub_body.len() as u32;
+        let stub_func_idx = num_func_imports_final + i as u32;
+        functions.push((*sig, stub_body));
+        output_code_pos += frame;
+        stub_func_idx_by_name.insert(name.clone(), stub_func_idx);
+        let mismatch_name = {
+            let mut s = b"signature_mismatch:".to_vec();
+            s.extend_from_slice(name);
+            s
+        };
+        pending_sig_mismatch.push((mismatch_name, 0x02, stub_func_idx));
+    }
+    // total_functions tracks count of *kept* defs across all files.
+    // Stubs already occupy the first slots; subsequent file defs
+    // start at this offset, so the existing func_base bookkeeping
+    // (each file's func_base = total_functions before its walk)
+    // lands later defs at the right position.
+    let mut total_functions = sig_mismatch_stubs.len() as u32;
+    // Memory offset assigned to each kept data segment, in emission
+    // order. Indexed in lockstep with `data_segments` and consumed
+    // by the data-section emit pass to write the correct
+    // `i32.const N` offset expression. Cumulative + alignment-aware
+    // — matches wasm-ld's `-r` layout where segment N starts at
+    // `align_up(end_of_segment_N-1, segN.alignment)`.
+    let mut data_segment_offsets: Vec<u32> = Vec::new();
+    let mut running_mem_offset: u32 = 0;
+    // Active element segments collected from inputs with function
+    // indices already remapped into the merged output's function-
+    // index space. Emitted as the ELEM section right before CODE.
+    let mut output_element_segments: Vec<(u32, Vec<u32>)> = Vec::new();
 
     for group in &layout.group_layouts {
         for file in &group.files {
@@ -937,24 +1310,97 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 )
             })?;
 
-            // Type dedup.
-            let mut type_map: Vec<u32> = Vec::new();
-            for input_type in &parsed.types {
-                let output_idx = if let Some(pos) = types.iter().position(|t| t == input_type) {
-                    pos as u32
-                } else {
-                    let idx = types.len() as u32;
-                    types.push(input_type.clone());
-                    idx
-                };
-                type_map.push(output_idx);
-            }
+            // Type dedup — shared with `merge_inputs` so the same
+            // input order produces the same dedup result on both
+            // emit paths.
+            let type_map = dedup_types_for_input(&parsed.types, &mut types);
 
             let func_base = total_functions;
             let seg_base = total_data_segments;
+            // Capture the func-imports count from *prior* objects so
+            // undefined function symbols (which index into this
+            // object's own import list) can be re-anchored into the
+            // merged output's import list. Without this, obj2yaml
+            // rejects the symbol table with `invalid function symbol
+            // index`.
+            let prior_func_imports = num_func_imports;
 
-            // Collect imports (pass through).
+            // Collect imports. Func imports whose name is in the
+            // sig-mismatch set are elided — the synthesized stub
+            // takes the conceptual function-index slot they would
+            // have occupied. Imports also dedup by (module, field,
+            // kind) so the same `env::__linear_memory` declared by
+            // multiple input files only lands one slot in the merged
+            // output, matching wasm-ld's behaviour.
+            //
+            // Per-file local→output func-import map is built during
+            // the same walk so element-segment indices can be
+            // remapped after function bodies are emitted.
+            let mut local_func_import_to_output: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.imports.iter().filter(|i| i.kind == 0).count());
             for imp in &parsed.imports {
+                if imp.kind == 0 && sig_mismatch_names.contains(&imp.field) {
+                    // sig-mismatched func import is elided. Its
+                    // local→output mapping points at the eventual
+                    // stub's function index so element segments
+                    // referencing it land on the stub.
+                    local_func_import_to_output.push(stub_func_idx_by_name.get(&imp.field).copied());
+                    continue;
+                }
+                if imp.kind == 2 {
+                    // Memory imports are elided in `-r` output —
+                    // the writer always synthesizes its own MEMORY
+                    // section sized from the merged data layout, so
+                    // passing through input MEMORY imports would
+                    // conflict. Matches wasm-ld.
+                    continue;
+                }
+                // Internalise GOT.mem.<tls> / GOT.data.<tls> imports
+                // for TLS data symbols. lld in `-r` emits these as
+                // DEFINED mutable globals named
+                // `GOT.data.internal.<name>`, init = 0; the next link
+                // step (or `__wasm_apply_global_tls_relocs` at thread
+                // start) fixes them up. Without this conversion, an
+                // input that uses `tls@GOT@TLS` would emit two `tls`
+                // globals (one imported via GOT.mem, one via GOT.data)
+                // and lld's per-output-global symbol-table layout
+                // wouldn't match wild's.
+                if imp.kind == 3
+                    && (imp.module == b"GOT.mem" || imp.module == b"GOT.data")
+                    && tls_data_names.contains(&imp.field)
+                {
+                    if !got_tls_internalised.contains_key(&imp.field) {
+                        let mut name = b"GOT.data.internal.".to_vec();
+                        name.extend_from_slice(&imp.field);
+                        let global_offset = defined_globals.len() as u32;
+                        defined_globals.push((
+                            name,
+                            VALTYPE_I32,
+                            true, // mutable
+                            0,    // init = 0; runtime fixup
+                        ));
+                        got_tls_internalised.insert(imp.field.clone(), global_offset);
+                    }
+                    continue;
+                }
+                // Dedup by (module, field, kind). For func imports
+                // we also redirect the per-file local index to the
+                // surviving twin's output position.
+                if imp.kind == 0
+                    && let Some(existing_idx) = imports
+                        .iter()
+                        .filter(|(_, _, k, _, _)| *k == 0)
+                        .position(|(m, f, _, _, _)| *m == imp.module && *f == imp.field)
+                {
+                    local_func_import_to_output.push(Some(existing_idx as u32));
+                    continue;
+                }
+                let dup = imports.iter().any(|(m, f, k, _, _)| {
+                    *m == imp.module && *f == imp.field && *k == imp.kind
+                });
+                if dup {
+                    continue;
+                }
                 let remapped_type = if imp.kind == 0 {
                     type_map
                         .get(imp.type_index as usize)
@@ -963,58 +1409,996 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 } else {
                     imp.type_index
                 };
+                if imp.kind == 0 {
+                    local_func_import_to_output.push(Some(num_func_imports));
+                }
                 imports.push((
                     imp.module.clone(),
                     imp.field.clone(),
                     imp.kind,
                     remapped_type,
+                    imp.kind_tail.clone(),
                 ));
                 if imp.kind == 0 {
                     num_func_imports += 1;
                 }
             }
 
-            // Collect functions.
-            for func in &parsed.functions {
-                let remapped_type = type_map
-                    .get(func.type_index as usize)
-                    .copied()
-                    .unwrap_or(func.type_index);
-                functions.push((remapped_type, func.body.clone()));
+            // COMDAT skip sets — must be computed BEFORE walking
+            // functions / data segments / symbols, since each of
+            // those uses the skip sets to decide what to drop.
+            // Shared with `merge_inputs` so the same input order
+            // produces the same winners on both emit paths.
+            //
+            // Capture which groups this file is the *winner* for
+            // (= first to define them) before compute_comdat_skip_sets
+            // mutates `seen_comdat_groups`. Their entries (in input
+            // indices) are remapped below to output indices and
+            // emitted in the linking section's COMDAT subsection.
+            let winning_comdat_groups: Vec<&(Vec<u8>, Vec<(u8, u32)>)> = parsed
+                .comdat_groups
+                .iter()
+                .filter(|(name, _)| !seen_comdat_groups.contains(name))
+                .collect();
+            let winning_comdat_groups_owned: Vec<(Vec<u8>, Vec<(u8, u32)>)> =
+                winning_comdat_groups.iter().map(|g| (g.0.clone(), g.1.clone())).collect();
+            let (skip_funcs, skip_data, _skip_tags) =
+                compute_comdat_skip_sets(&parsed, &mut seen_comdat_groups);
+
+            // Build per-file local-defined-func → output-defined-func
+            // index remap. Skipped (COMDAT-loser) entries map to
+            // `None`. `next_kept_def_idx` is the running counter of
+            // kept defined functions across all inputs so far —
+            // becomes the new output-side `func_base` semantics.
+            let mut local_def_to_output_def_idx: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.functions.len());
+            let mut kept_in_this_file: u32 = 0;
+            for i in 0..parsed.functions.len() {
+                if skip_funcs.contains(&(i as u32)) {
+                    local_def_to_output_def_idx.push(None);
+                } else {
+                    local_def_to_output_def_idx.push(Some(total_functions + kept_in_this_file));
+                    kept_in_this_file += 1;
+                }
             }
+
+            // Remap and accumulate this input's element segments
+            // into the merged output. Function indices in input
+            // space map either to a kept output func import via
+            // `local_func_import_to_output` or to a kept def via
+            // `num_func_imports_final + local_def_to_output_def_idx`.
+            for (offset, indices) in &parsed.element_segments {
+                let mut remapped: Vec<u32> = Vec::with_capacity(indices.len());
+                for &fi in indices {
+                    let out = if (fi as usize) < parsed.num_function_imports as usize {
+                        local_func_import_to_output
+                            .get(fi as usize)
+                            .copied()
+                            .flatten()
+                    } else {
+                        let local_def = (fi - parsed.num_function_imports) as usize;
+                        local_def_to_output_def_idx
+                            .get(local_def)
+                            .copied()
+                            .flatten()
+                            .map(|d| num_func_imports_final + d)
+                    };
+                    remapped.push(out.unwrap_or(0));
+                }
+                output_element_segments.push((*offset, remapped));
+            }
+
+            // Capture per-input-body positions so a code reloc whose
+            // offset lands inside body[i] can be moved to the same
+            // byte inside the same body in the output. `output_body_starts[i]`
+            // is `None` for skipped bodies, so a reloc landing inside a
+            // skipped body is dropped (its surviving COMDAT twin lives
+            // in another file).
+            let prior_symbol_count: u32 = symbol_entries.len() as u32;
+            let input_code_count_leb_bytes =
+                leb128_len(parsed.functions.len() as u32) as u32;
+            let mut input_body_starts: Vec<u32> = Vec::with_capacity(parsed.functions.len());
+            let mut input_body_ends: Vec<u32> = Vec::with_capacity(parsed.functions.len());
+            let mut output_body_starts: Vec<Option<u32>> = Vec::with_capacity(parsed.functions.len());
+            // Index into the global `functions` Vec for each kept body,
+            // so the post-walk reloc-patch step can mutate the cloned
+            // body bytes in place (LEB-encoded immediates need to be
+            // overwritten with `sym_addr + addend`).
+            let mut local_func_to_functions_idx: Vec<Option<usize>> =
+                Vec::with_capacity(parsed.functions.len());
+            let mut input_pos = input_code_count_leb_bytes;
+
+            // Collect functions, dropping COMDAT-losers. The body
+            // slot is still tracked for offset purposes so
+            // surviving relocs can be located back to their input
+            // body even when a skipped body precedes them.
+            for (i, func) in parsed.functions.iter().enumerate() {
+                let body_len = func.body.len() as u32;
+                let frame = leb128_len(body_len) as u32 + body_len;
+                input_body_starts.push(input_pos);
+                input_body_ends.push(input_pos + frame);
+                input_pos += frame;
+                if skip_funcs.contains(&(i as u32)) {
+                    output_body_starts.push(None);
+                    local_func_to_functions_idx.push(None);
+                } else {
+                    let remapped_type = type_map
+                        .get(func.type_index as usize)
+                        .copied()
+                        .unwrap_or(func.type_index);
+                    output_body_starts.push(Some(output_code_pos));
+                    output_code_pos += frame;
+                    local_func_to_functions_idx.push(Some(functions.len()));
+                    functions.push((remapped_type, func.body.clone()));
+                }
+            }
+
+            // Build per-input-kind import lookups so an undefined
+            // symbol whose name was omitted from the input's linking
+            // section (the standard encoding for non-explicit
+            // undefs) can have its name recovered from the matching
+            // import's field. Without this the output `name` section
+            // misses entries the test harness checks for.
+            let func_imports: Vec<&Vec<u8>> =
+                parsed.imports.iter().filter(|i| i.kind == 0).map(|i| &i.field).collect();
+            let global_imports: Vec<&Vec<u8>> =
+                parsed.imports.iter().filter(|i| i.kind == 3).map(|i| &i.field).collect();
+
+            // Decide which data segments survive into the output.
+            // `.bss.*` segments and any COMDAT-skipped data segments
+            // are dropped; everything else is kept. We also build a
+            // per-segment keep mask so the symbol-table emission
+            // below can rewrite data symbols whose backing segment
+            // got dropped into UNDEFINED.
+            // In `-r` mode lld preserves BSS segments — the next link
+            // step needs to place them and resolve absolute addresses
+            // against them. Only drop COMDAT-loser segments here; the
+            // exec path in `merge_inputs` handles BSS elision via its
+            // own group-classification pass.
+            let dropped_data_segs: std::collections::HashSet<u32> = parsed
+                .data_segments
+                .iter()
+                .enumerate()
+                .filter_map(|(i, _seg)| {
+                    if skip_data.contains(&(i as u32)) {
+                        Some(i as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Walk data segments BEFORE symbols so the symbol walk
+            // can populate `local_sym_addr` from `per_seg_logical_offset`.
+            // `data_offset_in_section` is the input-side payload
+            // position of each segment; `output_seg_payload_starts[i]`
+            // is the corresponding output position (or `None` if the
+            // segment was dropped because it's BSS or a COMDAT loser).
+            // The reloc remapper later uses these to translate
+            // per-input reloc offsets.
+            //
+            // Each kept segment also gets an assigned memory offset
+            // so the active-segment init expression points at where
+            // it actually lives in the merged image. Padding for
+            // alignment matches wasm-ld's behaviour (align_up the
+            // running offset to the segment's natural alignment).
+            let mut input_seg_payload_starts: Vec<u32> = Vec::with_capacity(parsed.data_segments.len());
+            let mut input_seg_payload_ends: Vec<u32> = Vec::with_capacity(parsed.data_segments.len());
+            let mut output_seg_payload_starts: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.data_segments.len());
+            // Memory placement assigned to every input segment,
+            // including BSS-elided ones (their payload isn't emitted
+            // but their symbols still need a logical address for
+            // partial reloc application). Kept segments use their
+            // active-init offset; BSS-elided ones get a logical
+            // offset placed after all kept segments, alignment-aware.
+            let mut per_seg_logical_offset: Vec<u32> = vec![0; parsed.data_segments.len()];
+            // Per-input-segment slot in the global `data_segments`
+            // Vec — `None` for dropped segments. Lets the data-reloc
+            // patcher mutate the cloned bytes in place.
+            let mut local_seg_to_data_seg_idx: Vec<Option<usize>> =
+                Vec::with_capacity(parsed.data_segments.len());
+            // Per-input-segment byte offset INSIDE its assigned
+            // data_segments slot. Zero for non-merged segments (the
+            // input seg's data fills the whole slot). Non-zero for
+            // TLS segments that share the merged `.tdata` slot —
+            // each input TLS seg occupies a sub-range starting at
+            // its alignment-padded position within the merged data.
+            // Used by the reloc patcher so input-relative offsets
+            // address the right bytes inside the merged buffer.
+            let mut local_seg_data_offset: Vec<u32> =
+                vec![0; parsed.data_segments.len()];
+
+            // First pass: classify each input seg as TLS-merged,
+            // non-TLS-kept, or dropped. lld merges all TLS segments
+            // into a single `.tdata` output segment (matching the
+            // ELF / mach-o pattern of name-based section merging).
+            // Wild collapses them per-input here; multi-input TLS
+            // merging across files would need to share state in
+            // `data_segments` outside this loop — out of scope for
+            // single-input fixtures like `tls.s`.
+            let is_tls_seg = |seg: &ParsedDataSegment| -> bool {
+                seg.is_tls || seg.name.starts_with(b".tdata")
+            };
+            let tls_kept_indices: Vec<usize> = parsed
+                .data_segments
+                .iter()
+                .enumerate()
+                .filter_map(|(i, seg)| {
+                    if !dropped_data_segs.contains(&(i as u32)) && is_tls_seg(seg) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Build the merged TLS payload + per-input local offsets.
+            let mut merged_tls_data: Vec<u8> = Vec::new();
+            let mut merged_tls_align: u32 = 1;
+            let mut tls_local_offsets: std::collections::HashMap<usize, u32> = Default::default();
+            for &i in &tls_kept_indices {
+                let seg = &parsed.data_segments[i];
+                let align = seg.alignment.max(1);
+                merged_tls_align = merged_tls_align.max(align);
+                // Align the merged buffer's tail to this seg's alignment.
+                let pad = (merged_tls_data.len() as u32).wrapping_neg() & (align - 1);
+                merged_tls_data.extend(std::iter::repeat_n(0u8, pad as usize));
+                let local_off = merged_tls_data.len() as u32;
+                tls_local_offsets.insert(i, local_off);
+                merged_tls_data.extend_from_slice(&seg.data);
+            }
+
+            // Reserve the merged `.tdata` slot (emitted FIRST so it
+            // takes idx 0 in `segment_names`, matching lld's ordering).
+            let tls_merged_slot: Option<usize> = if !tls_kept_indices.is_empty() {
+                let merged_payload_len = merged_tls_data.len() as u32;
+                let mem_offset = (running_mem_offset + merged_tls_align - 1)
+                    & !(merged_tls_align - 1);
+                running_mem_offset = mem_offset + merged_payload_len;
+                let sleb_size = sleb128_len(mem_offset as i32) as u32;
+                let framing_overhead = 1 + 1 + sleb_size + 1;
+                let framing_start = output_data_pos;
+                let payload_start = framing_start
+                    + framing_overhead
+                    + leb128_len(merged_payload_len) as u32;
+                output_data_pos = framing_start
+                    + framing_overhead
+                    + leb128_len(merged_payload_len) as u32
+                    + merged_payload_len;
+                let slot = data_segments.len();
+                data_segments.push((merged_tls_data, merged_tls_align));
+                segment_names.push(b".tdata".to_vec());
+                data_segment_offsets.push(mem_offset);
+                // Populate per-input TLS seg trackers now.
+                for &i in &tls_kept_indices {
+                    let local_off = tls_local_offsets[&i];
+                    per_seg_logical_offset[i] = mem_offset + local_off;
+                    local_seg_data_offset[i] = local_off;
+                }
+                let _ = payload_start;
+                Some(slot)
+            } else {
+                None
+            };
+
+            // Second pass: walk segments in input order, populating
+            // per-input trackers (input_seg_payload_starts/ends always
+            // get pushed; output starts and slot pointers depend on
+            // classification).
+            for (seg_i, seg) in parsed.data_segments.iter().enumerate() {
+                let payload_len = seg.data.len() as u32;
+                input_seg_payload_starts.push(seg.data_offset_in_section);
+                input_seg_payload_ends.push(seg.data_offset_in_section + payload_len);
+                if dropped_data_segs.contains(&(seg_i as u32)) {
+                    output_seg_payload_starts.push(None);
+                    local_seg_to_data_seg_idx.push(None);
+                    continue;
+                }
+                if is_tls_seg(seg) {
+                    let slot = tls_merged_slot
+                        .expect("tls_merged_slot must be Some when there's a kept TLS seg");
+                    let local_off = local_seg_data_offset[seg_i];
+                    // The merged payload's start in OUTPUT bytes was
+                    // computed when the slot was reserved. Recover it
+                    // by stepping back from the current output_data_pos
+                    // — but simpler: stash via data_segment_offsets
+                    // and recompute the framing here once. Cheap.
+                    let merged_mem_offset = data_segment_offsets[slot];
+                    let sleb_size = sleb128_len(merged_mem_offset as i32) as u32;
+                    let merged_payload_len = data_segments[slot].0.len() as u32;
+                    let framing_overhead = 1 + 1 + sleb_size + 1;
+                    // Walk back: start = output_data_pos -
+                    // (merged_payload_len + size_LEB + framing_overhead),
+                    // but only safe if this slot is the most recent
+                    // one — which it is for the simple single-input
+                    // case. Compute payload_start fresh using a
+                    // cursor that walks data_segments.
+                    let mut cursor = data_count_leb_bytes;
+                    for (s_idx, (s_data, _)) in data_segments.iter().enumerate() {
+                        let s_mem = data_segment_offsets[s_idx];
+                        let s_sleb = sleb128_len(s_mem as i32) as u32;
+                        let s_frame = 1 + 1 + s_sleb + 1;
+                        if s_idx == slot {
+                            let payload_start =
+                                cursor + s_frame + leb128_len(s_data.len() as u32) as u32;
+                            output_seg_payload_starts.push(Some(payload_start + local_off));
+                            break;
+                        }
+                        cursor += s_frame
+                            + leb128_len(s_data.len() as u32) as u32
+                            + s_data.len() as u32;
+                    }
+                    local_seg_to_data_seg_idx.push(Some(slot));
+                    let _ = (framing_overhead, merged_payload_len);
+                    continue;
+                }
+                // Non-TLS kept segment: emit individually as before.
+                let align = seg.alignment.max(1);
+                let mem_offset = (running_mem_offset + align - 1) & !(align - 1);
+                running_mem_offset = mem_offset + payload_len;
+                per_seg_logical_offset[seg_i] = mem_offset;
+
+                let sleb_size = sleb128_len(mem_offset as i32) as u32;
+                let framing_overhead = 1 + 1 + sleb_size + 1;
+                let framing_start = output_data_pos;
+                let payload_start =
+                    framing_start + framing_overhead + leb128_len(payload_len) as u32;
+                output_seg_payload_starts.push(Some(payload_start));
+                output_data_pos = framing_start
+                    + framing_overhead
+                    + leb128_len(payload_len) as u32
+                    + payload_len;
+                local_seg_to_data_seg_idx.push(Some(data_segments.len()));
+                data_segments.push((seg.data.clone(), seg.alignment));
+                segment_names.push(seg.name.clone());
+                data_segment_offsets.push(mem_offset);
+            }
+            // Second pass — assign logical offsets to BSS-elided
+            // segments after running_mem_offset, in input order. lld
+            // places elided BSS after non-BSS so symbols pointing at
+            // them get the right "memory tail" address.
+            for (seg_i, seg) in parsed.data_segments.iter().enumerate() {
+                if dropped_data_segs.contains(&(seg_i as u32)) && is_bss_segment(seg) {
+                    let align = seg.alignment.max(1);
+                    let mem_offset = (running_mem_offset + align - 1) & !(align - 1);
+                    running_mem_offset = mem_offset + seg.data.len() as u32;
+                    per_seg_logical_offset[seg_i] = mem_offset;
+                }
+            }
+
+            // For each COMDAT group this file wins, remap its
+            // entries to the merged output's indices and stage them
+            // for the linking section's COMDAT subsection. Has to
+            // sit after both `local_def_to_output_def_idx` and
+            // `local_seg_to_data_seg_idx` are known.
+            for (group_name, entries) in &winning_comdat_groups_owned {
+                let mut remapped: Vec<(u8, u32)> = Vec::with_capacity(entries.len());
+                for &(kind, input_idx) in entries {
+                    let out_idx = match kind {
+                        1 => {
+                            if input_idx < parsed.num_function_imports {
+                                local_func_import_to_output
+                                    .get(input_idx as usize)
+                                    .copied()
+                                    .flatten()
+                            } else {
+                                let local_def =
+                                    (input_idx - parsed.num_function_imports) as usize;
+                                local_def_to_output_def_idx
+                                    .get(local_def)
+                                    .copied()
+                                    .flatten()
+                                    .map(|d| num_func_imports_final + d)
+                            }
+                        }
+                        0 => local_seg_to_data_seg_idx
+                            .get(input_idx as usize)
+                            .copied()
+                            .flatten()
+                            .map(|s| s as u32),
+                        _ => Some(input_idx),
+                    };
+                    if let Some(idx) = out_idx {
+                        remapped.push((kind, idx));
+                    }
+                }
+                if !remapped.is_empty() {
+                    output_comdat_groups.push(OutputComdatGroup {
+                        name: group_name.clone(),
+                        entries: remapped,
+                    });
+                }
+            }
+
+            // Per-input local-symbol → output-symbol-index map. A
+            // symbol pointing at a COMDAT-skipped function body is
+            // dropped (mapped to None); subsequent symbols in this
+            // file shift down. The map feeds the reloc remapper
+            // below — relocs referencing dropped symbols get
+            // dropped too. Cross-file COMDAT redirect (point a
+            // dropped symbol's relocs at the surviving twin in
+            // another file) is the next-phase work; for now we
+            // assume references to dropped funcs come from the
+            // dropped funcs themselves (the typical case).
+            let mut local_sym_to_output_sym_idx: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.symbols.len());
+            // Per-input symbol address — used by the partial-reloc
+            // patcher below to compute `sym_addr + addend` for each
+            // reloc and overwrite the corresponding LEB-encoded
+            // immediate in the cloned body/data bytes. Funcs use
+            // their output function index; defined data symbols use
+            // `seg_logical_offset + sym.segment_offset`. Globals are
+            // indexed by the import-side global index (we don't yet
+            // emit defined globals on the `-r` path).
+            let mut local_sym_addr: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.symbols.len());
 
             // Collect symbols for the linking section.
             for sym in &parsed.symbols {
                 let mut new_index = sym.index;
                 let mut new_seg = sym.segment_index;
+                let mut name = sym.name.clone();
+                let mut new_flags = sym.flags;
+                let mut drop_symbol = false;
+                // DATA-only metadata for the SymEntry. Non-data
+                // symbols leave these zero. Defined data symbols
+                // carry segment/offset/size; symbols pointing at a
+                // dropped segment get demoted to UNDEFINED below.
+                let mut new_seg_value: u32 = 0;
+                let mut new_seg_offset: u32 = 0;
+                let mut new_seg_size: u32 = 0;
                 match sym.kind {
                     0 => {
-                        // FUNCTION: adjust index
-                        if (sym.flags & 0x10) == 0 && sym.index >= parsed.num_function_imports {
-                            new_index = func_base
-                                + (sym.index - parsed.num_function_imports)
-                                + num_func_imports;
+                        // FUNCTION: a symbol's `index` lives in the
+                        // imports-then-defs index space of the *input*
+                        // object. Both halves shift in the merged
+                        // output: imports gain the prior-object import
+                        // count; defs gain the full output import
+                        // count plus the prior-object def count.
+                        if sym.index < parsed.num_function_imports {
+                            // Recover the symbol's name from the
+                            // matching import field if the linking
+                            // section omitted it (standard for
+                            // non-explicit undefs).
+                            if name.is_empty() && let Some(n) = func_imports.get(sym.index as usize) {
+                                name = (*n).clone();
+                            }
+                            // If this UNDEF symbol's name is in the
+                            // sig-mismatch set, the import was
+                            // elided. Redirect to the stub's slot
+                            // (resolved post-walk via sentinel).
+                            if let Some(&stub_func) = stub_func_idx_by_name.get(&name) {
+                                new_index = stub_func;
+                                // We won't actually emit this symbol
+                                // — drop it but the local→output
+                                // remap for this file's local idx is
+                                // overridden to the sentinel below.
+                                drop_symbol = true;
+                            } else {
+                                new_index = prior_func_imports + sym.index;
+                            }
+                        } else {
+                            let local_def_idx = (sym.index - parsed.num_function_imports) as usize;
+                            match local_def_to_output_def_idx.get(local_def_idx).copied().flatten() {
+                                Some(out_def_idx) => {
+                                    // Use FINAL func-imports count
+                                    // so an early-walked DEF symbol
+                                    // doesn't get a stale index when
+                                    // later files add imports (or
+                                    // when this file's import was
+                                    // elided into a stub).
+                                    new_index = num_func_imports_final + out_def_idx;
+                                }
+                                None => {
+                                    drop_symbol = true;
+                                }
+                            }
                         }
                     }
                     1 => {
-                        // DATA: adjust segment index
+                        // DATA: remap segment index through the
+                        // per-file kept-seg map (which already
+                        // accounts for BSS elision and COMDAT
+                        // dropping). Defined data symbols carry
+                        // (segment, offset, size) through to the
+                        // linking section so the next link step can
+                        // re-resolve.
                         if (sym.flags & 0x10) == 0 {
-                            new_seg = seg_base + sym.segment_index;
+                            if dropped_data_segs.contains(&sym.segment_index) {
+                                new_flags |= 0x10; // WASM_SYM_UNDEFINED
+                            } else if let Some(out_seg) =
+                                local_seg_to_data_seg_idx
+                                    .get(sym.segment_index as usize)
+                                    .copied()
+                                    .flatten()
+                            {
+                                new_seg = out_seg as u32;
+                                new_seg_value = new_seg;
+                                new_seg_offset = sym.segment_offset;
+                                new_seg_size = sym.segment_size;
+                            } else {
+                                new_flags |= 0x10;
+                            }
+                        }
+                    }
+                    2 => {
+                        // GLOBAL: undefined globals' names live in the
+                        // input's import section, not the linking
+                        // section (matching the function path above).
+                        if (sym.flags & 0x10) != 0
+                            && name.is_empty()
+                            && let Some(n) = global_imports.get(sym.index as usize)
+                        {
+                            name = (*n).clone();
+                        }
+                        // If this UNDEF kind=2 sym matches an
+                        // internalised TLS GOT import, promote it to
+                        // a DEFINED global, rename to
+                        // `GOT.data.internal.<field>`, and aim its
+                        // index at the synthesised defined global.
+                        // The import was dropped from `imports` in
+                        // the import walk above; without this fixup
+                        // the linking section would emit a stale
+                        // UNDEF entry with no matching import.
+                        let original_field = if !name.is_empty() {
+                            Some(name.clone())
+                        } else {
+                            None
+                        };
+                        if (sym.flags & 0x10) != 0
+                            && let Some(field) = original_field.as_ref()
+                            && let Some(&got_offset) = got_tls_internalised.get(field)
+                        {
+                            new_flags &= !0x10; // drop UNDEFINED
+                            // Compute defined-global wasm index =
+                            // (final imported globals count) + got_offset.
+                            // We don't know the final count yet so
+                            // store a sentinel that's patched up
+                            // after all inputs are walked.
+                            new_index = u32::MAX - 1024 + got_offset;
+                            let mut renamed = b"GOT.data.internal.".to_vec();
+                            renamed.extend_from_slice(field);
+                            name = renamed;
                         }
                     }
                     _ => {}
                 }
-                symbol_entries.push((sym.kind, sym.name.clone(), sym.flags, new_index));
+                // Compute the symbol's address for partial reloc
+                // application. The address has different meaning per
+                // reloc kind, but for the kinds we patch (FUNCTION/
+                // GLOBAL/TABLE/TAG_INDEX_LEB and MEMORY_ADDR_*) it
+                // collapses to either an index into a wasm namespace
+                // or a memory byte offset.
+                let addr = match sym.kind {
+                    0 => {
+                        // Function: index in output's function-index
+                        // space (imports + defs).
+                        if sym.index < parsed.num_function_imports {
+                            Some(prior_func_imports + sym.index)
+                        } else if drop_symbol {
+                            None
+                        } else {
+                            Some(new_index)
+                        }
+                    }
+                    1 => {
+                        // Data: memory byte address. Defined symbols
+                        // resolve via the segment's logical offset
+                        // (kept or BSS-elided); undefined and
+                        // segment-dropped non-bss stay unresolved.
+                        if (sym.flags & 0x10) == 0
+                            && (sym.segment_index as usize) < per_seg_logical_offset.len()
+                        {
+                            Some(
+                                per_seg_logical_offset[sym.segment_index as usize]
+                                    + sym.segment_offset,
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    2 => {
+                        // Global: index in output's global-index
+                        // space. The naive `prior + sym.index`
+                        // breaks when this file's global imports were
+                        // dropped (e.g. TLS GOT internalisation).
+                        // Drop the partial-reloc patch in that case —
+                        // the reloc itself is preserved in the output
+                        // so the next link step still resolves.
+                        if sym.index < global_imports.len() as u32 {
+                            let total_global_imports = imports
+                                .iter()
+                                .filter(|(_, _, kind, _, _)| *kind == 3)
+                                .count() as u32;
+                            let this_file_globals = global_imports.len() as u32;
+                            total_global_imports
+                                .checked_sub(this_file_globals)
+                                .map(|prior| prior + sym.index)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                local_sym_addr.push(addr);
+
+                let is_local = (new_flags & 0x02) != 0; // BINDING_LOCAL
+
+                // Sig-mismatch detection for function symbols. The
+                // pre-pass already identifies cross-file mismatches
+                // and synthesizes their stubs upfront, so the
+                // in-flight detection below only fires on cases the
+                // pre-pass missed (currently nothing). Kept as a
+                // safety net.
+                let new_sig_for_mismatch: Option<u32> = if sym.kind == 0 && !drop_symbol {
+                    if sym.index < parsed.num_function_imports {
+                        // UNDEF function: sig = the import's type idx.
+                        // `func_imports` indexes the *names*; we need
+                        // the corresponding type-idxs (kind=0 imports
+                        // in input order).
+                        let mut k0 = 0u32;
+                        let mut t = None;
+                        for imp in &parsed.imports {
+                            if imp.kind == 0 {
+                                if k0 == sym.index {
+                                    t = Some(
+                                        type_map
+                                            .get(imp.type_index as usize)
+                                            .copied()
+                                            .unwrap_or(imp.type_index),
+                                    );
+                                    break;
+                                }
+                                k0 += 1;
+                            }
+                        }
+                        t
+                    } else {
+                        let local_def_idx =
+                            (sym.index - parsed.num_function_imports) as usize;
+                        parsed.functions.get(local_def_idx).map(|f| {
+                            type_map
+                                .get(f.type_index as usize)
+                                .copied()
+                                .unwrap_or(f.type_index)
+                        })
+                    }
+                } else {
+                    None
+                };
+
+                if drop_symbol {
+                    // Sig-mismatch UNDEF redirect first: if this
+                    // symbol's name has a stub, route file-local
+                    // relocs to the stub's eventual symbol-table
+                    // slot (sentinel patched up post-walk).
+                    let redirect = if let Some(&sentinel) = stub_sentinel_by_name.get(&name) {
+                        Some(sentinel)
+                    } else if !name.is_empty() && !is_local {
+                        // COMDAT-skipped symbols redirect to the
+                        // surviving cross-file twin if one exists.
+                        // Locals don't participate in cross-file
+                        // resolution — they're private to their TU.
+                        name_to_output_sym_idx.get(&name).copied()
+                    } else {
+                        None
+                    };
+                    local_sym_to_output_sym_idx.push(redirect);
+                } else if !name.is_empty()
+                    && !is_local
+                    && let Some(&existing_idx) = name_to_output_sym_idx.get(&name)
+                    && !(symbol_entries[existing_idx as usize].flags & 0x02) != 0
+                {
+                    // Same-name unification across files (both
+                    // non-local). When the new symbol is a function
+                    // and its sig differs from the existing slot's,
+                    // we synthesize a trap stub and emit the new
+                    // symbol under `signature_mismatch:<name>`. When
+                    // sigs match, promote UNDEFINED → DEFINED if a
+                    // later input provides a definition for what was
+                    // previously seen as an import; otherwise keep
+                    // the existing slot.
+                    let existing = symbol_entries[existing_idx as usize].clone();
+                    let existing_undef = (existing.flags & 0x10) != 0;
+                    let new_undef = (new_flags & 0x10) != 0;
+
+                    let sig_mismatch = sym.kind == 0 && new_sig_for_mismatch.is_some() && {
+                        // Look up the existing slot's sig: import →
+                        // import's type idx; def → functions[..].0.
+                        let existing_func_idx = existing.index;
+                        let total_func_imports = imports
+                            .iter()
+                            .filter(|(_, _, k, _, _)| *k == 0)
+                            .count() as u32;
+                        let existing_sig = if existing_func_idx < total_func_imports {
+                            // Find the kind=0 import at this position.
+                            let mut k0 = 0u32;
+                            let mut t = None;
+                            for (_, _, k, ti, _) in &imports {
+                                if *k == 0 {
+                                    if k0 == existing_func_idx {
+                                        t = Some(*ti);
+                                        break;
+                                    }
+                                    k0 += 1;
+                                }
+                            }
+                            t
+                        } else {
+                            functions
+                                .get((existing_func_idx - total_func_imports) as usize)
+                                .map(|(t, _)| *t)
+                        };
+                        existing_sig != new_sig_for_mismatch
+                    };
+
+                    if sig_mismatch {
+                        // Synthesize a trap stub with the existing
+                        // slot's sig — body `unreachable; end` — so
+                        // earlier-file relocs that still expect the
+                        // old sig retain a typecheckable target.
+                        let existing_func_idx = existing.index;
+                        let total_func_imports = imports
+                            .iter()
+                            .filter(|(_, _, k, _, _)| *k == 0)
+                            .count() as u32;
+                        let stub_sig = if existing_func_idx < total_func_imports {
+                            let mut k0 = 0u32;
+                            let mut t = 0u32;
+                            for (_, _, k, ti, _) in &imports {
+                                if *k == 0 {
+                                    if k0 == existing_func_idx {
+                                        t = *ti;
+                                        break;
+                                    }
+                                    k0 += 1;
+                                }
+                            }
+                            t
+                        } else {
+                            functions
+                                .get((existing_func_idx - total_func_imports) as usize)
+                                .map(|(t, _)| *t)
+                                .unwrap_or(0)
+                        };
+                        // locals_count(0) + unreachable + end. Emitter prefixes the
+        // body with its size LEB but doesn't add the locals_count.
+        let stub_body: Vec<u8> = vec![0x00, 0x00, 0x0B];
+                        let stub_frame =
+                            leb128_len(stub_body.len() as u32) as u32 + stub_body.len() as u32;
+                        let stub_func_idx = total_func_imports + functions.len() as u32;
+                        functions.push((stub_sig, stub_body));
+                        output_code_pos += stub_frame;
+
+                        // Add the renamed symbol slot — but defer
+                        // its insertion to the end of the merged
+                        // symbol table so it doesn't perturb the
+                        // natural ordering of the in-input symbols.
+                        // We still pre-compute the eventual index so
+                        // relocs that fire mid-walk can reference it.
+                        let mismatch_name = {
+                            let mut s = b"signature_mismatch:".to_vec();
+                            s.extend_from_slice(&name);
+                            s
+                        };
+                        let stub_slot_idx =
+                            symbol_entries.len() as u32 + pending_sig_mismatch.len() as u32;
+                        pending_sig_mismatch.push((mismatch_name, 0x02, stub_func_idx));
+                        for r in output_code_relocs.iter_mut() {
+                            if r.symbol_index == existing_idx {
+                                r.symbol_index = stub_slot_idx;
+                            }
+                        }
+                        for r in output_data_relocs.iter_mut() {
+                            if r.symbol_index == existing_idx {
+                                r.symbol_index = stub_slot_idx;
+                            }
+                        }
+
+                        // Upgrade existing slot to point at the new
+                        // DEF (file 2's foo). The existing entry
+                        // takes the canonical "foo" identity.
+                        if existing_undef && !new_undef {
+                            symbol_entries[existing_idx as usize] = SymEntry {
+                                kind: sym.kind,
+                                name: name.clone(),
+                                flags: new_flags,
+                                index: new_index,
+                                segment: new_seg_value,
+                                segment_offset: new_seg_offset,
+                                segment_size: new_seg_size,
+                            };
+                        }
+                        // Redirect this file's local symbol at the
+                        // canonical (upgraded) slot — its relocs
+                        // point at file 2's def, which has the
+                        // matching sig.
+                        local_sym_to_output_sym_idx.push(Some(existing_idx));
+                    } else {
+                        if existing_undef && !new_undef {
+                            symbol_entries[existing_idx as usize] = SymEntry {
+                                kind: sym.kind,
+                                name: name.clone(),
+                                flags: new_flags,
+                                index: new_index,
+                                segment: new_seg_value,
+                                segment_offset: new_seg_offset,
+                                segment_size: new_seg_size,
+                            };
+                        }
+                        local_sym_to_output_sym_idx.push(Some(existing_idx));
+                    }
+                } else {
+                    let new_idx = symbol_entries.len() as u32;
+                    if !name.is_empty() && !is_local {
+                        name_to_output_sym_idx.insert(name.clone(), new_idx);
+                    }
+                    local_sym_to_output_sym_idx.push(Some(new_idx));
+                    symbol_entries.push(SymEntry {
+                        kind: sym.kind,
+                        name,
+                        flags: new_flags,
+                        index: new_index,
+                        segment: new_seg_value,
+                        segment_offset: new_seg_offset,
+                        segment_size: new_seg_size,
+                    });
+                }
                 let _ = new_seg; // TODO: use for data symbol relocation
             }
 
-            // Collect data segments.
-            for seg in &parsed.data_segments {
-                data_segments.push((seg.data.clone(), seg.alignment));
-                segment_names.push(seg.name.clone());
+            // Remap data relocs: locate each reloc's input segment by
+            // offset, drop it if the segment was dropped, otherwise
+            // shift the offset by `(output_payload_start -
+            // input_payload_start)` so it lands at the same byte in
+            // the merged DATA section. The reloc's symbol_index also
+            // gets remapped through `local_sym_to_output_sym_idx`;
+            // relocs referencing a dropped symbol are dropped.
+            for reloc in &parsed.data_relocations {
+                let Some(out_sym_local) = local_sym_to_output_sym_idx
+                    .get(reloc.symbol_index as usize)
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let mut found: Option<usize> = None;
+                for i in 0..parsed.data_segments.len() {
+                    if reloc.offset >= input_seg_payload_starts[i]
+                        && reloc.offset < input_seg_payload_ends[i]
+                    {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                let Some(i) = found else { continue };
+                let Some(out_start) = output_seg_payload_starts[i] else {
+                    continue;
+                };
+                let new_offset = out_start + (reloc.offset - input_seg_payload_starts[i]);
+                // Partial reloc application on data bytes. The
+                // segment payload starts at the beginning of the
+                // cloned `data_segments[..].0` Vec, so the byte
+                // offset within the data is `reloc.offset -
+                // input_seg_payload_starts[i]`.
+                if let Some(out_seg_idx) = local_seg_to_data_seg_idx[i]
+                    && let Some(sym_addr) =
+                        local_sym_addr.get(reloc.symbol_index as usize).copied().flatten()
+                    && !reloc_is_table_index(reloc.reloc_type)
+                {
+                    // For TLS-merged segments the input seg's bytes
+                    // sit at `local_seg_data_offset[i]` inside the
+                    // merged buffer, so add that shift to the
+                    // input-relative offset.
+                    let off_in_data = (reloc.offset - input_seg_payload_starts[i]
+                        + local_seg_data_offset[i]) as usize;
+                    patch_reloc_immediate(
+                        &mut data_segments[out_seg_idx].0,
+                        off_in_data,
+                        reloc.reloc_type,
+                        sym_addr,
+                        reloc.addend,
+                    );
+                }
+                output_data_relocs.push(WasmReloc {
+                    reloc_type: reloc.reloc_type,
+                    offset: new_offset,
+                    symbol_index: out_sym_local,
+                    addend: reloc.addend,
+                });
             }
 
-            // Collect code relocations.
+            // Remap code relocs: locate each reloc's body, then shift
+            // by `(output_body_start - input_body_start)`. A reloc
+            // inside a COMDAT-skipped body is dropped (its surviving
+            // twin lives elsewhere). A reloc whose target symbol is
+            // dropped is also dropped — no surviving slot to point
+            // at; cross-file COMDAT redirect is the next-phase work.
+            //
+            // R_WASM_TYPE_INDEX_LEB (kind 6) is special: its `index`
+            // field is a TYPE-section index (not a symbol-table
+            // index). Remap through `type_map` so the output reloc
+            // points at the merged output's type slot.
+            for reloc in &parsed.code_relocations {
+                let out_sym_local = if reloc.reloc_type == 6 {
+                    type_map
+                        .get(reloc.symbol_index as usize)
+                        .copied()
+                } else {
+                    local_sym_to_output_sym_idx
+                        .get(reloc.symbol_index as usize)
+                        .copied()
+                        .flatten()
+                };
+                let Some(out_sym_local) = out_sym_local else {
+                    continue;
+                };
+                let mut found: Option<usize> = None;
+                for i in 0..parsed.functions.len() {
+                    if reloc.offset >= input_body_starts[i]
+                        && reloc.offset < input_body_ends[i]
+                    {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                let Some(i) = found else { continue };
+                let Some(out_start) = output_body_starts[i] else {
+                    continue;
+                };
+                let new_offset = out_start + (reloc.offset - input_body_starts[i]);
+                // Partial reloc application — overwrite the LEB-
+                // encoded immediate in the cloned body with the
+                // resolved value. Skipped silently if the symbol
+                // address isn't computable (undefined / unsupported
+                // kind); the body keeps its input bytes and the
+                // reloc carries the addend through to the next link.
+                //
+                // Kind 6 (R_WASM_TYPE_INDEX_LEB) needs different
+                // patching: its `symbol_index` is an input-local
+                // type idx, not a symbol-table idx. Indexing
+                // `local_sym_addr` with it returns garbage. The
+                // merged type idx (already computed as
+                // `out_sym_local`) is what should be written.
+                if reloc.reloc_type == 6 {
+                    if let Some(out_func_idx) = local_func_to_functions_idx[i] {
+                        let body_data_start = input_body_starts[i]
+                            + leb128_len(parsed.functions[i].body.len() as u32) as u32;
+                        let off_in_body = (reloc.offset - body_data_start) as usize;
+                        write_padded_leb128(
+                            &mut functions[out_func_idx].1,
+                            off_in_body,
+                            out_sym_local,
+                        );
+                    }
+                } else if let Some(out_func_idx) = local_func_to_functions_idx[i]
+                    && let Some(sym_addr) =
+                        local_sym_addr.get(reloc.symbol_index as usize).copied().flatten()
+                    && !reloc_is_table_index(reloc.reloc_type)
+                {
+                    let body_data_start = input_body_starts[i]
+                        + leb128_len(parsed.functions[i].body.len() as u32) as u32;
+                    let off_in_body = (reloc.offset - body_data_start) as usize;
+                    patch_reloc_immediate(
+                        &mut functions[out_func_idx].1,
+                        off_in_body,
+                        reloc.reloc_type,
+                        sym_addr,
+                        reloc.addend,
+                    );
+                }
+                output_code_relocs.push(WasmReloc {
+                    reloc_type: reloc.reloc_type,
+                    offset: new_offset,
+                    symbol_index: out_sym_local,
+                    addend: reloc.addend,
+                });
+            }
+            per_file_remap.push((0, prior_symbol_count));
+            // Old flat collection kept for any non-relocatable
+            // downstream consumers — but it's no longer the source of
+            // truth for `reloc.CODE` emission.
             for reloc in &parsed.code_relocations {
                 code_relocs.push(reloc.clone());
             }
@@ -1040,8 +2424,866 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 }
             }
 
-            total_functions += parsed.functions.len() as u32;
+            // Advance by KEPT function count so the next file's
+            // `func_base` lines up with the merged output's def
+            // index space (skipped COMDAT bodies don't take slots).
+            total_functions += kept_in_this_file;
             total_data_segments += parsed.data_segments.len() as u32;
+        }
+    }
+
+    // Build the function-index → table-slot lookup from the merged
+    // ELEM segments. `R_WASM_TABLE_INDEX_*` relocs encode this
+    // table-slot value rather than the function-index — they need
+    // post-walk patching once the merged element segment list is
+    // final.
+    let mut func_to_table_slot: std::collections::HashMap<u32, u32> = Default::default();
+    for (offset, indices) in &output_element_segments {
+        for (slot_offset, &fi) in indices.iter().enumerate() {
+            func_to_table_slot
+                .entry(fi)
+                .or_insert(*offset + slot_offset as u32);
+        }
+    }
+
+    // Data-segment classification sort. wasm-ld groups `.rodata.*`
+    // before `.data.*` and within each group preserves input order;
+    // wild walks segments in input file order. Apply the permutation
+    // post-walk and recompute every byproduct: data-segment offsets,
+    // symbol-table data-symbol `.segment` fields, output_data_relocs
+    // offsets, and the patched immediates in body / data bytes for
+    // any reloc whose target data symbol moved.
+    if data_segments.len() > 1 {
+        fn seg_priority(name: &[u8]) -> u8 {
+            if name.starts_with(b".rodata") {
+                0
+            } else if name.starts_with(b".data") {
+                1
+            } else {
+                2
+            }
+        }
+        let n = data_segments.len();
+        let count_leb_size = leb128_len(n as u32) as u32;
+        // Capture pre-sort payload positions in the DATA section
+        // contents so reloc offsets can be split into
+        // (segment, within-segment) coordinates.
+        let mut old_payload_starts: Vec<u32> = Vec::with_capacity(n);
+        {
+            let mut pos = count_leb_size;
+            for i in 0..n {
+                let payload_len = data_segments[i].0.len() as u32;
+                let sleb_size = sleb128_len(data_segment_offsets[i] as i32) as u32;
+                let size_leb_size = leb128_len(payload_len) as u32;
+                old_payload_starts.push(pos + 1 + 1 + sleb_size + 1 + size_leb_size);
+                pos += 1 + 1 + sleb_size + 1 + size_leb_size + payload_len;
+            }
+        }
+        let mut perm: Vec<usize> = (0..n).collect();
+        perm.sort_by_key(|&i| (seg_priority(&segment_names[i]), i));
+        if perm.iter().enumerate().any(|(new_idx, &old_idx)| new_idx != old_idx) {
+            // Apply permutation to segments and names.
+            let new_segments: Vec<_> = perm.iter().map(|&i| data_segments[i].clone()).collect();
+            let new_names: Vec<_> = perm.iter().map(|&i| segment_names[i].clone()).collect();
+            // Recompute memory offsets cumulative-aligned in new
+            // order.
+            let mut new_offsets: Vec<u32> = Vec::with_capacity(n);
+            let mut running: u32 = 0;
+            for (data, alignment) in &new_segments {
+                let align = (*alignment).max(1);
+                let off = (running + align - 1) & !(align - 1);
+                new_offsets.push(off);
+                running = off + data.len() as u32;
+            }
+            running_mem_offset = running;
+            // Compute new section-content payload positions.
+            let mut new_payload_starts: Vec<u32> = Vec::with_capacity(n);
+            {
+                let mut pos = count_leb_size;
+                for i in 0..n {
+                    let payload_len = new_segments[i].0.len() as u32;
+                    let sleb_size = sleb128_len(new_offsets[i] as i32) as u32;
+                    let size_leb_size = leb128_len(payload_len) as u32;
+                    new_payload_starts.push(pos + 1 + 1 + sleb_size + 1 + size_leb_size);
+                    pos += 1 + 1 + sleb_size + 1 + size_leb_size + payload_len;
+                }
+            }
+            // Build old-segment-idx → new-segment-idx map.
+            let mut old_to_new_seg: Vec<u32> = vec![0; n];
+            for (new_idx, &old_idx) in perm.iter().enumerate() {
+                old_to_new_seg[old_idx] = new_idx as u32;
+            }
+            // Remap data-symbol .segment fields.
+            for e in symbol_entries.iter_mut() {
+                if e.kind == 1
+                    && (e.flags & 0x10) == 0
+                    && (e.segment as usize) < old_to_new_seg.len()
+                {
+                    e.segment = old_to_new_seg[e.segment as usize];
+                }
+            }
+            // Remap COMDAT data-entry indices (kind=0 = data
+            // segment) through the same permutation so the linking
+            // section's COMDAT subsection points at the segment's
+            // post-sort position.
+            for g in output_comdat_groups.iter_mut() {
+                for entry in g.entries.iter_mut() {
+                    if entry.0 == 0 && (entry.1 as usize) < old_to_new_seg.len() {
+                        entry.1 = old_to_new_seg[entry.1 as usize];
+                    }
+                }
+            }
+            // Remap reloc.DATA offsets: each reloc lived inside a
+            // specific old segment; relocate it to the same byte
+            // inside the new segment's new payload position.
+            for r in output_data_relocs.iter_mut() {
+                for old_seg in 0..n {
+                    let old_start = old_payload_starts[old_seg];
+                    let old_end = old_start + data_segments[old_seg].0.len() as u32;
+                    if r.offset >= old_start && r.offset < old_end {
+                        let within = r.offset - old_start;
+                        let new_seg = old_to_new_seg[old_seg] as usize;
+                        r.offset = new_payload_starts[new_seg] + within;
+                        break;
+                    }
+                }
+            }
+            // Commit the new layout.
+            data_segments = new_segments;
+            segment_names = new_names;
+            data_segment_offsets = new_offsets;
+            // Re-patch code body bytes for relocs targeting moved
+            // data symbols. Walk functions to map reloc.offset back
+            // to (body_idx, within-body) so `patch_reloc_immediate`
+            // can rewrite the LEB-encoded immediate.
+            let code_count_leb = leb128_len(functions.len() as u32) as u32;
+            let mut body_starts: Vec<u32> = Vec::with_capacity(functions.len());
+            {
+                let mut pos = code_count_leb;
+                for (_, body) in &functions {
+                    let size_leb_size = leb128_len(body.len() as u32) as u32;
+                    body_starts.push(pos + size_leb_size);
+                    pos += size_leb_size + body.len() as u32;
+                }
+            }
+            let code_relocs_snapshot: Vec<WasmReloc> = output_code_relocs.clone();
+            for r in &code_relocs_snapshot {
+                let Some(entry) = symbol_entries.get(r.symbol_index as usize) else {
+                    continue;
+                };
+                if entry.kind != 1 || (entry.flags & 0x10) != 0 {
+                    continue;
+                }
+                let new_sym_addr =
+                    data_segment_offsets[entry.segment as usize] + entry.segment_offset;
+                let mut body_idx = None;
+                for i in 0..functions.len() {
+                    let start = body_starts[i];
+                    let end = start + functions[i].1.len() as u32;
+                    if r.offset >= start && r.offset < end {
+                        body_idx = Some(i);
+                        break;
+                    }
+                }
+                let Some(b) = body_idx else { continue };
+                let in_body = (r.offset - body_starts[b]) as usize;
+                patch_reloc_immediate(
+                    &mut functions[b].1,
+                    in_body,
+                    r.reloc_type,
+                    new_sym_addr,
+                    r.addend,
+                );
+            }
+            // Same re-patch for data-section bytes — relocs in DATA
+            // (e.g. `data_addr1` pointing at a moved data symbol).
+            let data_relocs_snapshot: Vec<WasmReloc> = output_data_relocs.clone();
+            for r in &data_relocs_snapshot {
+                let Some(entry) = symbol_entries.get(r.symbol_index as usize) else {
+                    continue;
+                };
+                if entry.kind != 1 || (entry.flags & 0x10) != 0 {
+                    continue;
+                }
+                let new_sym_addr =
+                    data_segment_offsets[entry.segment as usize] + entry.segment_offset;
+                let mut seg_idx = None;
+                for i in 0..data_segments.len() {
+                    let start = new_payload_starts[i];
+                    let end = start + data_segments[i].0.len() as u32;
+                    if r.offset >= start && r.offset < end {
+                        seg_idx = Some(i);
+                        break;
+                    }
+                }
+                let Some(s) = seg_idx else { continue };
+                let in_data = (r.offset - new_payload_starts[s]) as usize;
+                patch_reloc_immediate(
+                    &mut data_segments[s].0,
+                    in_data,
+                    r.reloc_type,
+                    new_sym_addr,
+                    r.addend,
+                );
+            }
+        }
+    }
+
+    // Post-walk patch pass for TABLE_INDEX_* relocs. Each one's
+    // immediate encodes the function's *table* slot, which only
+    // becomes known once the merged ELEM segments are finalised.
+    // Also re-runs for relocs whose target data symbol moved due to
+    // segment-classification reorder above.
+    {
+        // Recompute body & segment positions in the post-sort
+        // layout so we can locate each reloc back to its container.
+        let code_count_leb = leb128_len(functions.len() as u32) as u32;
+        let mut body_starts: Vec<u32> = Vec::with_capacity(functions.len());
+        {
+            let mut pos = code_count_leb;
+            for (_, body) in &functions {
+                let size_leb_size = leb128_len(body.len() as u32) as u32;
+                body_starts.push(pos + size_leb_size);
+                pos += size_leb_size + body.len() as u32;
+            }
+        }
+        let data_count_leb = leb128_len(data_segments.len() as u32) as u32;
+        let mut seg_starts: Vec<u32> = Vec::with_capacity(data_segments.len());
+        {
+            let mut pos = data_count_leb;
+            for i in 0..data_segments.len() {
+                let payload_len = data_segments[i].0.len() as u32;
+                let sleb_size = sleb128_len(data_segment_offsets[i] as i32) as u32;
+                let size_leb_size = leb128_len(payload_len) as u32;
+                seg_starts.push(pos + 1 + 1 + sleb_size + 1 + size_leb_size);
+                pos += 1 + 1 + sleb_size + 1 + size_leb_size + payload_len;
+            }
+        }
+        let resolve_sym_addr = |entry: &SymEntry, reloc_type: u8| -> Option<u32> {
+            match entry.kind {
+                0 => {
+                    if reloc_is_table_index(reloc_type) {
+                        func_to_table_slot.get(&entry.index).copied()
+                    } else {
+                        Some(entry.index)
+                    }
+                }
+                1 => {
+                    if (entry.flags & 0x10) == 0
+                        && (entry.segment as usize) < data_segment_offsets.len()
+                    {
+                        Some(data_segment_offsets[entry.segment as usize] + entry.segment_offset)
+                    } else {
+                        None
+                    }
+                }
+                2 => Some(entry.index),
+                _ => None,
+            }
+        };
+        let code_relocs_snapshot: Vec<WasmReloc> = output_code_relocs.clone();
+        for r in &code_relocs_snapshot {
+            if !reloc_is_table_index(r.reloc_type) {
+                continue;
+            }
+            let Some(entry) = symbol_entries.get(r.symbol_index as usize) else {
+                continue;
+            };
+            let Some(sym_addr) = resolve_sym_addr(entry, r.reloc_type) else {
+                continue;
+            };
+            let mut body_idx = None;
+            for i in 0..functions.len() {
+                let start = body_starts[i];
+                let end = start + functions[i].1.len() as u32;
+                if r.offset >= start && r.offset < end {
+                    body_idx = Some(i);
+                    break;
+                }
+            }
+            let Some(b) = body_idx else { continue };
+            let in_body = (r.offset - body_starts[b]) as usize;
+            patch_reloc_immediate(
+                &mut functions[b].1,
+                in_body,
+                r.reloc_type,
+                sym_addr,
+                r.addend,
+            );
+        }
+        let data_relocs_snapshot: Vec<WasmReloc> = output_data_relocs.clone();
+        for r in &data_relocs_snapshot {
+            if !reloc_is_table_index(r.reloc_type) {
+                continue;
+            }
+            let Some(entry) = symbol_entries.get(r.symbol_index as usize) else {
+                continue;
+            };
+            let Some(sym_addr) = resolve_sym_addr(entry, r.reloc_type) else {
+                continue;
+            };
+            let mut seg_idx = None;
+            for i in 0..data_segments.len() {
+                let start = seg_starts[i];
+                let end = start + data_segments[i].0.len() as u32;
+                if r.offset >= start && r.offset < end {
+                    seg_idx = Some(i);
+                    break;
+                }
+            }
+            let Some(s) = seg_idx else { continue };
+            let in_data = (r.offset - seg_starts[s]) as usize;
+            patch_reloc_immediate(
+                &mut data_segments[s].0,
+                in_data,
+                r.reloc_type,
+                sym_addr,
+                r.addend,
+            );
+        }
+    }
+
+    // wasm-ld emits TABLE imports before FUNCTION imports — needed
+    // because the function-index space is built from imports in
+    // order, but TABLE imports don't take function-index slots,
+    // so reordering doesn't shift anything. Stable sort with the
+    // kind-priority [1=table, 0=function, 3=global, 4=tag]; other
+    // (e.g. memory which we elide) remain at the back.
+    {
+        fn kind_priority(k: u8) -> u8 {
+            match k {
+                1 => 0, // tables first
+                0 => 1, // functions
+                3 => 2, // globals
+                4 => 3, // tags
+                _ => 9,
+            }
+        }
+        imports.sort_by_key(|(_, _, k, _, _)| kind_priority(*k));
+    }
+
+    // Rebuild the TYPE section to match lld's first-registration
+    // order (lld/wasm/Relocations.cpp::scanRelocations +
+    // Writer.cpp::calculateTypes, Apache-2.0 with LLVM Exceptions):
+    // 1. Walk all inputs' code_relocations in link-line order;
+    //    register the type referenced by each `R_WASM_TYPE_INDEX_LEB`
+    //    (kind 6) — the dominant phase when `call_indirect` is in
+    //    play. Without this pass `weak-alias.s -r` puts `() → ()`
+    //    at type 0 (input dedup order) but lld puts `() → I32`
+    //    there because the call_indirect target gets registered first.
+    // 2. Imported function signatures, in `imports` order.
+    // 3. Defined function signatures, in `functions` order.
+    {
+        let mut seen: std::collections::HashSet<u32> = Default::default();
+        let mut new_order: Vec<u32> = Vec::new();
+        // Phase 1: scanRelocations TYPE_INDEX_LEB walk. Translate each
+        // input-local type idx → merged idx via signature lookup
+        // (per-input type_map isn't preserved post-walk, but `types`
+        // is the merged target so we look up by (params, results)).
+        let sig_to_merged_idx: std::collections::HashMap<(Vec<u8>, Vec<u8>), u32> = types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.params.clone(), t.results.clone()), i as u32))
+            .collect();
+        for group in &layout.group_layouts {
+            for file in &group.files {
+                let FileLayout::Object(obj) = file else {
+                    continue;
+                };
+                let data = obj.object.data;
+                if data.len() < 8 || &data[..4] != b"\0asm" {
+                    continue;
+                }
+                let Ok(parsed) = parse_wasm_sections(data) else {
+                    continue;
+                };
+                for r in &parsed.code_relocations {
+                    if r.reloc_type != 6 {
+                        continue;
+                    }
+                    if let Some(local_ty) = parsed.types.get(r.symbol_index as usize)
+                        && let Some(&merged_idx) = sig_to_merged_idx
+                            .get(&(local_ty.params.clone(), local_ty.results.clone()))
+                        && seen.insert(merged_idx)
+                    {
+                        new_order.push(merged_idx);
+                    }
+                }
+            }
+        }
+        // Phase 2: imported function signatures.
+        for (_, _, kind, type_idx, _) in &imports {
+            if *kind == 0 && seen.insert(*type_idx) {
+                new_order.push(*type_idx);
+            }
+        }
+        // Phase 3: defined function signatures.
+        for (type_idx, _) in &functions {
+            if seen.insert(*type_idx) {
+                new_order.push(*type_idx);
+            }
+        }
+        // Catch-all (defensive — shouldn't be reachable on
+        // well-formed input but guards against signature-table
+        // desyncs).
+        for i in 0..types.len() {
+            if seen.insert(i as u32) {
+                new_order.push(i as u32);
+            }
+        }
+        if !new_order.is_empty() {
+            let mut old_to_new: std::collections::HashMap<u32, u32> = Default::default();
+            for (new_idx, &old_idx) in new_order.iter().enumerate() {
+                old_to_new.insert(old_idx, new_idx as u32);
+            }
+            let new_types: Vec<FuncType> = new_order
+                .iter()
+                .map(|&i| types[i as usize].clone())
+                .collect();
+            for (_, _, kind, type_idx, _) in imports.iter_mut() {
+                if *kind == 0
+                    && let Some(&n) = old_to_new.get(type_idx)
+                {
+                    *type_idx = n;
+                }
+            }
+            for (type_idx, _) in functions.iter_mut() {
+                if let Some(&n) = old_to_new.get(type_idx) {
+                    *type_idx = n;
+                }
+            }
+            // Remap TYPE_INDEX_LEB relocs whose `symbol_index` field
+            // is actually a type-section index — already populated via
+            // the kind-6 special-case in the per-input walk above.
+            for r in output_code_relocs.iter_mut() {
+                if r.reloc_type == 6
+                    && let Some(&n) = old_to_new.get(&r.symbol_index)
+                {
+                    r.symbol_index = n;
+                }
+            }
+            // Remap call_indirect / return_call_indirect typeidx
+            // operands in every body so the body's encoded LEB
+            // matches the new type-section ordering.
+            for (_, body) in functions.iter_mut() {
+                let mut patches: Vec<(usize, u32)> = Vec::new();
+                let walk = walk_call_indirect_typeidx(body, |off, old| {
+                    if let Some(&new_idx) = old_to_new.get(&old)
+                        && new_idx != old
+                    {
+                        patches.push((off, new_idx));
+                    }
+                });
+                if walk.is_err() {
+                    continue;
+                }
+                for (off, new_idx) in patches {
+                    write_padded_leb128(body, off, new_idx);
+                }
+            }
+            types = new_types;
+        }
+    }
+
+    // Flush deferred sig-mismatch slots at the END of the symbol
+    // table. Their ordering matches `sig_mismatch_stubs`, so the
+    // i-th deferred entry's slot index is `symbol_entries.len() +
+    // i` at flush time. Patch up sentinels we recorded during the
+    // walk so reloc symbol indices land on the right slots.
+    let stub_slot_base = symbol_entries.len() as u32;
+    let resolve_sentinel = |idx: u32| -> u32 {
+        if idx >= STUB_SENTINEL_BASE {
+            stub_slot_base + (idx - STUB_SENTINEL_BASE)
+        } else {
+            idx
+        }
+    };
+    for r in output_code_relocs.iter_mut() {
+        r.symbol_index = resolve_sentinel(r.symbol_index);
+    }
+    for r in output_data_relocs.iter_mut() {
+        r.symbol_index = resolve_sentinel(r.symbol_index);
+    }
+    for (mismatch_name, flags, stub_func_idx) in pending_sig_mismatch.drain(..) {
+        symbol_entries.push(SymEntry {
+            kind: 0,
+            name: mismatch_name,
+            flags,
+            index: stub_func_idx,
+            segment: 0,
+            segment_offset: 0,
+            segment_size: 0,
+        });
+    }
+
+    // Resolve internalised TLS GOT sentinels in symbol_entries.
+    // The sym walk above stored `u32::MAX - 1024 + got_offset` for
+    // kind=2 syms whose import got internalised; now that the import
+    // walk has finalised the global namespace we can patch each to
+    // its real defined-global wasm idx (= num_imported_globals +
+    // got_offset).
+    if !got_tls_internalised.is_empty() {
+        const GOT_TLS_SENTINEL_BASE: u32 = u32::MAX - 1024;
+        let num_imported_globals_final =
+            imports.iter().filter(|(_, _, k, _, _)| *k == 3).count() as u32;
+        for e in symbol_entries.iter_mut() {
+            if e.kind == 2 && e.index >= GOT_TLS_SENTINEL_BASE {
+                let got_offset = e.index - GOT_TLS_SENTINEL_BASE;
+                e.index = num_imported_globals_final + got_offset;
+            }
+        }
+    }
+
+    // Synthesize sym-entry rows for the defined GOT.data.internal.<tls>
+    // globals. lld's `-r` linking section lists them as DEFINED kind=2
+    // symbols (no UNDEFINED bit) so the next link step sees them as
+    // local definitions. Dedup: only add if no entry with the same
+    // name already exists (e.g. from the renamed UNDEF promotion in
+    // the kind=2 sym walk).
+    if !got_tls_internalised.is_empty() {
+        let num_imported_globals_final =
+            imports.iter().filter(|(_, _, k, _, _)| *k == 3).count() as u32;
+        let mut sorted: Vec<(&Vec<u8>, u32)> = got_tls_internalised
+            .iter()
+            .map(|(k, &v)| (k, v))
+            .collect();
+        sorted.sort_by_key(|(_, v)| *v);
+        for (field, got_offset) in sorted {
+            let mut name = b"GOT.data.internal.".to_vec();
+            name.extend_from_slice(field);
+            if symbol_entries.iter().any(|e| e.kind == 2 && e.name == name) {
+                continue;
+            }
+            symbol_entries.push(SymEntry {
+                kind: 2,
+                name,
+                flags: 0,
+                index: num_imported_globals_final + got_offset,
+                segment: 0,
+                segment_offset: 0,
+                segment_size: 0,
+            });
+        }
+    }
+
+    // Drop function imports that were resolved by a later input's
+    // definition. lld in -r mode contracts the function-index space
+    // when an UNDEF gets a DEF — wild's UNDEF→DEF promotion already
+    // updated symbol_entries.index to the defined function, but the
+    // IMPORT entry stuck around. Without this pass, `weak-alias.s`
+    // emits both an `env.alias_fn` import AND a defined `alias_fn`
+    // (with idx 0 vs idx 2), which doesn't match lld's output.
+    //
+    // Mechanics: collect imports whose `field` matches a DEFINED
+    // kind=0 symbol, build an old→new function-index map (dropped
+    // imports redirect to the resolved DEF's idx), then rewrite
+    // every function-index reference downstream:
+    //   - `imports` vector (filter out resolved kind=0 entries)
+    //   - `symbol_entries[i].index` (when kind=0)
+    //   - `functions[i].body` — call / return_call / ref.func
+    //     operands (via `remap_call_targets`)
+    //   - `output_element_segments` — funcref tables
+    {
+        // OLD function-namespace position (0..num_func_imports_old)
+        // for each function import in `imports` order.
+        let mut imp_func_pos: Vec<usize> = Vec::new();
+        for (i, (_, _, k, _, _)) in imports.iter().enumerate() {
+            if *k == 0 {
+                imp_func_pos.push(i);
+            }
+        }
+        let num_func_imports_old = imp_func_pos.len() as u32;
+
+        // Build "name → resolved DEF idx" from defined kind=0 symbols.
+        let mut def_idx_by_name: std::collections::HashMap<Vec<u8>, u32> =
+            std::collections::HashMap::new();
+        for e in &symbol_entries {
+            if e.kind == 0 && (e.flags & 0x10) == 0 && !e.name.is_empty() {
+                // First wins is fine — multiple aliases can map to the
+                // same function and we just need any defined slot to
+                // redirect to.
+                def_idx_by_name.entry(e.name.clone()).or_insert(e.index);
+            }
+        }
+
+        let mut drop_func_import: Vec<bool> = vec![false; num_func_imports_old as usize];
+        for (k0_idx, &imp_vec_idx) in imp_func_pos.iter().enumerate() {
+            let field = &imports[imp_vec_idx].1;
+            if def_idx_by_name.contains_key(field) {
+                drop_func_import[k0_idx] = true;
+            }
+        }
+
+        if drop_func_import.iter().any(|&b| b) {
+            let total_funcs = num_func_imports_old + functions.len() as u32;
+            let mut remap: Vec<Option<u32>> = vec![None; total_funcs as usize];
+
+            // Surviving imports take low indices.
+            let mut new_func_idx = 0u32;
+            for k0_idx in 0..num_func_imports_old as usize {
+                if !drop_func_import[k0_idx] {
+                    remap[k0_idx] = Some(new_func_idx);
+                    new_func_idx += 1;
+                }
+            }
+            // Defined functions follow.
+            for def_idx in 0..functions.len() as u32 {
+                let old_wasm_idx = num_func_imports_old + def_idx;
+                remap[old_wasm_idx as usize] = Some(new_func_idx);
+                new_func_idx += 1;
+            }
+            // Dropped imports redirect to their resolved DEF's NEW idx.
+            for k0_idx in 0..num_func_imports_old as usize {
+                if drop_func_import[k0_idx] {
+                    let imp_vec_idx = imp_func_pos[k0_idx];
+                    let field = &imports[imp_vec_idx].1;
+                    if let Some(&old_def_idx) = def_idx_by_name.get(field) {
+                        remap[k0_idx] = remap.get(old_def_idx as usize).copied().flatten();
+                    }
+                }
+            }
+
+            // Symbol-table indices (kind=0 only).
+            for e in symbol_entries.iter_mut() {
+                if e.kind == 0
+                    && let Some(Some(new_idx)) = remap.get(e.index as usize)
+                {
+                    e.index = *new_idx;
+                }
+            }
+
+            // Function bodies — call / return_call / ref.func operands.
+            for (_, body) in functions.iter_mut() {
+                remap_call_targets(body, &remap);
+            }
+
+            // ELEM segments — direct funcrefs.
+            for (_, indices) in output_element_segments.iter_mut() {
+                for idx in indices.iter_mut() {
+                    if let Some(Some(new_idx)) = remap.get(*idx as usize) {
+                        *idx = *new_idx;
+                    }
+                }
+            }
+
+            // Filter `imports`: drop function imports flagged for removal.
+            let mut new_imports = Vec::with_capacity(imports.len());
+            let mut k0_iter = 0usize;
+            for imp in imports.iter() {
+                if imp.2 == 0 {
+                    if !drop_func_import[k0_iter] {
+                        new_imports.push(imp.clone());
+                    }
+                    k0_iter += 1;
+                } else {
+                    new_imports.push(imp.clone());
+                }
+            }
+            imports = new_imports;
+        }
+    }
+
+    // Pad call_indirect tableidx LEBs to 5 bytes in every body, and
+    // synthesize R_WASM_TABLE_NUMBER_LEB relocs at the new positions
+    // so the next link can re-resolve the table-index. lld emits these
+    // even though they're absent from the input — they're required by
+    // the spec for any output that has a TABLE import. The TABLE
+    // symbol itself is added to symbol_entries on first encounter
+    // during the body walk to match lld's symbol-table ordering
+    // (lld registers TABLE symbols inline as it walks function bodies
+    // looking for call_indirect uses).
+    //
+    // Side effects:
+    //  - Body lengths grow by 4 bytes per call_indirect, so
+    //    `output_code_relocs` offsets that fall after a padding point
+    //    need to shift, AND the per-body-start cursor through the
+    //    CODE section needs recomputing.
+    //  - All sym refs (in output_code_relocs) at index ≥ the inserted
+    //    TABLE symbol's position shift up by 1.
+    {
+        // Collect old body starts (cumulative offsets within the
+        // emitted CODE section payload, BEFORE padding). Layout:
+        // count_leb | { size_leb | body }*.
+        let mut old_body_starts: Vec<u32> = Vec::with_capacity(functions.len());
+        let mut old_body_data_starts: Vec<u32> = Vec::with_capacity(functions.len());
+        let mut old_body_data_ends: Vec<u32> = Vec::with_capacity(functions.len());
+        {
+            let mut cursor = leb128_len(functions.len() as u32) as u32;
+            for (_, body) in &functions {
+                let size_leb = leb128_len(body.len() as u32) as u32;
+                old_body_starts.push(cursor);
+                let data_start = cursor + size_leb;
+                old_body_data_starts.push(data_start);
+                old_body_data_ends.push(data_start + body.len() as u32);
+                cursor += size_leb + body.len() as u32;
+            }
+        }
+
+        // Find body indices that contain call_indirect (will need
+        // padding + TABLE_NUMBER_LEB synthesis). Also collect
+        // per-body padding-shift maps: each entry is the byte offset
+        // (within data) where 4 bytes were inserted, in increasing
+        // order so consumers can binary-search.
+        let mut per_body_pad_offsets: Vec<Vec<u32>> = vec![Vec::new(); functions.len()];
+        let mut any_call_indirect = false;
+        for (fi, (_, body)) in functions.iter().enumerate() {
+            let mut tableidx_positions: Vec<(usize, usize, u32)> = Vec::new();
+            let walk = walk_call_indirect_tableidx(body, |off, len, val| {
+                if len < 5 {
+                    tableidx_positions.push((off, len, val));
+                }
+            });
+            if walk.is_err() {
+                continue;
+            }
+            for (off, _len, _val) in &tableidx_positions {
+                per_body_pad_offsets[fi].push(*off as u32);
+            }
+            if !tableidx_positions.is_empty() {
+                any_call_indirect = true;
+            }
+        }
+
+        if any_call_indirect {
+            // Insert TABLE symbol for `__indirect_function_table` at
+            // the position lld uses: immediately AFTER the first
+            // function-symbol whose body contains call_indirect.
+            // Find that position.
+            let table_import_field = imports
+                .iter()
+                .find(|i| i.2 == 1)
+                .map(|i| i.1.clone())
+                .unwrap_or_else(|| b"__indirect_function_table".to_vec());
+
+            let already_has_table_sym = symbol_entries
+                .iter()
+                .any(|e| e.kind == 5 && e.name == table_import_field);
+            let table_sym_idx_old: u32 = if already_has_table_sym {
+                symbol_entries
+                    .iter()
+                    .position(|e| e.kind == 5 && e.name == table_import_field)
+                    .unwrap() as u32
+            } else {
+                let mut insert_after: Option<usize> = None;
+                let num_func_imports_now = imports.iter().filter(|i| i.2 == 0).count() as u32;
+                for (i, e) in symbol_entries.iter().enumerate() {
+                    if e.kind != 0 {
+                        continue;
+                    }
+                    let func_idx = e.index;
+                    if func_idx < num_func_imports_now {
+                        continue;
+                    }
+                    let def_idx = (func_idx - num_func_imports_now) as usize;
+                    if !per_body_pad_offsets
+                        .get(def_idx)
+                        .map_or(false, |v| !v.is_empty())
+                    {
+                        continue;
+                    }
+                    insert_after = Some(i);
+                    break;
+                }
+                let insert_pos = insert_after.map(|i| i + 1).unwrap_or(symbol_entries.len());
+                // Shift sym refs in output_code_relocs.
+                for r in output_code_relocs.iter_mut() {
+                    if r.reloc_type != 6 && r.symbol_index >= insert_pos as u32 {
+                        r.symbol_index += 1;
+                    }
+                }
+                for r in output_data_relocs.iter_mut() {
+                    if r.symbol_index >= insert_pos as u32 {
+                        r.symbol_index += 1;
+                    }
+                }
+                symbol_entries.insert(
+                    insert_pos,
+                    SymEntry {
+                        kind: 5, // TABLE
+                        name: table_import_field.clone(),
+                        flags: 0x10 | 0x80, // UNDEFINED | NO_STRIP
+                        index: 0,           // table index 0 (the imported table)
+                        segment: 0,
+                        segment_offset: 0,
+                        segment_size: 0,
+                    },
+                );
+                insert_pos as u32
+            };
+
+            // Pad bodies: walk each function's tableidx positions
+            // right-to-left and splice in 4 zero bytes (with proper
+            // continuation bits) so the field becomes 5 bytes wide.
+            for (_, body) in functions.iter_mut() {
+                let _ = pad_call_indirect_tableidx_in_body(body);
+            }
+
+            // Recompute new body data starts (cursor positions in
+            // the CODE section, post-padding).
+            let mut new_body_starts: Vec<u32> = Vec::with_capacity(functions.len());
+            let mut new_body_data_starts: Vec<u32> = Vec::with_capacity(functions.len());
+            {
+                let mut cursor = leb128_len(functions.len() as u32) as u32;
+                for (_, body) in &functions {
+                    let size_leb = leb128_len(body.len() as u32) as u32;
+                    new_body_starts.push(cursor);
+                    new_body_data_starts.push(cursor + size_leb);
+                    cursor += size_leb + body.len() as u32;
+                }
+            }
+
+            // Shift output_code_relocs offsets to account for body
+            // growth. For each reloc, find which body it lived in (by
+            // OLD body-data range) and compute its new offset =
+            // new_body_data_start + (old_offset_within_body +
+            // padding_shift_for_offsets_before_it).
+            //
+            // padding_shift = 4 * (count of pad-positions in this
+            // body that were strictly < old_offset_within_body).
+            let mut new_relocs: Vec<WasmReloc> = Vec::with_capacity(output_code_relocs.len());
+            for r in output_code_relocs.drain(..) {
+                let mut owning_body: Option<usize> = None;
+                for (i, &start) in old_body_data_starts.iter().enumerate() {
+                    if r.offset >= start && r.offset < old_body_data_ends[i] {
+                        owning_body = Some(i);
+                        break;
+                    }
+                }
+                let Some(bi) = owning_body else {
+                    new_relocs.push(r);
+                    continue;
+                };
+                let old_within = r.offset - old_body_data_starts[bi];
+                let pad_count_before = per_body_pad_offsets[bi]
+                    .iter()
+                    .filter(|&&p| p < old_within)
+                    .count() as u32;
+                let new_offset = new_body_data_starts[bi] + old_within + 4 * pad_count_before;
+                new_relocs.push(WasmReloc {
+                    reloc_type: r.reloc_type,
+                    offset: new_offset,
+                    symbol_index: r.symbol_index,
+                    addend: r.addend,
+                });
+            }
+            // Synthesize TABLE_NUMBER_LEB relocs at each padded
+            // tableidx position (post-pad coordinates).
+            for (fi, pad_positions) in per_body_pad_offsets.iter().enumerate() {
+                for (i, &old_pos) in pad_positions.iter().enumerate() {
+                    let new_pos = new_body_data_starts[fi] + old_pos + 4 * i as u32;
+                    new_relocs.push(WasmReloc {
+                        reloc_type: 20, // R_WASM_TABLE_NUMBER_LEB
+                        offset: new_pos,
+                        symbol_index: table_sym_idx_old,
+                        addend: 0,
+                    });
+                }
+            }
+            // Sort by offset to keep reloc.CODE in canonical order
+            // (matches lld's per-section ordering and what FileCheck
+            // expects).
+            new_relocs.sort_by_key(|r| r.offset);
+            output_code_relocs = new_relocs;
         }
     }
 
@@ -1052,6 +3294,13 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     let mut out = Cursor::new(&mut sized_output.out[..]);
     out.extend_from_slice(b"\0asm");
     out.extend_from_slice(&1u32.to_le_bytes());
+
+    // Track the index of each emitted section in the output module so
+    // `reloc.CODE` can name CODE by its section index. Per spec, the
+    // index counts every section (standard + custom) in emit order.
+    let mut next_section_index: u32 = 0;
+    let mut code_section_index: Option<u32> = None;
+    let mut data_section_index: Option<u32> = None;
 
     // Type section.
     if !types.is_empty() {
@@ -1065,27 +3314,73 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             payload.extend_from_slice(&ty.results);
         }
         write_section(&mut out, SECTION_TYPE, &payload);
+        next_section_index += 1;
     }
 
     // Import section.
     if !imports.is_empty() {
         let mut payload = Vec::new();
         write_leb128(&mut payload, imports.len() as u32);
-        for (module, field, kind, type_idx) in &imports {
+        for (module, field, kind, type_idx, kind_tail) in &imports {
             write_name(&mut payload, module);
             write_name(&mut payload, field);
             payload.push(*kind);
             match kind {
-                0 => write_leb128(&mut payload, *type_idx), // function
+                0 => write_leb128(&mut payload, *type_idx), // function: type_idx LEB
                 3 => {
                     // global: type_index encodes valtype<<1|mutable
                     payload.push((*type_idx >> 1) as u8);
                     payload.push((*type_idx & 1) as u8);
                 }
+                1 => {
+                    // table import: rewrite the kind_tail with min
+                    // widened to the actual reach of every active
+                    // ELEM segment across inputs (zero of the input
+                    // declared a smaller min that doesn't fit). Tail
+                    // shape: elem_type(1) + flags_LEB + min_LEB
+                    // [+ max_LEB if flags & 1].
+                    if kind_tail.is_empty() {
+                        payload.extend_from_slice(kind_tail);
+                    } else {
+                        let elem_type = kind_tail[0];
+                        let mut o = 1usize;
+                        let (flags, c) = read_leb128(&kind_tail[o..]).unwrap_or((0, 0));
+                        o += c;
+                        let (in_min, c) = read_leb128(&kind_tail[o..]).unwrap_or((0, 0));
+                        o += c;
+                        let max_opt = if (flags & 1) != 0 {
+                            let (m, c) = read_leb128(&kind_tail[o..]).unwrap_or((0, 0));
+                            o += c;
+                            Some(m as u32)
+                        } else {
+                            None
+                        };
+                        let _ = o;
+                        let new_min = (in_min as u32).max(max_table_reach);
+                        payload.push(elem_type);
+                        write_leb128(&mut payload, flags as u32);
+                        write_leb128(&mut payload, new_min);
+                        if let Some(m) = max_opt {
+                            write_leb128(&mut payload, m.max(new_min));
+                        }
+                    }
+                }
+                2 => {
+                    // memory: pass through verbatim (we only get here
+                    // if elision was bypassed; `kind == 2` is normally
+                    // skipped during import collection).
+                    payload.extend_from_slice(kind_tail);
+                }
+                4 => {
+                    // tag: attribute byte (always 0) + type idx LEB.
+                    payload.push(0);
+                    write_leb128(&mut payload, *type_idx);
+                }
                 _ => write_leb128(&mut payload, *type_idx),
             }
         }
         write_section(&mut out, 2, &payload);
+        next_section_index += 1;
     }
 
     // Function section.
@@ -1096,20 +3391,74 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             write_leb128(&mut payload, *type_idx);
         }
         write_section(&mut out, SECTION_FUNCTION, &payload);
+        next_section_index += 1;
     }
 
-    // Memory section (minimal, one memory with min 0).
+    // Memory section. The minimum size is the smallest page count
+    // that holds all merged data (page = 64 KB). When there's no
+    // data the minimum stays 0; otherwise we round up to the next
+    // page boundary so the merged image has somewhere to live.
     {
         let mut payload = Vec::new();
         write_leb128(&mut payload, 1);
         let mem64 = layout.symbol_db.args.memory64;
+        const PAGE_SIZE: u32 = 65536;
+        let pages = if running_mem_offset == 0 {
+            0
+        } else {
+            running_mem_offset.div_ceil(PAGE_SIZE)
+        };
         payload.push(if mem64 { 0x04 } else { 0x00 }); // no max [+ mem64]
         if mem64 {
-            write_leb128_u64(&mut payload, 0);
+            write_leb128_u64(&mut payload, pages as u64);
         } else {
-            write_leb128(&mut payload, 0);
+            write_leb128(&mut payload, pages);
         }
         write_section(&mut out, SECTION_MEMORY, &payload);
+        next_section_index += 1;
+    }
+
+    // Global section (spec §9.5): defined globals only — wild's `-r`
+    // path uses this for internalised GOT.data.internal.<tls> entries
+    // (synthesised in the import walk above when GOT.mem.<tls> /
+    // GOT.data.<tls> imports are dropped). User-defined globals from
+    // input files aren't currently merged through this path; that's a
+    // separate quest.
+    if !defined_globals.is_empty() {
+        let mut payload = Vec::new();
+        write_leb128(&mut payload, defined_globals.len() as u32);
+        for (_name, valtype, mutable, init) in &defined_globals {
+            payload.push(*valtype);
+            payload.push(if *mutable { 0x01 } else { 0x00 });
+            // Init expression: i32.const <init> + end (we only emit
+            // i32 globals here so this is sufficient).
+            payload.push(0x41);
+            write_sleb128(&mut payload, *init as i32);
+            payload.push(0x0B);
+        }
+        write_section(&mut out, SECTION_GLOBAL, &payload);
+        next_section_index += 1;
+    }
+
+    // Element section (spec §9.6): emit one segment per input
+    // segment with active mode 0 (`(offset)` + funcref count + func
+    // indices). Wild collected them with indices already remapped
+    // into the merged output's function-index space.
+    if !output_element_segments.is_empty() {
+        let mut payload = Vec::new();
+        write_leb128(&mut payload, output_element_segments.len() as u32);
+        for (offset, indices) in &output_element_segments {
+            payload.push(0x00); // mode 0: active table 0
+            payload.push(0x41); // i32.const
+            write_sleb128(&mut payload, *offset as i32);
+            payload.push(0x0B); // end
+            write_leb128(&mut payload, indices.len() as u32);
+            for idx in indices {
+                write_leb128(&mut payload, *idx);
+            }
+        }
+        write_section(&mut out, SECTION_ELEMENT, &payload);
+        next_section_index += 1;
     }
 
     // Code section.
@@ -1121,21 +3470,29 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             payload.extend_from_slice(body);
         }
         write_section(&mut out, SECTION_CODE, &payload);
+        code_section_index = Some(next_section_index);
+        next_section_index += 1;
     }
 
     // Data section.
     if !data_segments.is_empty() {
         let mut payload = Vec::new();
         write_leb128(&mut payload, data_segments.len() as u32);
-        for (data, _align) in &data_segments {
+        for (i, (data, _align)) in data_segments.iter().enumerate() {
+            // Each kept segment gets the offset assigned during the
+            // input walk. Falls back to 0 only if the offsets vector
+            // is somehow short (defensive — would indicate a bug).
+            let mem_offset = data_segment_offsets.get(i).copied().unwrap_or(0);
             payload.push(0x00); // active, memory 0
             payload.push(0x41); // i32.const
-            write_sleb128(&mut payload, 0); // offset 0
+            write_sleb128(&mut payload, mem_offset as i32);
             payload.push(0x0B); // end
             write_leb128(&mut payload, data.len() as u32);
             payload.extend_from_slice(data);
         }
         write_section(&mut out, SECTION_DATA, &payload);
+        data_section_index = Some(next_section_index);
+        next_section_index += 1;
     }
 
     // User custom sections (before linking section, but after standard sections).
@@ -1145,69 +3502,56 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             write_name(&mut cp, &cs.name);
             cp.extend_from_slice(&cs.data);
             write_section(&mut out, 0, &cp);
+            next_section_index += 1;
         }
     }
 
-    // Linking section (custom section "linking").
+    // Linking section.
     {
-        let mut link_data = Vec::new();
-        write_leb128(&mut link_data, 2); // version
-
-        // WASM_SYMBOL_TABLE (subsection 8).
-        let mut sym_payload = Vec::new();
-        write_leb128(&mut sym_payload, symbol_entries.len() as u32);
-        for (kind, name, flags, index) in &symbol_entries {
-            sym_payload.push(*kind);
-            write_leb128(&mut sym_payload, *flags);
-            match kind {
-                0 | 2 => {
-                    // FUNCTION / GLOBAL: index + name
-                    write_leb128(&mut sym_payload, *index);
-                    if (flags & 0x10) == 0 || (flags & 0x40) != 0 {
-                        write_name(&mut sym_payload, name);
-                    }
-                }
-                1 => {
-                    // DATA: name + (if defined: segment, offset, size)
-                    write_name(&mut sym_payload, name);
-                    if (flags & 0x10) == 0 {
-                        write_leb128(&mut sym_payload, 0); // segment
-                        write_leb128(&mut sym_payload, 0); // offset
-                        write_leb128(&mut sym_payload, 0); // size
-                    }
-                }
-                _ => {
-                    write_leb128(&mut sym_payload, *index);
-                    if (flags & 0x10) == 0 || (flags & 0x40) != 0 {
-                        write_name(&mut sym_payload, name);
-                    }
-                }
-            }
-        }
-        link_data.push(8); // WASM_SYMBOL_TABLE
-        write_leb128(&mut link_data, sym_payload.len() as u32);
-        link_data.extend_from_slice(&sym_payload);
-
-        // WASM_SEGMENT_INFO (subsection 5).
-        if !segment_names.is_empty() {
-            let mut seg_payload = Vec::new();
-            write_leb128(&mut seg_payload, segment_names.len() as u32);
-            for (i, name) in segment_names.iter().enumerate() {
-                write_name(&mut seg_payload, name);
-                let align = data_segments.get(i).map(|(_, a)| *a).unwrap_or(1);
-                let align_log2 = if align > 1 { align.trailing_zeros() } else { 0 };
-                write_leb128(&mut seg_payload, align_log2);
-                write_leb128(&mut seg_payload, 0); // flags
-            }
-            link_data.push(5);
-            write_leb128(&mut link_data, seg_payload.len() as u32);
-            link_data.extend_from_slice(&seg_payload);
-        }
-
+        let link_data = build_linking_section_payload(
+            &symbol_entries,
+            &segment_names,
+            &data_segments,
+            &output_comdat_groups,
+        );
         let mut custom_payload = Vec::new();
         write_name(&mut custom_payload, b"linking");
         custom_payload.extend_from_slice(&link_data);
         write_section(&mut out, 0, &custom_payload);
+        next_section_index += 1;
+    }
+
+    // `reloc.CODE` and `reloc.DATA` custom sections. Skipped when
+    // there's no target section (no functions / no data) or no
+    // relocations to record.
+    if let Some(code_idx) = code_section_index
+        && !output_code_relocs.is_empty()
+    {
+        let payload = build_reloc_section_payload(code_idx, &output_code_relocs);
+        let mut cp = Vec::new();
+        write_name(&mut cp, b"reloc.CODE");
+        cp.extend_from_slice(&payload);
+        write_section(&mut out, 0, &cp);
+        next_section_index += 1;
+    }
+    if let Some(data_idx) = data_section_index
+        && !output_data_relocs.is_empty()
+    {
+        let payload = build_reloc_section_payload(data_idx, &output_data_relocs);
+        let mut cp = Vec::new();
+        write_name(&mut cp, b"reloc.DATA");
+        cp.extend_from_slice(&payload);
+        write_section(&mut out, 0, &cp);
+        next_section_index += 1;
+    }
+
+    // `name` custom section.
+    if let Some(name_payload) = build_name_section_payload(&symbol_entries, &segment_names) {
+        let mut cp = Vec::new();
+        write_name(&mut cp, b"name");
+        cp.extend_from_slice(&name_payload);
+        write_section(&mut out, 0, &cp);
+        next_section_index += 1;
     }
 
     // target_features (after linking).
@@ -1217,8 +3561,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             write_name(&mut cp, &cs.name);
             cp.extend_from_slice(&cs.data);
             write_section(&mut out, 0, &cp);
+            next_section_index += 1;
         }
     }
+    let _ = (next_section_index, per_file_remap, code_relocs); // tail bookkeeping
 
     // No post-link rewrite for `-r`; the cursor's length IS the
     // final length. Drop the cursor (releases the borrow on
@@ -1299,6 +3645,13 @@ struct MergedModule {
     explicit_export_indices: Vec<u32>,
     /// Function names with VISIBILITY_HIDDEN (flag 0x04) — excluded from --export-dynamic.
     hidden_functions: std::collections::HashSet<Vec<u8>>,
+    /// Function names whose defining symbol carried `WASM_SYM_BINDING_WEAK`
+    /// (flag 0x01). When two names map to the same output function index
+    /// (a weak alias scenario like `alias_fn = direct_fn`), the canonical
+    /// non-weak name wins for purposes that pick a single representative —
+    /// e.g. the `name` custom section's FunctionNames subsection where lld
+    /// emits `direct_fn` (the strong symbol), not `alias_fn`.
+    weak_function_names: std::collections::HashSet<Vec<u8>>,
     /// Functions with WASM_SYM_NO_STRIP flag (spec §4.2, flag 0x80).
     no_strip_indices: Vec<u32>,
     /// Functions with WASM_SYM_EXPORTED flag (spec §4.2, flag 0x20).
@@ -1346,12 +3699,997 @@ struct MergedModule {
     hidden_tags: std::collections::HashSet<Vec<u8>>,
     /// Tag names flagged `WASM_SYM_EXPORTED`.
     exported_tag_names: std::collections::HashSet<Vec<u8>>,
+    /// LLVM-level names of imported globals (parallel to the
+    /// global imports in `imports`, in import-emission order).
+    /// Used by the `name` custom section's GlobalNames subsection
+    /// so e.g. `g1` shows for an import whose field is `g`.
+    import_global_names: Vec<Vec<u8>>,
 }
 
 impl MergedModule {
     fn function_by_name(&self, name: &[u8]) -> Option<u32> {
         self.function_name_map.get(name).copied()
     }
+}
+
+/// Compute the section index of CODE in `write_direct`'s emitted
+/// output. Mirrors the section-emission order for an executable
+/// build: TYPE(1), IMPORT(2)?, FUNCTION(3), TABLE(4)?, MEMORY(5),
+/// GLOBAL(6)?, EXPORT(7)?, START(8)?, ELEMENT(9)?, CODE(10), DATA.
+/// CODE's section-index in the output is the count of standard
+/// sections that precede it. Returns None if there are no functions.
+fn compute_code_section_index_in_output(merged: &MergedModule) -> Option<u32> {
+    if merged.functions.is_empty() {
+        return None;
+    }
+    let mut idx: u32 = 0;
+    // TYPE always present when there are functions.
+    if !merged.types.is_empty() {
+        idx += 1;
+    }
+    // IMPORT
+    if !merged.imports.is_empty() {
+        idx += 1;
+    }
+    // FUNCTION
+    idx += 1;
+    // TABLE — emitted when table_entries non-empty (executable path
+    // synthesises one).
+    if !merged.table_entries.is_empty() {
+        idx += 1;
+    }
+    // MEMORY — always emitted unless --import-memory.
+    idx += 1;
+    // GLOBAL — emitted when defined globals exist.
+    if !merged.globals.is_empty() {
+        idx += 1;
+    }
+    // EXPORT — almost always emitted in exec mode.
+    idx += 1;
+    // ELEMENT — emitted when table entries exist.
+    if !merged.table_entries.is_empty() {
+        idx += 1;
+    }
+    // DATACOUNT — if passive segments.
+    if merged.use_passive_segments {
+        idx += 1;
+    }
+    // CODE
+    Some(idx)
+}
+
+/// DATA section index in `write_direct`'s output, immediately after
+/// CODE when present. None if there are no data segments.
+fn compute_data_section_index_in_output(merged: &MergedModule) -> Option<u32> {
+    if merged.data_segments.is_empty() {
+        return None;
+    }
+    compute_code_section_index_in_output(merged).map(|c| c + 1)
+}
+
+/// Per-custom-section index in `write_direct`'s output, used by
+/// `reloc.<name>` payload preambles. Custom sections are emitted
+/// AFTER all standard sections, in the order: user customs (skipping
+/// `target_features` / `producers`), then `linking` / `reloc.*`,
+/// then `name`, then `target_features` / `producers`. The reloc
+/// preamble references the section by its file-wide section index,
+/// so we count standard sections + position-of-name within the
+/// emitted user-custom prefix. Returns None if the section is not
+/// in `merged.custom_sections` (or is `target_features` /
+/// `producers`, which are emitted in the trailer rather than the
+/// user-custom prefix).
+fn compute_custom_section_index_in_output(merged: &MergedModule, name: &[u8]) -> Option<u32> {
+    if name == b"target_features" || name == b"producers" {
+        return None;
+    }
+    let standard_count = match (
+        compute_code_section_index_in_output(merged),
+        compute_data_section_index_in_output(merged),
+    ) {
+        (Some(_), Some(d)) => d + 1,
+        (Some(c), None) => c + 1,
+        _ => 0,
+    };
+    let mut pos: u32 = 0;
+    for cs in &merged.custom_sections {
+        if cs.name == b"target_features" || cs.name == b"producers" {
+            continue;
+        }
+        if cs.name == name {
+            return Some(standard_count + pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// Reorder `merged.functions` so synthesized linker functions come
+/// first (after imports). Mirrors lld/wasm/Writer.cpp::assignIndexes
+/// (Apache-2.0 with LLVM Exceptions): linker-defined synthetics
+/// reserve the lowest defined-function indices, then user code.
+///
+/// Updates everywhere a defined function index appears in the
+/// merged module — `function_name_map`, `entry_function_index`,
+/// `exported_indices`, `no_strip_indices`, `table_entries` (and its
+/// inverse `func_to_table_index`), `init_memory_func_idx`, and the
+/// `call` / `return_call` / `ref.func` operands inside every body.
+///
+/// Synth order matches lld's: ctors, init-memory, init-tls,
+/// apply-tls-relocs. Bodies' call operands resolve to whatever
+/// the synth functions land at after this pass — without it, the
+/// index encoded by `merge_inputs`'s synth-emit code (e.g.
+/// `__wasm_init_tls`'s `call <apply_idx>`) becomes stale.
+fn reorder_synth_functions_first(merged: &mut MergedModule) {
+    const SYNTH_NAMES: &[&[u8]] = &[
+        b"__wasm_call_ctors",
+        b"__wasm_init_memory",
+        b"__wasm_init_tls",
+        b"__wasm_apply_global_tls_relocs",
+    ];
+    let num_imports = merged.num_imported_functions;
+    let num_funcs = merged.functions.len();
+    if num_funcs == 0 {
+        return;
+    }
+    // Find each synth's current local idx (= wasm_idx - num_imports).
+    let mut synth_local: Vec<usize> = Vec::new();
+    for &sn in SYNTH_NAMES {
+        if let Some(&wasm_idx) = merged.function_name_map.get(sn) {
+            if let Some(local) = (wasm_idx as usize).checked_sub(num_imports as usize) {
+                if local < num_funcs {
+                    synth_local.push(local);
+                }
+            }
+        }
+    }
+    // Skip if synthetics are already at the front in the canonical order.
+    let already_in_order = synth_local
+        .iter()
+        .enumerate()
+        .all(|(i, &local)| local == i);
+    if already_in_order {
+        return;
+    }
+
+    // Build new order: synthetics first (in SYNTH_NAMES sequence),
+    // then everything else in original order.
+    let synth_set: std::collections::HashSet<usize> = synth_local.iter().copied().collect();
+    let mut new_to_old: Vec<usize> = Vec::with_capacity(num_funcs);
+    new_to_old.extend(synth_local.iter().copied());
+    for old in 0..num_funcs {
+        if !synth_set.contains(&old) {
+            new_to_old.push(old);
+        }
+    }
+    debug_assert_eq!(new_to_old.len(), num_funcs);
+
+    // old_local → new_local
+    let mut old_to_new_local: Vec<u32> = vec![0u32; num_funcs];
+    for (new_i, &old) in new_to_old.iter().enumerate() {
+        old_to_new_local[old] = new_i as u32;
+    }
+
+    // Wasm-index remap (imports unchanged, defined remapped).
+    let total = num_imports as usize + num_funcs;
+    let mut wasm_remap: Vec<Option<u32>> = vec![None; total];
+    for i in 0..num_imports {
+        wasm_remap[i as usize] = Some(i);
+    }
+    for old_local in 0..num_funcs {
+        let new_local = old_to_new_local[old_local];
+        wasm_remap[num_imports as usize + old_local] = Some(num_imports + new_local);
+    }
+
+    // Permute `merged.functions`.
+    let mut tmp: Vec<Option<MergedFunction>> = merged.functions.drain(..).map(Some).collect();
+    let mut reordered: Vec<MergedFunction> = Vec::with_capacity(num_funcs);
+    for &old in &new_to_old {
+        reordered.push(tmp[old].take().expect("permutation referenced same idx twice"));
+    }
+    merged.functions = reordered;
+
+    // Patch function_name_map values.
+    for v in merged.function_name_map.values_mut() {
+        if let Some(Some(new_v)) = wasm_remap.get(*v as usize) {
+            *v = *new_v;
+        }
+    }
+    // Patch entry_function_index.
+    if let Some(idx) = merged.entry_function_index {
+        if let Some(Some(new_v)) = wasm_remap.get(idx as usize) {
+            merged.entry_function_index = Some(*new_v);
+        }
+    }
+    // Patch exported_indices and no_strip_indices.
+    for idx in merged.exported_indices.iter_mut() {
+        if let Some(Some(new_v)) = wasm_remap.get(*idx as usize) {
+            *idx = *new_v;
+        }
+    }
+    for idx in merged.no_strip_indices.iter_mut() {
+        if let Some(Some(new_v)) = wasm_remap.get(*idx as usize) {
+            *idx = *new_v;
+        }
+    }
+    // Patch table_entries and rebuild func_to_table_index.
+    for idx in merged.table_entries.iter_mut() {
+        if let Some(Some(new_v)) = wasm_remap.get(*idx as usize) {
+            *idx = *new_v;
+        }
+    }
+    merged.func_to_table_index = merged
+        .table_entries
+        .iter()
+        .enumerate()
+        .map(|(i, &func_idx)| (func_idx, (i + 1) as u32))
+        .collect();
+    // Patch init_memory_func_idx.
+    if let Some(idx) = merged.init_memory_func_idx {
+        if let Some(Some(new_v)) = wasm_remap.get(idx as usize) {
+            merged.init_memory_func_idx = Some(*new_v);
+        }
+    }
+    // Patch every body's call/return_call/ref.func operands.
+    for func in merged.functions.iter_mut() {
+        remap_call_targets(&mut func.body, &wasm_remap);
+    }
+}
+
+/// Rebuild the TYPE section to match lld wasm's first-registration order.
+///
+/// Algorithm derived from lld/wasm/Relocations.cpp::scanRelocations and
+/// lld/wasm/Writer.cpp::calculateTypes (Apache-2.0 with LLVM Exceptions).
+/// lld's TypeSection registers each unique signature on first call and
+/// the registration sequence is:
+///
+/// 1. **`scanRelocations`** runs first, in link-line file order. For
+///    each file it walks function chunks → data segments → custom
+///    sections. Every `R_WASM_TYPE_INDEX_LEB` reloc registers the
+///    referenced signature immediately. This is the dominant phase
+///    when inputs use `call_indirect` (its operand emits a TYPE_INDEX
+///    reloc).
+/// 2. **`calculateTypes`** runs after `assignIndexes`, in three passes:
+///    a. Walk every file's `typeIsUsed` flags (for any TYPE-reloc
+///       types that somehow weren't caught above — usually a no-op).
+///    b. Imported function signatures, in `importedSymbols` insertion
+///       order (= link-line file order × symbol-table order).
+///    c. Defined function signatures — synthetics (e.g.
+///       `__wasm_call_ctors`) first, then per-file × per-function
+///       order.
+///
+/// Because `registerType` is dedup-by-signature first-wins, later
+/// passes are no-ops for sigs already seen.
+///
+/// Wild's `merge_inputs` deduplicates types in input *type-section*
+/// order, which doesn't match lld whenever `call_indirect` is in play
+/// (lld registers the call_indirect target first; wild registers
+/// whatever appears first in the input's TYPE table). For fixtures
+/// like `weak-alias.s` whose CHECK lines pin specific type indices,
+/// reordering to lld's algorithm matches byte-for-byte. We compute
+/// the desired order, build an old→new map, and remap function /
+/// import / call_indirect references in lockstep so bodies stay
+/// internally consistent.
+fn rebuild_types_in_usage_order(layout: &Layout<'_, Wasm>, merged: &mut MergedModule) {
+    if merged.types.is_empty() {
+        return;
+    }
+    let sig_to_merged_idx: std::collections::HashMap<(Vec<u8>, Vec<u8>), u32> = merged
+        .types
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ((t.params.clone(), t.results.clone()), i as u32))
+        .collect();
+
+    let mut seen: std::collections::HashSet<u32> = Default::default();
+    let mut new_order: Vec<u32> = Vec::new();
+
+    // Phase 1 (scanRelocations): walk every input's code-relocation
+    // table in order; for each R_WASM_TYPE_INDEX_LEB (kind=6), look
+    // up the input-local type by index, map to merged signature, and
+    // register it. This is THE phase that distinguishes lld from
+    // input-order dedup — `call_indirect` operands resolve here.
+    //
+    // Within each input the reloc list is already in code-section
+    // offset order (= function-body emission order), which matches
+    // lld's per-chunk walk.
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+            for r in &parsed.code_relocations {
+                if r.reloc_type != 6 {
+                    continue;
+                }
+                if let Some(local_ty) = parsed.types.get(r.symbol_index as usize)
+                    && let Some(&merged_idx) = sig_to_merged_idx
+                        .get(&(local_ty.params.clone(), local_ty.results.clone()))
+                    && seen.insert(merged_idx)
+                {
+                    new_order.push(merged_idx);
+                }
+            }
+        }
+    }
+
+    // Phase 2b (calculateTypes pass B): imported function types in
+    // import order. Use merged.imports — its order mirrors lld's
+    // importedSymbols insertion order after symbol resolution.
+    for imp in &merged.imports {
+        if let ImportKind::Function(type_idx) = imp.kind
+            && seen.insert(type_idx)
+        {
+            new_order.push(type_idx);
+        }
+    }
+
+    // Phase 2c (calculateTypes pass C): defined function types in
+    // function-section order. wild's merged.functions vector mirrors
+    // lld's `functionSec.inputFunctions` — synthetic-first (when
+    // present) followed by per-file × per-function order.
+    for f in &merged.functions {
+        if seen.insert(f.type_index) {
+            new_order.push(f.type_index);
+        }
+    }
+
+    // Defensive: types still unseen (shouldn't happen on well-formed
+    // input — every type is either reached by a TYPE_INDEX reloc, an
+    // import, or a defined function — but guards against
+    // signature-table desyncs in malformed inputs).
+    for i in 0..merged.types.len() {
+        if seen.insert(i as u32) {
+            new_order.push(i as u32);
+        }
+    }
+
+    let already_in_order = new_order
+        .iter()
+        .enumerate()
+        .all(|(i, &old)| i as u32 == old);
+    if already_in_order {
+        return;
+    }
+
+    let mut old_to_new: std::collections::HashMap<u32, u32> = Default::default();
+    for (new_idx, &old_idx) in new_order.iter().enumerate() {
+        old_to_new.insert(old_idx, new_idx as u32);
+    }
+    let new_types: Vec<FuncType> = new_order
+        .iter()
+        .map(|&i| merged.types[i as usize].clone())
+        .collect();
+    for imp in merged.imports.iter_mut() {
+        if let ImportKind::Function(ref mut type_idx) = imp.kind
+            && let Some(&n) = old_to_new.get(type_idx)
+        {
+            *type_idx = n;
+        }
+    }
+    for f in merged.functions.iter_mut() {
+        if let Some(&n) = old_to_new.get(&f.type_index) {
+            f.type_index = n;
+        }
+    }
+    // Patch call_indirect / return_call_indirect typeidx operands.
+    for f in merged.functions.iter_mut() {
+        let mut patches: Vec<(usize, u32)> = Vec::new();
+        let walk = walk_call_indirect_typeidx(&f.body, |off, old| {
+            if let Some(&new_idx) = old_to_new.get(&old)
+                && new_idx != old
+            {
+                patches.push((off, new_idx));
+            }
+        });
+        if walk.is_err() {
+            continue;
+        }
+        for (off, new_idx) in patches {
+            write_padded_leb128(&mut f.body, off, new_idx);
+        }
+    }
+    merged.types = new_types;
+}
+
+/// Re-apply function-related custom-section relocations using
+/// POST-GC values. `merge_inputs` patches `.debug_info` /
+/// `.debug_line` relocs while building `merged.custom_sections`, but
+/// at that point GC hasn't run yet — function indices and body
+/// offsets are about to shift. This pass overwrites the affected
+/// 4-byte slots with the correct post-GC values (or 0xFFFFFFFF when
+/// the target function got dropped).
+///
+/// Only kinds 8 (`R_WASM_FUNCTION_OFFSET_I32`) and 26
+/// (`R_WASM_FUNCTION_INDEX_I32`) are affected — data symbols,
+/// globals, and section symbols are not GC'd in our flow.
+fn repatch_custom_section_function_relocs(layout: &Layout<'_, Wasm>, merged: &mut MergedModule) {
+    // Output body offsets in the merged CODE section, post-GC.
+    // Layout: count_leb | { size_leb | body }*. Indexed by defined
+    // function position (= wasm_idx - num_imported_functions).
+    let mut output_body_offsets: Vec<u32> = Vec::with_capacity(merged.functions.len());
+    {
+        let mut cursor = leb128_len(merged.functions.len() as u32) as u32;
+        for f in &merged.functions {
+            let size_leb = leb128_len(f.body.len() as u32) as u32;
+            output_body_offsets.push(cursor + size_leb);
+            cursor += size_leb + f.body.len() as u32;
+        }
+    }
+
+    // Index merged.custom_sections by name.
+    let mut cs_idx_by_name: std::collections::HashMap<Vec<u8>, usize> = Default::default();
+    for (i, cs) in merged.custom_sections.iter().enumerate() {
+        cs_idx_by_name.insert(cs.name.clone(), i);
+    }
+
+    // Walk inputs in the same order merge_inputs used, tracking each
+    // section's running contribution offset so we can address the
+    // right slice of `merged.custom_sections[idx].data` for each
+    // input's relocs.
+    let mut running: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+
+            // Replicate merge_inputs's effective_name closure so an
+            // UNDEFINED kind-0 symbol with empty name still resolves
+            // (via the matching import field).
+            let effective_name = |sym: &WasmSymbolInfo| -> Option<Vec<u8>> {
+                if !sym.name.is_empty() {
+                    return Some(sym.name.clone());
+                }
+                if sym.flags & 0x10 == 0 {
+                    return None;
+                }
+                if sym.kind == 0 {
+                    parsed
+                        .import_function_names
+                        .get(sym.index as usize)
+                        .cloned()
+                } else {
+                    None
+                }
+            };
+
+            for cs in &parsed.custom_sections {
+                if cs.name == b"target_features" || cs.name == b"producers" {
+                    continue;
+                }
+                let contrib_start = *running.get(&cs.name).unwrap_or(&0);
+                if let Some(relocs) = parsed.custom_relocations.get(&cs.name)
+                    && let Some(&out_idx) = cs_idx_by_name.get(&cs.name)
+                {
+                    let dst = &mut merged.custom_sections[out_idx].data;
+                    for reloc in relocs {
+                        let abs_off = contrib_start as usize + reloc.offset as usize;
+                        if abs_off + 4 > dst.len() {
+                            continue;
+                        }
+                        let unresolved: u32 = u32::MAX;
+                        let value: u32 = match reloc.reloc_type {
+                            8 => {
+                                // R_WASM_FUNCTION_OFFSET_I32
+                                let body_off = parsed
+                                    .symbols
+                                    .get(reloc.symbol_index as usize)
+                                    .filter(|s| s.kind == 0)
+                                    .and_then(effective_name)
+                                    .and_then(|n| merged.function_name_map.get(&n).copied())
+                                    .and_then(|wasm_idx| {
+                                        wasm_idx
+                                            .checked_sub(merged.num_imported_functions)
+                                            .and_then(|pos| {
+                                                output_body_offsets.get(pos as usize).copied()
+                                            })
+                                    });
+                                match body_off {
+                                    Some(off) => (off as i64 + reloc.addend as i64) as u32,
+                                    None => unresolved,
+                                }
+                            }
+                            26 => {
+                                // R_WASM_FUNCTION_INDEX_I32
+                                parsed
+                                    .symbols
+                                    .get(reloc.symbol_index as usize)
+                                    .filter(|s| s.kind == 0)
+                                    .and_then(effective_name)
+                                    .and_then(|n| merged.function_name_map.get(&n).copied())
+                                    .unwrap_or(unresolved)
+                            }
+                            _ => continue,
+                        };
+                        dst[abs_off..abs_off + 4].copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+                running
+                    .entry(cs.name.clone())
+                    .and_modify(|e| *e += cs.data.len() as u32)
+                    .or_insert(cs.data.len() as u32);
+            }
+        }
+    }
+}
+
+/// `--emit-relocs` payload — symbol table + output-coordinate
+/// relocations gathered post-merge for the executable path. Built
+/// by `gather_emit_relocs`; consumed by `write_direct`.
+struct EmitRelocsData {
+    sym_entries: Vec<SymEntry>,
+    output_code_relocs: Vec<WasmReloc>,
+    output_data_relocs: Vec<WasmReloc>,
+    /// Per-custom-section relocs, keyed by the merged custom-section
+    /// name (e.g. `b".debug_info"`). Offsets are relative to the
+    /// merged section's data; symbol indices reference `sym_entries`.
+    /// wasm-ld writes one `reloc.<custom_section_name>` per entry
+    /// here, after `reloc.DATA` and before the `name` section.
+    output_custom_relocs: std::collections::HashMap<Vec<u8>, Vec<WasmReloc>>,
+}
+
+/// Walk inputs once more (post-merge) to collect output-coordinate
+/// code and data relocations + extend the `SymEntry` list with data
+/// and global symbols. Used by `write_direct` when `--emit-relocs`
+/// is set so the merged output carries `linking` + `reloc.CODE` /
+/// `reloc.DATA` custom sections matching what wasm-ld writes.
+///
+/// Body positions in the merged CODE section come from a cumulative
+/// walk of `merged.functions`. Per-input function bodies map onto
+/// merged positions via a running `func_base` counter — the same
+/// rule `merge_inputs` uses internally; we re-derive it rather than
+/// extending `MergedModule` further.
+fn gather_emit_relocs(layout: &Layout<'_, Wasm>, merged: &MergedModule) -> EmitRelocsData {
+    let mut sym_entries = build_sym_entries_from_merged(merged);
+    let mut name_to_sym_idx: std::collections::HashMap<Vec<u8>, u32> = sym_entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name.clone(), i as u32))
+        .collect();
+
+    // Pre-walk: scan inputs for UNDEFINED data references to lld's
+    // synthesized "linker-defined" symbols (`__stack_low`, `__stack_high`,
+    // `__heap_base`, `__heap_end`, `__data_end`, `__global_base`,
+    // `__memory_base`, `__table_base`, `__dso_handle`). lld emits these
+    // as ABSOLUTE+HIDDEN data symbols in the linking section and assigns
+    // them early symbol-table indices (right after the defined-function
+    // block). Pre-adding them here gives them stable positions before
+    // the main per-input walk discovers them as new entries at the tail.
+    //
+    // The address values are placeholders (0/Size:0) — that's faithful
+    // to wasm-ld's `__stack_low` (its size is always 0) and matches
+    // obj2yaml's YAML output convention (mapOptional with default 0
+    // omits Segment/Offset; Size is mapRequired so always shown).
+    const SYNTHESIZED_DATA_SYMBOLS: &[&[u8]] = &[
+        b"__stack_low",
+        b"__stack_high",
+        b"__heap_base",
+        b"__heap_end",
+        b"__data_end",
+        b"__global_base",
+        b"__dso_handle",
+    ];
+    {
+        let mut referenced: std::collections::BTreeSet<&'static [u8]> = Default::default();
+        for group in &layout.group_layouts {
+            for file in &group.files {
+                let FileLayout::Object(obj) = file else {
+                    continue;
+                };
+                let data = obj.object.data;
+                if data.len() < 8 || &data[..4] != b"\0asm" {
+                    continue;
+                }
+                let Ok(parsed) = parse_wasm_sections(data) else {
+                    continue;
+                };
+                for sym in &parsed.symbols {
+                    if sym.kind == 1 && (sym.flags & 0x10) != 0 && !sym.name.is_empty() {
+                        for &sn in SYNTHESIZED_DATA_SYMBOLS {
+                            if sym.name == sn && !name_to_sym_idx.contains_key(sn) {
+                                referenced.insert(sn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Add in deterministic alphabetical order.
+        for sn in referenced {
+            let new_idx = sym_entries.len() as u32;
+            sym_entries.push(SymEntry {
+                kind: 1,
+                name: sn.to_vec(),
+                flags: 0x04 | 0x200, // VISIBILITY_HIDDEN | ABSOLUTE
+                index: 0,
+                segment: 0,
+                segment_offset: 0,
+                segment_size: 0,
+            });
+            name_to_sym_idx.insert(sn.to_vec(), new_idx);
+        }
+    }
+
+    // Output body data-byte starts in the merged CODE section.
+    let mut body_data_starts: Vec<u32> = Vec::with_capacity(merged.functions.len());
+    {
+        let count_leb = leb128_len(merged.functions.len() as u32) as u32;
+        let mut pos = count_leb;
+        for f in &merged.functions {
+            let bsz = leb128_len(f.body.len() as u32) as u32;
+            body_data_starts.push(pos + bsz);
+            pos += bsz + f.body.len() as u32;
+        }
+    }
+
+    let mut output_code_relocs: Vec<WasmReloc> = Vec::new();
+    let mut output_data_relocs: Vec<WasmReloc> = Vec::new();
+    let mut output_custom_relocs: std::collections::HashMap<Vec<u8>, Vec<WasmReloc>> =
+        Default::default();
+    // Running sum of each custom section's contribution from all inputs
+    // walked so far. Mirrors the `running` map in `merge_inputs`'s
+    // contrib-offset pass, so when this input's reloc fires we can
+    // shift its offset to the merged section's coordinate space.
+    let mut custom_section_running: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    let mut func_base: u32 = 0;
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+
+            // Recover name for an undef function symbol from its
+            // matching import field.
+            let func_imports: Vec<&Vec<u8>> = parsed
+                .imports
+                .iter()
+                .filter(|i| i.kind == 0)
+                .map(|i| &i.field)
+                .collect();
+            let global_imports: Vec<&Vec<u8>> = parsed
+                .imports
+                .iter()
+                .filter(|i| i.kind == 3)
+                .map(|i| &i.field)
+                .collect();
+
+            // Build per-input local-sym-idx → output-sym-idx map.
+            // For symbols whose name we recognize, map to existing
+            // SymEntry slot; for new data/global symbols, append a
+            // SymEntry and record the new index.
+            let mut local_sym_to_output: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.symbols.len());
+            for sym in &parsed.symbols {
+                let resolved_name: Vec<u8> = if !sym.name.is_empty() {
+                    sym.name.clone()
+                } else if sym.kind == 0 && (sym.flags & 0x10) != 0 {
+                    func_imports
+                        .get(sym.index as usize)
+                        .map(|n| (*n).clone())
+                        .unwrap_or_default()
+                } else if sym.kind == 2 && (sym.flags & 0x10) != 0 {
+                    global_imports
+                        .get(sym.index as usize)
+                        .map(|n| (*n).clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if resolved_name.is_empty() {
+                    local_sym_to_output.push(None);
+                    continue;
+                }
+                if let Some(&idx) = name_to_sym_idx.get(&resolved_name) {
+                    local_sym_to_output.push(Some(idx));
+                    continue;
+                }
+                // Defined function symbols whose function got GC'd:
+                // skip. These are typically `BINDING_LOCAL` helpers
+                // (e.g. `unused_function`) — keeping their symbol
+                // entries would leave a stale alias pointing at
+                // whatever happened to land at the original index
+                // post-GC, which obj2yaml's `Function:` field then
+                // mis-reports.
+                if sym.kind == 0
+                    && (sym.flags & 0x10) == 0
+                    && !merged.function_name_map.contains_key(&resolved_name)
+                {
+                    local_sym_to_output.push(None);
+                    continue;
+                }
+                // New entry — primarily data symbols since we built
+                // the initial set from merged's function/global maps.
+                // For DATA symbols, demote to UNDEFINED when the
+                // input's segment didn't make it into the merged
+                // output (BSS-elision, dead-strip). The linking
+                // section validates that defined data symbols
+                // reference real segments.
+                let mut new_flags = sym.flags;
+                if sym.kind == 1
+                    && (sym.flags & 0x10) == 0
+                    && (sym.segment_index as usize) >= merged.data_segments.len()
+                {
+                    new_flags |= 0x10; // UNDEFINED
+                }
+                let new_idx = sym_entries.len() as u32;
+                let new_entry = SymEntry {
+                    kind: sym.kind,
+                    name: resolved_name.clone(),
+                    flags: new_flags,
+                    index: sym.index,
+                    segment: sym.segment_index,
+                    segment_offset: sym.segment_offset,
+                    segment_size: sym.segment_size,
+                };
+                sym_entries.push(new_entry);
+                name_to_sym_idx.insert(resolved_name, new_idx);
+                local_sym_to_output.push(Some(new_idx));
+            }
+
+            // Input body positions (data-byte starts in input CODE
+            // section contents).
+            let mut input_body_data_starts: Vec<u32> = Vec::with_capacity(parsed.functions.len());
+            let mut input_body_data_ends: Vec<u32> = Vec::with_capacity(parsed.functions.len());
+            {
+                let input_count_leb = leb128_len(parsed.functions.len() as u32) as u32;
+                let mut pos = input_count_leb;
+                for f in &parsed.functions {
+                    let bsz = leb128_len(f.body.len() as u32) as u32;
+                    input_body_data_starts.push(pos + bsz);
+                    input_body_data_ends.push(pos + bsz + f.body.len() as u32);
+                    pos += bsz + f.body.len() as u32;
+                }
+            }
+
+            // Code relocations → output-coordinate relocs. Map
+            // input-local-function index to merged via the
+            // function's name (GC may have dropped or reordered
+            // bodies, so a naive `func_base + local_idx` would land
+            // on the wrong merged slot — or out of bounds).
+            for r in &parsed.code_relocations {
+                let mut local = None;
+                for (i, &s) in input_body_data_starts.iter().enumerate() {
+                    if r.offset >= s && r.offset < input_body_data_ends[i] {
+                        local = Some(i);
+                        break;
+                    }
+                }
+                let Some(local_idx) = local else { continue };
+                let Some(local_name) = parsed.function_names.get(&(local_idx as u32)) else {
+                    continue;
+                };
+                let Some(&merged_func_idx) = merged.function_name_map.get(local_name) else {
+                    continue;
+                };
+                let merged_def_idx = merged_func_idx
+                    .checked_sub(merged.num_imported_functions)
+                    .map(|d| d as usize);
+                let Some(merged_def_idx) = merged_def_idx else {
+                    continue;
+                };
+                let Some(&body_start) = body_data_starts.get(merged_def_idx) else {
+                    continue;
+                };
+                let off_in_body = r.offset - input_body_data_starts[local_idx];
+                let new_offset = body_start + off_in_body;
+                let Some(out_sym) = local_sym_to_output
+                    .get(r.symbol_index as usize)
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                output_code_relocs.push(WasmReloc {
+                    reloc_type: r.reloc_type,
+                    offset: new_offset,
+                    symbol_index: out_sym,
+                    addend: r.addend,
+                });
+            }
+            // Data relocations stay un-remapped for now since the
+            // executable path handles the data-section layout
+            // differently (segments may be coalesced or stripped).
+            for r in &parsed.data_relocations {
+                let Some(out_sym) = local_sym_to_output
+                    .get(r.symbol_index as usize)
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                output_data_relocs.push(WasmReloc {
+                    reloc_type: r.reloc_type,
+                    offset: r.offset,
+                    symbol_index: out_sym,
+                    addend: r.addend,
+                });
+            }
+
+            // Custom-section relocations. Each input contributes a
+            // contiguous run to the merged custom section (in input
+            // order, skipping target_features/producers); reloc offsets
+            // shift by the running contribution sum. We drop relocs
+            // whose target symbol was GC'd (local_sym_to_output → None)
+            // — `merge_inputs` has already overwritten the data with
+            // the 0xFFFFFFFF tombstone in that case, so a debug reader
+            // sees the dead reference and we keep the reloc table free
+            // of stale entries.
+            for cs in &parsed.custom_sections {
+                if cs.name == b"target_features" || cs.name == b"producers" {
+                    continue;
+                }
+                let contrib_start = *custom_section_running.get(&cs.name).unwrap_or(&0);
+                if let Some(relocs) = parsed.custom_relocations.get(&cs.name) {
+                    let dst = output_custom_relocs.entry(cs.name.clone()).or_default();
+                    for r in relocs {
+                        let Some(out_sym) = local_sym_to_output
+                            .get(r.symbol_index as usize)
+                            .copied()
+                            .flatten()
+                        else {
+                            continue;
+                        };
+                        // Skip relocs whose resolved output symbol is
+                        // UNDEFINED — `merge_inputs`'s patch path has
+                        // already written the tombstone bytes, and lld
+                        // omits the reloc in that case.
+                        if let Some(entry) = sym_entries.get(out_sym as usize)
+                            && (entry.flags & 0x10) != 0
+                        {
+                            continue;
+                        }
+                        dst.push(WasmReloc {
+                            reloc_type: r.reloc_type,
+                            offset: r.offset + contrib_start,
+                            symbol_index: out_sym,
+                            addend: r.addend,
+                        });
+                    }
+                }
+                custom_section_running
+                    .entry(cs.name.clone())
+                    .and_modify(|e| *e += cs.data.len() as u32)
+                    .or_insert(cs.data.len() as u32);
+            }
+
+            func_base += parsed.functions.len() as u32;
+        }
+    }
+
+    EmitRelocsData {
+        sym_entries,
+        output_code_relocs,
+        output_data_relocs,
+        output_custom_relocs,
+    }
+}
+
+/// Build a `SymEntry` list (the linking section's symbol table)
+/// from a `MergedModule`. Shared between the `-r` path (which
+/// historically built its own from per-input walks) and a future
+/// `--emit-relocs` implementation in `write_direct` — both need
+/// the same on-disk format that `build_linking_section_payload`
+/// expects.
+///
+/// Function entries pull from `function_name_map` + the flag maps
+/// (`function_is_weak` is internal to `merge_inputs` so we
+/// approximate from `hidden_functions` / `exported_indices` /
+/// `no_strip_indices`). Imported functions appear first as
+/// UNDEFINED entries, in import order. Globals follow the same
+/// pattern. Data symbols are *not* yet populated — `MergedModule`
+/// discards per-input data-symbol metadata (segment_offset,
+/// size) and rebuilding it would need a third walk over the
+/// inputs; tracked as future work for full `--emit-relocs`.
+fn build_sym_entries_from_merged(merged: &MergedModule) -> Vec<SymEntry> {
+    let mut entries: Vec<SymEntry> = Vec::new();
+    let mut name_seen: std::collections::HashSet<Vec<u8>> = Default::default();
+
+    // Function imports (kind=0, UNDEFINED) — use the import's
+    // module/field as the "name" since merge_inputs doesn't
+    // separately preserve undef function symbol names.
+    let mut func_import_idx = 0u32;
+    let mut global_import_idx = 0u32;
+    for imp in &merged.imports {
+        match &imp.kind {
+            ImportKind::Function(_) => {
+                if name_seen.insert(imp.field.clone()) {
+                    entries.push(SymEntry {
+                        kind: 0,
+                        name: imp.field.clone(),
+                        flags: 0x10, // UNDEFINED
+                        index: func_import_idx,
+                        segment: 0,
+                        segment_offset: 0,
+                        segment_size: 0,
+                    });
+                }
+                func_import_idx += 1;
+            }
+            ImportKind::Global { .. } => {
+                if name_seen.insert(imp.field.clone()) {
+                    entries.push(SymEntry {
+                        kind: 2,
+                        name: imp.field.clone(),
+                        flags: 0x10, // UNDEFINED
+                        index: global_import_idx,
+                        segment: 0,
+                        segment_offset: 0,
+                        segment_size: 0,
+                    });
+                }
+                global_import_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Defined function symbols.
+    let exported_set: std::collections::HashSet<u32> =
+        merged.exported_indices.iter().copied().collect();
+    let no_strip_set: std::collections::HashSet<u32> =
+        merged.no_strip_indices.iter().copied().collect();
+    let mut func_entries: Vec<(Vec<u8>, u32)> = merged
+        .function_name_map
+        .iter()
+        .filter_map(|(name, &idx)| {
+            if idx >= merged.num_imported_functions {
+                Some((name.clone(), idx))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Stable order by output function index so the linking section
+    // is reproducible across runs.
+    func_entries.sort_by_key(|(_, i)| *i);
+    for (name, idx) in func_entries {
+        if !name_seen.insert(name.clone()) {
+            continue;
+        }
+        let mut flags: u32 = 0;
+        if merged.hidden_functions.contains(&name) {
+            flags |= 0x04; // VISIBILITY_HIDDEN
+        }
+        if exported_set.contains(&idx) {
+            flags |= 0x20; // EXPORTED
+        }
+        if no_strip_set.contains(&idx) {
+            flags |= 0x80; // NO_STRIP
+        }
+        entries.push(SymEntry {
+            kind: 0,
+            name,
+            flags,
+            index: idx,
+            segment: 0,
+            segment_offset: 0,
+            segment_size: 0,
+        });
+    }
+
+    entries
 }
 
 /// GC: remove unreferenced functions and remap indices.
@@ -1709,6 +5047,9 @@ fn walk_call_indirect_typeidx(
                 let (typeidx, c) = read_leb128(&body[pos..])?;
                 on_typeidx(start, typeidx as u32);
                 pos += c;
+                // Skip tableidx — second on_*  callback is via the
+                // sister walker `walk_call_indirect_tableidx` to keep
+                // each walker's hot path uncluttered.
                 let (_, c) = read_leb128(&body[pos..])?;
                 pos += c;
             }
@@ -1760,6 +5101,150 @@ fn walk_call_indirect_typeidx(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Walk a function body and report every `call_indirect` /
+/// `return_call_indirect` **tableidx** operand. Mirrors
+/// `walk_call_indirect_typeidx` byte-for-byte except the callback
+/// fires on the tableidx field (the second LEB after the opcode).
+/// Returns `(offset, current_byte_length, value)` so callers can
+/// re-encode in place.
+fn walk_call_indirect_tableidx(
+    body: &[u8],
+    mut on_tableidx: impl FnMut(usize, usize, u32),
+) -> crate::error::Result<()> {
+    let mut pos = 0;
+    let (local_count, c) = read_leb128(body)?;
+    pos += c;
+    for _ in 0..local_count {
+        let (_, c) = read_leb128(&body[pos..])?;
+        pos += c + 1;
+    }
+    while pos < body.len() {
+        let opcode = body[pos];
+        pos += 1;
+        match opcode {
+            0x00 | 0x01 | 0x05 | 0x0B | 0x0F | 0x1A | 0x1B | 0x45..=0xC4 | 0xD1 => {}
+            0x02 | 0x03 | 0x04 => {
+                if pos < body.len() {
+                    let b = body[pos];
+                    if b == 0x40 || (0x6B..=0x7F).contains(&b) {
+                        pos += 1;
+                    } else {
+                        let (_, c) = read_sleb128(&body[pos..])?;
+                        pos += c;
+                    }
+                }
+            }
+            0x0C | 0x0D | 0x09 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x0E => {
+                let (count, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                for _ in 0..=count {
+                    let (_, c) = read_leb128(&body[pos..])?;
+                    pos += c;
+                }
+            }
+            0x10 | 0x12 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x11 | 0x13 => {
+                // typeidx then tableidx — emit on_tableidx for the second
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                let table_start = pos;
+                let (table_idx, c) = read_leb128(&body[pos..])?;
+                on_tableidx(table_start, c, table_idx as u32);
+                pos += c;
+            }
+            0x1C => {
+                let (count, c) = read_leb128(&body[pos..])?;
+                pos += c + count;
+            }
+            0x20..=0x24 | 0x25 | 0x26 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x28..=0x3E => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x3F | 0x40 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x41 => {
+                let (_, c) = read_sleb128(&body[pos..])?;
+                pos += c;
+            }
+            0x42 => {
+                let (_, c) = read_sleb128_i64_consumed(&body[pos..])?;
+                pos += c;
+            }
+            0x43 => {
+                if pos + 4 > body.len() {
+                    return Err(crate::error!("call_indirect tableidx walker: truncated f32.const"));
+                }
+                pos += 4;
+            }
+            0x44 => {
+                if pos + 8 > body.len() {
+                    return Err(crate::error!("call_indirect tableidx walker: truncated f64.const"));
+                }
+                pos += 8;
+            }
+            0xD2 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            _ => {
+                return Err(crate::error!(
+                    "call_indirect tableidx walker: unknown opcode 0x{opcode:02x}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pad every `call_indirect` / `return_call_indirect` tableidx LEB
+/// in `body` to 5 bytes so an R_WASM_TABLE_NUMBER_LEB reloc can
+/// patch the operand without changing body length. lld always
+/// emits this operand at the maximum LEB width regardless of the
+/// input encoding (`encodeULEB128(idx, OS, /*PadTo=*/5)` in
+/// `lld/wasm/InputChunks.cpp`); matching it makes wild's body
+/// bytes byte-equal lld's for the exec path AND pre-positions the
+/// operand for correct reloc offsets in the `--emit-relocs` /
+/// `-r` paths. Cheap rewrite — most inputs already encode at 5
+/// bytes and the walker exits without patches.
+fn pad_call_indirect_tableidx_in_body(body: &mut Vec<u8>) -> crate::error::Result<()> {
+    let mut to_expand: Vec<(usize, usize, u32)> = Vec::new();
+    walk_call_indirect_tableidx(body, |off, len, val| {
+        if len < 5 {
+            to_expand.push((off, len, val));
+        }
+    })?;
+    // Apply right-to-left so earlier offsets stay valid.
+    to_expand.sort_by_key(|(off, _, _)| std::cmp::Reverse(*off));
+    for (off, len, val) in to_expand {
+        let mut padded = Vec::with_capacity(5);
+        for i in 0..5 {
+            let byte = ((val >> (i * 7)) & 0x7F) as u8;
+            if i < 4 {
+                padded.push(byte | 0x80);
+            } else {
+                padded.push(byte);
+            }
+        }
+        body.splice(off..off + len, padded);
     }
     Ok(())
 }
@@ -2079,43 +5564,14 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 );
             }
 
-            // Type deduplication.
-            let mut type_map: Vec<u32> = Vec::new();
-            for input_type in &parsed.types {
-                let output_idx = if let Some(pos) = types.iter().position(|t| t == input_type) {
-                    pos as u32
-                } else {
-                    let idx = types.len() as u32;
-                    types.push(input_type.clone());
-                    idx
-                };
-                type_map.push(output_idx);
-            }
+            // Type deduplication — same helper feeds the `-r` path.
+            let type_map = dedup_types_for_input(&parsed.types, &mut types);
 
-            // COMDAT dedup (spec §7): first group wins, duplicates discarded.
-            // Build a set of local function indices that belong to duplicate groups.
-            let mut comdat_skip_functions: std::collections::HashSet<u32> = Default::default();
-            let mut comdat_skip_data: std::collections::HashSet<u32> = Default::default();
-            let mut comdat_skip_tags: std::collections::HashSet<u32> = Default::default();
-            for (group_name, entries) in &parsed.comdat_groups {
-                if !seen_comdat_groups.insert(group_name.clone()) {
-                    // Duplicate group — mark all its entries for skipping.
-                    for &(kind, index) in entries {
-                        match kind {
-                            0 => {
-                                comdat_skip_data.insert(index);
-                            }
-                            1 => {
-                                comdat_skip_functions.insert(index);
-                            }
-                            3 => {
-                                comdat_skip_tags.insert(index);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+            // COMDAT dedup (spec §7): first group wins, duplicates
+            // discarded. Same helper feeds the `-r` path so both
+            // emit identical skip sets for the same input order.
+            let (comdat_skip_functions, comdat_skip_data, comdat_skip_tags) =
+                compute_comdat_skip_sets(&parsed, &mut seen_comdat_groups);
 
             let func_base = total_functions;
 
@@ -2176,9 +5632,16 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                     }
                     if !sym.name.is_empty() && !function_name_map.contains_key(&sym.name) {
                         function_name_map.insert(sym.name.clone(), output_idx);
-                        // Aliases inherit the weak/hidden state of the
-                        // canonical name; default to strong + visible.
-                        function_is_weak.entry(sym.name.clone()).or_insert(false);
+                        // Aliases carry their own weak/hidden flags from
+                        // the symbol-table entry — `BINDING_WEAK` (0x01)
+                        // here marks an alias like `alias_fn = direct_fn`
+                        // so name-section emission can prefer the strong
+                        // (canonical) name when both point at the same
+                        // function index.
+                        let sym_is_weak = (sym.flags & 0x01) != 0;
+                        function_is_weak
+                            .entry(sym.name.clone())
+                            .or_insert(sym_is_weak);
                         if sym.name == entry_name {
                             entry_function_index = Some(output_idx);
                         }
@@ -2292,16 +5755,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     // Classify segments by name prefix.
     // Order: rodata (read-only) → data (read-write non-BSS) → BSS.
     let is_rodata = |seg: &ParsedDataSegment| -> bool { seg.name.starts_with(b".rodata") };
-    let is_bss_name = |seg: &ParsedDataSegment| -> bool {
-        // Use the segment name for BSS classification, not the data content.
-        // Segments with relocation placeholders (all zeros) should NOT be
-        // treated as BSS if their name is .data.*.
-        if !seg.name.is_empty() {
-            seg.name.starts_with(b".bss")
-        } else {
-            seg.data.iter().all(|&b| b == 0)
-        }
-    };
+    let is_bss_name = |seg: &ParsedDataSegment| -> bool { is_bss_segment(seg) };
 
     // Layout helper: place segments in a group, aligning the group start to
     // the max alignment of any segment in the group.
@@ -2385,20 +5839,34 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     );
 
     // Compute group boundaries for rodata / tdata / data segments.
+    // Under --emit-relocs we ALSO track a bss range so we can emit it as
+    // a zero-filled DATA segment — wasm-ld preserves BSS in the output
+    // so a subsequent linker pass can re-resolve absolute addresses
+    // against it. In the default exec path we still elide BSS.
     let mut rodata_start: Option<u32> = None;
     let mut rodata_end: Option<u32> = None;
     let mut tdata_start: Option<u32> = None;
     let mut tdata_end: Option<u32> = None;
     let mut rw_data_start: Option<u32> = None;
     let mut rw_data_end: Option<u32> = None;
+    let mut bss_start: Option<u32> = None;
+    let mut bss_end: Option<u32> = None;
+    let preserve_bss = layout.symbol_db.args.emit_relocs;
     for (obj_idx, obj_info) in objects.iter().enumerate() {
         for (seg_i, seg) in obj_info.parsed.data_segments.iter().enumerate() {
-            if should_skip_seg(obj_idx, seg_i) || is_bss_name(seg) {
+            if should_skip_seg(obj_idx, seg_i) {
+                continue;
+            }
+            let bss = is_bss_name(seg);
+            if bss && !preserve_bss {
                 continue;
             }
             let off = segment_output_offsets[obj_idx][seg_i];
             let end = off + seg.data.len() as u32;
-            if is_rodata(seg) {
+            if bss {
+                bss_start = Some(bss_start.map_or(off, |s: u32| s.min(off)));
+                bss_end = Some(bss_end.map_or(end, |e: u32| e.max(end)));
+            } else if is_rodata(seg) {
                 rodata_start = Some(rodata_start.map_or(off, |s: u32| s.min(off)));
                 rodata_end = Some(rodata_end.map_or(end, |e: u32| e.max(end)));
             } else if is_tls_seg(seg) {
@@ -2413,7 +5881,13 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
 
     // Merge data into per-group output segments (spec §9.1).
     // Groups: .rodata.* → one segment, .data.* → another, matching wasm-ld.
-    // BSS segments are omitted (implicit in memory allocation).
+    // BSS segments are normally omitted (implicit in memory allocation);
+    // under --emit-relocs we emit a zero-filled BSS segment so the next
+    // link can re-resolve absolute addresses pointing into it. Note: BSS
+    // segments only contribute zeros (their `seg.data` is the BSS payload
+    // — typically already zeroed but conceptually undefined), so we keep
+    // the `merged_data` build path symmetric and do NOT copy BSS bytes
+    // into the rodata/data merged buffer below.
     let (mut data_segments, tls_segment_index) = if data_offset > data_start {
         // Build merged data for the full range, then split into segments.
         let total_data_len = (data_offset - data_start) as usize;
@@ -2429,14 +5903,16 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         }
 
         // Create separate output segments for each group.
-        // Order: rodata → tdata → data. Keep `.tdata` as its own output
-        // segment (spec §16.3 requires this so `memory.init` can target
-        // it under `--shared-memory`).
+        // Order: rodata → tdata → data → bss. Keep `.tdata` as its own
+        // output segment (spec §16.3 requires this so `memory.init` can
+        // target it under `--shared-memory`). BSS only emitted under
+        // --emit-relocs (preserve_bss).
         let mut segments = Vec::new();
-        let groups: [(Option<u32>, Option<u32>); 3] = [
+        let groups: [(Option<u32>, Option<u32>); 4] = [
             (rodata_start, rodata_end),
             (tdata_start, tdata_end),
             (rw_data_start, rw_data_end),
+            (bss_start, bss_end),
         ];
         // Track which emitted segment index corresponds to `.tdata`, so
         // `memory.init` in `__wasm_init_tls` can target it.
@@ -2446,7 +5922,13 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 let rel_start = (s - data_start) as usize;
                 let rel_end = (e - data_start) as usize;
                 if rel_end > rel_start && rel_end <= merged_data.len() {
-                    let data = merged_data[rel_start..rel_end].to_vec();
+                    // BSS is always zero-filled regardless of merged_data
+                    // contents — `seg.data` for BSS is undefined payload.
+                    let data = if group_i == 3 {
+                        vec![0u8; rel_end - rel_start]
+                    } else {
+                        merged_data[rel_start..rel_end].to_vec()
+                    };
                     if group_i == 1 {
                         tls_segment_index = Some(segments.len() as u32);
                     }
@@ -2499,6 +5981,13 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
 
     // Build global data symbol name → output address map for cross-object resolution.
     let mut data_name_map: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    // Track which data symbol names live in TLS segments so the GOT-
+    // synthesis pass can route their address through __tls_base
+    // instead of the ordinary memory-base. lld emits a synthesized
+    // `__wasm_apply_global_tls_relocs` that runs once per thread to
+    // overwrite each TLS GOT slot with `__tls_base + tls_rel_offset`.
+    let mut tls_data_offset_by_name: std::collections::HashMap<Vec<u8>, u32> =
+        Default::default();
     for (obj_idx, obj_info) in objects.iter().enumerate() {
         let obj_seg_offsets = &segment_output_offsets[obj_idx];
         for sym in &obj_info.parsed.symbols {
@@ -2513,7 +6002,21 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 }
                 // Defined data symbol with a name.
                 if let Some(&seg_base) = obj_seg_offsets.get(sym.segment_index as usize) {
-                    data_name_map.insert(sym.name.clone(), seg_base + sym.segment_offset);
+                    let abs_addr = seg_base + sym.segment_offset;
+                    data_name_map.insert(sym.name.clone(), abs_addr);
+                    if obj_info
+                        .parsed
+                        .data_segments
+                        .get(sym.segment_index as usize)
+                        .map(|seg| is_tls_seg(seg))
+                        .unwrap_or(false)
+                    {
+                        // tls_base_offset is the absolute byte offset
+                        // of `.tdata` in the merged data image.
+                        let tls_base_abs = tls_base_offset.unwrap_or(data_start);
+                        let tls_rel = abs_addr.saturating_sub(tls_base_abs);
+                        tls_data_offset_by_name.insert(sym.name.clone(), tls_rel);
+                    }
                 }
             }
         }
@@ -2533,6 +6036,14 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     // --- Create linker-defined globals (spec §9.6) ---
     let mut globals: Vec<OutputGlobal> = Vec::new();
     let mut global_name_map: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    // Hoisted: TLS-shared-memory mode determines whether GOT.data
+    // entries for TLS symbols become mutable globals fixed up by
+    // __wasm_apply_global_tls_relocs at thread init.
+    let tls_shared_memory = layout.symbol_db.args.shared_memory;
+    // Pairs of (got_global_idx, tls_rel_offset) — one per TLS GOT
+    // entry — that __wasm_apply_global_tls_relocs has to write each
+    // thread. Populated by the GOT.data internalisation pass below.
+    let mut tls_apply_global_relocs: Vec<(u32, u32)> = Vec::new();
 
     // __stack_pointer: mutable i32, init to top of stack.
     // --stack-first: stack at 0..stack_size, sp = stack_size.
@@ -3045,7 +6556,18 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                     continue;
                 }
                 let data_name = imp.field.clone();
-                let init = data_name_map.get(&data_name).copied().unwrap_or(0);
+                // TLS data symbols' GOT slots are special: under
+                // --shared-memory `__tls_base` is set per thread and
+                // the GOT slot must be written each time. Make the
+                // global mutable, init it to 0, and remember its
+                // (idx, tls_rel_offset) so __wasm_apply_global_tls_relocs
+                // can fix it up at runtime.
+                let is_tls = tls_data_offset_by_name.contains_key(&data_name);
+                let (mutable, init) = if is_tls && tls_shared_memory {
+                    (true, 0u32)
+                } else {
+                    (false, data_name_map.get(&data_name).copied().unwrap_or(0))
+                };
                 let mut got_name = b"GOT.data.internal.".to_vec();
                 got_name.extend_from_slice(&data_name);
                 let global_idx = globals.len() as u32;
@@ -3057,10 +6579,17 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 globals.push(OutputGlobal {
                     name: got_name,
                     valtype: VALTYPE_I32,
-                    mutable: false,
+                    mutable,
                     init_value: init as u64,
                     exported: false,
                 });
+                if is_tls && tls_shared_memory {
+                    let tls_rel = tls_data_offset_by_name
+                        .get(&data_name)
+                        .copied()
+                        .unwrap_or(0);
+                    tls_apply_global_relocs.push((global_idx, tls_rel));
+                }
             }
         }
     }
@@ -3126,7 +6655,18 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             .iter()
             .any(|n| n == ctors_name)
     }) || entry_name == ctors_name;
-    let needs_ctors = !all_init_funcs.is_empty() || ctors_referenced;
+    // Under `--shared-memory`, lld unconditionally synthesises
+    // `__wasm_call_ctors` so the per-thread bootstrapper has a
+    // stable target to call. tls.s's ASM CHECK asserts `call 3`
+    // from `__wasm_init_tls` to `__wasm_apply_global_tls_relocs` —
+    // that index only lines up when `__wasm_call_ctors` reserves
+    // slot 0. Non-shared-memory builds keep the lazy emission
+    // (lld and wild only emit when ctors actually exist or the
+    // symbol is referenced) so visibility-hidden.ll / weak-alias.s
+    // / etc. don't grow a phantom function-0.
+    let needs_ctors = !all_init_funcs.is_empty()
+        || ctors_referenced
+        || layout.symbol_db.args.shared_memory;
 
     if needs_ctors {
         all_init_funcs.sort_by_key(|(prio, _)| *prio);
@@ -3667,11 +7207,33 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                     }
                     4 => {
                         // R_WASM_MEMORY_ADDR_SLEB (spec §9.4: 5-byte varint32)
+                        // Under --shared-memory, absolute references to TLS
+                        // data are not link-time constants — the actual
+                        // address depends on which thread is running. lld
+                        // detects TLS-flagged data symbols and emits the
+                        // TLS-relative offset (= addr - tls_base) so the
+                        // user's `global.get __tls_base; i32.const sym;
+                        // i32.add` pattern resolves to the per-thread
+                        // address. Match that here when the target sits
+                        // in a TLS segment.
                         let addr = symbol_to_data_addr
                             .get(&reloc.symbol_index)
                             .copied()
                             .unwrap_or(0);
-                        let value = (addr as i64 + reloc.addend as i64) as i32;
+                        let sym_name_for_tls = parsed
+                            .symbols
+                            .get(reloc.symbol_index as usize)
+                            .filter(|s| s.kind == 1 && (s.flags & 0x10) == 0)
+                            .map(|s| s.name.as_slice());
+                        let is_tls_data =
+                            sym_name_for_tls.is_some_and(|n| tls_data_offset_by_name.contains_key(n));
+                        let value = if is_tls_data && layout.symbol_db.args.shared_memory {
+                            let tls_base = tls_base_offset.unwrap_or(0);
+                            let tls_rel = addr.saturating_sub(tls_base) as i32;
+                            tls_rel + reloc.addend
+                        } else {
+                            (addr as i64 + reloc.addend as i64) as i32
+                        };
                         write_padded_sleb128(&mut body, off_in_body, value);
                     }
                     5 => {
@@ -4282,63 +7844,132 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
 
     // (Data segment layout done in pass 1.5 above.)
 
-    // --- Pass 3.6: synthesize __wasm_init_tls for --shared-memory ---
+    // --- Pass 3.6: synthesize __wasm_init_tls + __wasm_apply_global_tls_relocs ---
     // Spec §16.3: under threaded builds, the runtime calls
     // `__wasm_init_tls(ptr)` once per thread with a freshly-allocated
     // TLS block. The function copies `.tdata` into the block via
-    // `memory.init` and points `__tls_base` at the block.
-    // Body:
-    //     local.get 0
-    //     global.set __tls_base
-    //     local.get 0
-    //     i32.const 0
-    //     i32.const <tls_size>
-    //     memory.init <tdata_idx>, 0
-    //     end
-    // Call to `__wasm_apply_global_tls_relocs` is appended only when
-    // that helper is also synthesised.
+    // `memory.init`, points `__tls_base` at the block, and calls
+    // `__wasm_apply_global_tls_relocs` to fix up GOT slots that
+    // reference TLS symbols (each becomes `__tls_base + tls_rel`).
+    //
+    // Order in the output: __wasm_apply_global_tls_relocs is
+    // synthesised first when needed, so its function index is known
+    // before __wasm_init_tls's body is emitted (which contains a
+    // `call <apply_idx>` instruction). lld's same-test output has
+    // __wasm_init_tls at idx 2 and __wasm_apply at idx 3 — wild
+    // currently appends both at the tail, but the in-body `call`
+    // resolves to the correct index regardless of whether the two
+    // functions are at the front or tail of `functions`.
+    //
+    // Algorithm derived from `lld/wasm/Writer.cpp::createApplyGlobalTLSRelocationsFunction`
+    // and `createInitTLSFunction` (Apache-2.0 with LLVM Exceptions).
     if layout.symbol_db.args.shared_memory {
         let tls_base_idx = global_name_map.get(&b"__tls_base"[..]).copied();
         if let Some(tls_base_global) = tls_base_idx {
-            // type (i32) -> ()
-            let ty = FuncType {
+            // Emit __wasm_init_tls FIRST (lower function idx) so
+            // llvm-objdump's output prints it before
+            // __wasm_apply_global_tls_relocs — matching lld's layout
+            // and the ASM CHECK chain in `tls.s`. Pre-compute the
+            // apply func idx as `functions.len() + 1` so the `call`
+            // instruction in __wasm_init_tls's body resolves to the
+            // function we're about to push next.
+            let needs_apply = !tls_apply_global_relocs.is_empty();
+            let init_func_idx = functions.len() as u32;
+            let apply_func_idx = if needs_apply {
+                Some(init_func_idx + 1)
+            } else {
+                None
+            };
+
+            // type (i32) -> () for __wasm_init_tls
+            let init_ty = FuncType {
                 params: vec![VALTYPE_I32],
                 results: Vec::new(),
             };
-            let type_idx = if let Some(pos) = types.iter().position(|t| *t == ty) {
+            let init_type_idx = if let Some(pos) = types.iter().position(|t| *t == init_ty) {
                 pos as u32
             } else {
                 let idx = types.len() as u32;
-                types.push(ty);
+                types.push(init_ty);
                 idx
             };
-            let mut body = Vec::new();
-            body.push(0x00); // 0 locals
-            body.push(0x20); // local.get
-            write_leb128(&mut body, 0);
-            body.push(0x24); // global.set
-            write_leb128(&mut body, tls_base_global);
+            let mut init_body = Vec::new();
+            init_body.push(0x00); // 0 locals
+            init_body.push(0x20); // local.get
+            write_leb128(&mut init_body, 0);
+            init_body.push(0x24); // global.set __tls_base
+            write_leb128(&mut init_body, tls_base_global);
             if tls_size > 0 {
                 if let Some(tdata_idx) = tls_segment_index {
-                    body.push(0x20); // local.get
-                    write_leb128(&mut body, 0);
-                    body.push(0x41); // i32.const 0 (src offset)
-                    write_sleb128(&mut body, 0);
-                    body.push(0x41); // i32.const tls_size
-                    write_sleb128(&mut body, tls_size as i32);
-                    body.push(0xFC);
-                    write_leb128(&mut body, 0x08); // memory.init
-                    write_leb128(&mut body, tdata_idx);
-                    write_leb128(&mut body, 0); // memory index
+                    init_body.push(0x20); // local.get
+                    write_leb128(&mut init_body, 0);
+                    init_body.push(0x41); // i32.const 0 (src offset)
+                    write_sleb128(&mut init_body, 0);
+                    init_body.push(0x41); // i32.const tls_size
+                    write_sleb128(&mut init_body, tls_size as i32);
+                    init_body.push(0xFC);
+                    write_leb128(&mut init_body, 0x08); // memory.init
+                    write_leb128(&mut init_body, tdata_idx);
+                    write_leb128(&mut init_body, 0); // memory index
                 }
             }
-            body.push(0x0B); // end
-            let func_idx = functions.len() as u32;
-            function_name_map.insert(b"__wasm_init_tls".to_vec(), func_idx);
+            if let Some(apply_idx) = apply_func_idx {
+                init_body.push(0x10); // call
+                // 5-byte padded LEB so a later reorder pass
+                // (`reorder_synth_functions_first`) can patch this
+                // operand in place via `write_padded_leb128` without
+                // shifting the subsequent body bytes.
+                let pos = init_body.len();
+                init_body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
+                write_padded_leb128(&mut init_body, pos, apply_idx);
+            }
+            init_body.push(0x0B); // end
+            function_name_map.insert(b"__wasm_init_tls".to_vec(), init_func_idx);
             functions.push(MergedFunction {
-                type_index: type_idx,
-                body,
+                type_index: init_type_idx,
+                body: init_body,
             });
+
+            // Then synthesize __wasm_apply_global_tls_relocs, which
+            // walks each TLS GOT slot and writes
+            // `__tls_base + tls_rel_offset` into it. Algorithm
+            // mirrors lld/wasm/Writer.cpp::createApplyGlobalTLSRelocationsFunction
+            // (Apache-2.0 with LLVM Exceptions).
+            if needs_apply {
+                let void_ty = FuncType {
+                    params: Vec::new(),
+                    results: Vec::new(),
+                };
+                let void_type_idx = if let Some(pos) = types.iter().position(|t| *t == void_ty) {
+                    pos as u32
+                } else {
+                    let idx = types.len() as u32;
+                    types.push(void_ty);
+                    idx
+                };
+                let mut body = Vec::new();
+                body.push(0x00); // 0 locals
+                for &(got_idx, tls_rel) in &tls_apply_global_relocs {
+                    body.push(0x23); // global.get __tls_base
+                    write_leb128(&mut body, tls_base_global);
+                    body.push(0x41); // i32.const tls_rel
+                    write_sleb128(&mut body, tls_rel as i32);
+                    body.push(0x6A); // i32.add
+                    body.push(0x24); // global.set <got_idx>
+                    write_leb128(&mut body, got_idx);
+                }
+                body.push(0x0B); // end
+                let func_idx = functions.len() as u32;
+                debug_assert_eq!(Some(func_idx), apply_func_idx);
+                function_name_map.insert(
+                    b"__wasm_apply_global_tls_relocs".to_vec(),
+                    func_idx,
+                );
+                functions.push(MergedFunction {
+                    type_index: void_type_idx,
+                    body,
+                });
+            }
         }
     }
 
@@ -4351,8 +7982,27 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let mut num_imported_globals = 0u32;
     let mut seen_imports: std::collections::HashSet<(Vec<u8>, Vec<u8>, u8, u32)> =
         Default::default();
+    // (LLVM symbol name, pre-shift import wasm idx) — applied to
+    // function_name_map after the defined-functions shift loop so
+    // the import index isn't shifted twice.
+    let mut import_function_name_map: Vec<(Vec<u8>, u32)> = Vec::new();
+    // (LLVM symbol name, import wasm idx) for global imports — used
+    // to populate the GlobalNames subsection of the `name` custom
+    // section so e.g. `g1` appears at idx 0 even though the import
+    // field is `g` (via `.import_name g1, g`).
+    let mut import_global_name_map: Vec<(Vec<u8>, u32)> = Vec::new();
 
     for obj_info in &objects {
+        // Position of each kind=0 import within this object's imports
+        // list — equals the input-side function index for that import,
+        // which is also the key into `parsed.function_names` for the
+        // LLVM-level symbol name (e.g. `f0` when the import field is
+        // `something` via `wasm-import-name`). Counted as we walk so
+        // the per-import lookup is O(1).
+        let mut input_func_imp_idx: u32 = 0;
+        // Same idea for kind=3 imports, used to look up global symbols
+        // by their input-side global-import index.
+        let mut input_global_imp_idx: u32 = 0;
         for imp in &obj_info.parsed.imports {
             // Skip memory imports (we define our own memory).
             if imp.kind == 2 {
@@ -4360,10 +8010,12 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             }
             // Skip function imports that are resolved by a definition.
             if imp.kind == 0 && function_name_map.contains_key(imp.field.as_slice()) {
+                input_func_imp_idx += 1;
                 continue;
             }
             // Skip global imports that are resolved by linker-defined globals.
             if imp.kind == 3 && global_name_map.contains_key(imp.field.as_slice()) {
+                input_global_imp_idx += 1;
                 continue;
             }
             // Dedup: same module+field+kind+type are merged, different types kept.
@@ -4374,6 +8026,11 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 imp.type_index,
             );
             if !seen_imports.insert(key) {
+                if imp.kind == 0 {
+                    input_func_imp_idx += 1;
+                } else if imp.kind == 3 {
+                    input_global_imp_idx += 1;
+                }
                 continue;
             }
             match imp.kind {
@@ -4389,7 +8046,35 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                         field: imp.field.clone(),
                         kind: ImportKind::Function(remapped_type),
                     });
+                    // Record this import's LLVM-level symbol name +
+                    // pre-shift wasm slot. Inserted into
+                    // `function_name_map` *after* the post-pass-4
+                    // shift loop so the value isn't double-shifted by
+                    // `num_imported_functions`. Source: an UNDEFINED
+                    // function symbol pointing at this input's
+                    // function-import index (the EXPLICIT_NAME case —
+                    // e.g. `f0` for an import whose field is
+                    // `something` via `wasm-import-name`).
+                    // `parsed.function_names` is keyed by
+                    // local-after-imports index, so it can't supply
+                    // import names — only the linking section can.
+                    let import_wasm_idx = num_imported_functions;
+                    if let Some(name) = obj_info
+                        .parsed
+                        .symbols
+                        .iter()
+                        .find(|s| {
+                            s.kind == 0
+                                && (s.flags & 0x10) != 0
+                                && s.index == input_func_imp_idx
+                                && !s.name.is_empty()
+                        })
+                        .map(|s| s.name.clone())
+                    {
+                        import_function_name_map.push((name, import_wasm_idx));
+                    }
                     num_imported_functions += 1;
+                    input_func_imp_idx += 1;
                 }
                 3 => {
                     // Pass 1.75 internalises GOT.* imports whenever the
@@ -4403,6 +8088,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                             || imp.module == b"GOT.mem"
                             || imp.module == b"GOT.data")
                     {
+                        input_global_imp_idx += 1;
                         continue;
                     }
                     if static_pic
@@ -4410,6 +8096,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                             || imp.field == b"__table_base"
                             || imp.field == b"__tls_base")
                     {
+                        input_global_imp_idx += 1;
                         continue;
                     }
                     let valtype = (imp.type_index >> 1) as u8;
@@ -4419,7 +8106,28 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                         field: imp.field.clone(),
                         kind: ImportKind::Global { valtype, mutable },
                     });
+                    // Record the LLVM-level global symbol name for
+                    // GlobalNames subsection emission. Global symbols
+                    // (kind=2) carry the local name (e.g. `g1`) while
+                    // the import field carries the wasm import name
+                    // (e.g. `g`).
+                    let import_wasm_idx = num_imported_globals;
+                    if let Some(name) = obj_info
+                        .parsed
+                        .symbols
+                        .iter()
+                        .find(|s| {
+                            s.kind == 2
+                                && (s.flags & 0x10) != 0
+                                && s.index == input_global_imp_idx
+                                && !s.name.is_empty()
+                        })
+                        .map(|s| s.name.clone())
+                    {
+                        import_global_name_map.push((name, import_wasm_idx));
+                    }
                     num_imported_globals += 1;
+                    input_global_imp_idx += 1;
                 }
                 _ => {
                     // Table imports etc — skip for now.
@@ -4618,6 +8326,12 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         }
         // `func_to_table_index` keys are the pre-shift funcidxs that
         // deferred TABLE_INDEX relocs already patched against; leave it.
+    }
+    // Now record import function names (pre-shift indices, since the
+    // shift only applies to defined-function entries above). These
+    // surface in the `name` custom section's FunctionNames subsection.
+    for (name, idx) in import_function_name_map {
+        function_name_map.entry(name).or_insert(idx);
     }
 
     // Similarly for imported globals.
@@ -4829,6 +8543,11 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         }
     }
 
+    let weak_function_names: std::collections::HashSet<Vec<u8>> = function_is_weak
+        .iter()
+        .filter(|(_, w)| **w)
+        .map(|(n, _)| n.clone())
+        .collect();
     Ok(MergedModule {
         types,
         functions,
@@ -4836,6 +8555,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         function_name_map,
         explicit_export_indices,
         hidden_functions: function_is_hidden,
+        weak_function_names,
         no_strip_indices,
         exported_indices,
         table_entries,
@@ -4865,10 +8585,718 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         tag_name_map,
         hidden_tags: tag_is_hidden,
         exported_tag_names: exported_tag_name_set,
+        import_global_names: {
+            // Reorder map → Vec at import-wasm-idx position. Holes
+            // (idx with no matching kind=2 UNDEF symbol) get an empty
+            // Vec, which causes the GlobalNames emitter to skip that
+            // slot rather than emit a blank entry.
+            let mut v = vec![Vec::new(); num_imported_globals as usize];
+            for (name, idx) in import_global_name_map {
+                if let Some(slot) = v.get_mut(idx as usize) {
+                    *slot = name;
+                }
+            }
+            v
+        },
     })
 }
 
 // --- Raw WASM binary parsing ---
+
+/// One row of the merged output's `linking` symbol table — same
+/// fields the wasm linking-section spec §4 records, threaded
+/// through `write_relocatable` so the data side carries enough
+/// context to re-emit the (segment, offset, size) tuple.
+#[derive(Debug, Clone)]
+struct SymEntry {
+    kind: u8,
+    name: Vec<u8>,
+    flags: u32,
+    /// For function/global/table/tag: the element index. For data:
+    /// also a flat element-id used by name-section emission.
+    index: u32,
+    /// DATA only: output segment index. 0 for non-data + undef-data.
+    segment: u32,
+    /// DATA only: byte offset within `segment`.
+    segment_offset: u32,
+    /// DATA only: symbol size. 0 for undef.
+    segment_size: u32,
+}
+
+/// Pre-pass result for the wasm `-r` path.
+struct PrePassResult {
+    /// Names that appear with mismatched function signatures across
+    /// files (one file imports `foo` with sig X, another defines it
+    /// with sig Y). Each entry's u32 is the *stub sig* — the import
+    /// side's sig that the trap stub will carry.
+    sig_mismatch_stubs: Vec<(Vec<u8>, u32)>,
+    /// Per-mismatch diagnostic data: for each name in
+    /// `sig_mismatch_stubs`, the import side's (sig, file path) and
+    /// the def side's (sig, file path). lld emits warnings of the
+    /// form `function signature mismatch: <name>` followed by two
+    /// `>>> defined as <sig> in <file>` lines. The resolved
+    /// signature index is into `tmp_types` (the pre-pass's local
+    /// dedup'd type table).
+    sig_mismatch_diagnostics: Vec<SigMismatchDiagnostic>,
+    /// Pre-pass type table (signatures keyed by the indices used in
+    /// `sig_mismatch_stubs` and `sig_mismatch_diagnostics`).
+    sig_mismatch_types: Vec<FuncType>,
+    /// Total function imports across all input files BEFORE elision.
+    total_input_func_imports: u32,
+    /// Approximate total defined functions in output (sum of inputs'
+    /// `parsed.functions.len()`). Sig-mismatch stubs and COMDAT skip
+    /// adjustments aren't accounted for here, so the count LEB sized
+    /// from this is an upper bound — sometimes one byte too wide,
+    /// never too narrow. Used to pick the count-LEB byte width up
+    /// front so reloc offsets land correctly.
+    approx_total_funcs: u32,
+    /// Same upper bound for the data section.
+    approx_total_segs: u32,
+    /// Highest table index reached by any active element segment
+    /// across all inputs. Drives the merged TABLE import's `Min`.
+    max_table_reach: u32,
+}
+
+/// One sig-mismatch finding: which symbol, the conflicting sigs
+/// from each side, and the file paths to surface in the warning.
+struct SigMismatchDiagnostic {
+    name: Vec<u8>,
+    import_sig: u32,
+    import_file: std::path::PathBuf,
+    def_sig: u32,
+    def_file: std::path::PathBuf,
+}
+
+/// Format a wasm valtype byte as a short string for diagnostics.
+fn valtype_str(b: u8) -> &'static str {
+    match b {
+        0x7F => "i32",
+        0x7E => "i64",
+        0x7D => "f32",
+        0x7C => "f64",
+        0x7B => "v128",
+        0x70 => "funcref",
+        0x6F => "externref",
+        _ => "?",
+    }
+}
+
+/// Format a `FuncType` as `(param0, param1, ...) -> result` matching
+/// lld's diagnostic style (`>>> defined as (i32, i64, i32) -> i32`).
+fn format_func_type(ty: &FuncType) -> String {
+    let params = ty
+        .params
+        .iter()
+        .map(|&b| valtype_str(b))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let results = if ty.results.is_empty() {
+        "void".to_string()
+    } else if ty.results.len() == 1 {
+        valtype_str(ty.results[0]).to_string()
+    } else {
+        format!(
+            "({})",
+            ty.results
+                .iter()
+                .map(|&b| valtype_str(b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!("({}) -> {}", params, results)
+}
+
+/// Emit lld-style sig-mismatch warnings to stderr, one per finding.
+/// Format matches `lld/wasm/SymbolTable.cpp` (Apache-2.0 with LLVM
+/// Exceptions): `function signature mismatch: <name>` followed by
+/// two `>>> defined as <sig> in <file>` lines (import side first,
+/// def side second).
+fn emit_sig_mismatch_warnings(diagnostics: &[SigMismatchDiagnostic], types: &[FuncType]) {
+    for d in diagnostics {
+        let isig_str = types
+            .get(d.import_sig as usize)
+            .map(format_func_type)
+            .unwrap_or_else(|| "?".to_string());
+        let dsig_str = types
+            .get(d.def_sig as usize)
+            .map(format_func_type)
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "wild: warning: function signature mismatch: {}\n>>> defined as {} in {}\n>>> defined as {} in {}",
+            String::from_utf8_lossy(&d.name),
+            isig_str,
+            d.import_file.display(),
+            dsig_str,
+            d.def_file.display(),
+        );
+    }
+}
+
+/// Pre-pass that walks every wasm input once to detect function
+/// names that appear with mismatched signatures across files (one
+/// file imports `foo` with sig X, another defines `foo` with sig Y).
+/// Such names need a synthesized trap stub in the output so the
+/// importer's call sites stay typecheckable; this helper just
+/// collects (name, stub_sig) pairs and the main pass uses them to
+/// elide the conflicting import + slot the stubs as the first
+/// defined functions, matching wasm-ld's layout.
+///
+/// Runs `parse_wasm_sections` once per input — the main pass
+/// re-parses, paying ~one extra parse per input for cleaner
+/// architecture. Order of returned pairs matches input order so the
+/// resulting stubs are deterministic.
+fn compute_sig_mismatch_stubs(layout: &Layout<'_, Wasm>) -> PrePassResult {
+    let mut tmp_types: Vec<FuncType> = Vec::new();
+    let mut first_def_sig: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    let mut first_def_file: std::collections::HashMap<Vec<u8>, std::path::PathBuf> =
+        Default::default();
+    // For imports we keep insertion order so the resulting stubs are
+    // deterministic across runs.
+    let mut first_import_sig: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut first_import_file: std::collections::HashMap<Vec<u8>, std::path::PathBuf> =
+        Default::default();
+    let mut import_seen: std::collections::HashSet<Vec<u8>> = Default::default();
+    let mut total_input_func_imports: u32 = 0;
+    let mut approx_total_funcs: u32 = 0;
+    let mut approx_total_segs: u32 = 0;
+    let mut max_table_reach: u32 = 0;
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+            let type_map = dedup_types_for_input(&parsed.types, &mut tmp_types);
+            total_input_func_imports += parsed.num_function_imports;
+            approx_total_funcs += parsed.functions.len() as u32;
+            approx_total_segs += parsed.data_segments.len() as u32;
+            max_table_reach = max_table_reach.max(parsed.elem_table_reach);
+
+            // Pre-collect kind=0 import field names so we can recover
+            // names for UNDEF function symbols whose linking-section
+            // entry omitted them (the standard encoding for
+            // non-explicit undefs).
+            let func_import_fields: Vec<&Vec<u8>> = parsed
+                .imports
+                .iter()
+                .filter(|i| i.kind == 0)
+                .map(|i| &i.field)
+                .collect();
+            for sym in &parsed.symbols {
+                if sym.kind != 0 || (sym.flags & 0x02) != 0 {
+                    continue;
+                }
+                let undef = (sym.flags & 0x10) != 0;
+                // Resolve the name. UNDEF function symbols without
+                // an explicit name pull the name from the matching
+                // import's field.
+                let name: Vec<u8> = if !sym.name.is_empty() {
+                    sym.name.clone()
+                } else if undef {
+                    match func_import_fields.get(sym.index as usize) {
+                        Some(f) => (*f).clone(),
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                };
+                let sig = if undef {
+                    let mut k0 = 0u32;
+                    let mut t = None;
+                    for imp in &parsed.imports {
+                        if imp.kind == 0 {
+                            if k0 == sym.index {
+                                t = Some(
+                                    type_map
+                                        .get(imp.type_index as usize)
+                                        .copied()
+                                        .unwrap_or(imp.type_index),
+                                );
+                                break;
+                            }
+                            k0 += 1;
+                        }
+                    }
+                    t
+                } else {
+                    let local_def_idx =
+                        sym.index.saturating_sub(parsed.num_function_imports) as usize;
+                    parsed.functions.get(local_def_idx).map(|f| {
+                        type_map
+                            .get(f.type_index as usize)
+                            .copied()
+                            .unwrap_or(f.type_index)
+                    })
+                };
+                let Some(sig) = sig else { continue };
+                let file_path = obj.input.file.filename.clone();
+                if undef {
+                    if import_seen.insert(name.clone()) {
+                        first_import_file.insert(name.clone(), file_path);
+                        first_import_sig.push((name, sig));
+                    }
+                } else if let std::collections::hash_map::Entry::Vacant(e) =
+                    first_def_sig.entry(name.clone())
+                {
+                    e.insert(sig);
+                    first_def_file.insert(name, file_path);
+                }
+            }
+        }
+    }
+
+    let mut sig_mismatch_stubs: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut sig_mismatch_diagnostics: Vec<SigMismatchDiagnostic> = Vec::new();
+    for (name, isig) in first_import_sig {
+        let Some(&dsig) = first_def_sig.get(&name) else {
+            continue;
+        };
+        if dsig == isig {
+            continue;
+        }
+        let import_file = first_import_file
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
+        let def_file = first_def_file.get(&name).cloned().unwrap_or_default();
+        sig_mismatch_diagnostics.push(SigMismatchDiagnostic {
+            name: name.clone(),
+            import_sig: isig,
+            import_file,
+            def_sig: dsig,
+            def_file,
+        });
+        sig_mismatch_stubs.push((name, isig));
+    }
+    PrePassResult {
+        sig_mismatch_stubs,
+        sig_mismatch_diagnostics,
+        sig_mismatch_types: tmp_types,
+        total_input_func_imports,
+        approx_total_funcs,
+        approx_total_segs,
+        max_table_reach,
+    }
+}
+
+/// Build the `linking` custom-section payload (the bytes that follow
+/// the section name in the WASM custom-section framing). Used by the
+/// `-r` emit path; future `--emit-relocs` support in `write_direct`
+/// will call the same helper. Includes the version preamble, the
+/// `WASM_SYMBOL_TABLE` subsection, and (when present) the
+/// `WASM_SEGMENT_INFO` subsection.
+fn build_linking_section_payload(
+    symbol_entries: &[SymEntry],
+    segment_names: &[Vec<u8>],
+    data_segments: &[(Vec<u8>, u32)],
+    comdat_groups: &[OutputComdatGroup],
+) -> Vec<u8> {
+    let mut link_data = Vec::new();
+    write_leb128(&mut link_data, 2); // version
+
+    // WASM_SYMBOL_TABLE (subsection 8).
+    let mut sym_payload = Vec::new();
+    write_leb128(&mut sym_payload, symbol_entries.len() as u32);
+    for e in symbol_entries {
+        sym_payload.push(e.kind);
+        write_leb128(&mut sym_payload, e.flags);
+        match e.kind {
+            0 | 2 => {
+                // FUNCTION / GLOBAL: index + name
+                write_leb128(&mut sym_payload, e.index);
+                if (e.flags & 0x10) == 0 || (e.flags & 0x40) != 0 {
+                    write_name(&mut sym_payload, &e.name);
+                }
+            }
+            1 => {
+                // DATA: name + (if defined: segment, offset, size)
+                write_name(&mut sym_payload, &e.name);
+                if (e.flags & 0x10) == 0 {
+                    write_leb128(&mut sym_payload, e.segment);
+                    write_leb128(&mut sym_payload, e.segment_offset);
+                    write_leb128(&mut sym_payload, e.segment_size);
+                }
+            }
+            _ => {
+                write_leb128(&mut sym_payload, e.index);
+                if (e.flags & 0x10) == 0 || (e.flags & 0x40) != 0 {
+                    write_name(&mut sym_payload, &e.name);
+                }
+            }
+        }
+    }
+    link_data.push(8);
+    write_leb128(&mut link_data, sym_payload.len() as u32);
+    link_data.extend_from_slice(&sym_payload);
+
+    // WASM_COMDAT_INFO (subsection 7) per spec §7.
+    if !comdat_groups.is_empty() {
+        let mut payload = Vec::new();
+        write_leb128(&mut payload, comdat_groups.len() as u32);
+        for g in comdat_groups {
+            write_name(&mut payload, &g.name);
+            write_leb128(&mut payload, 0); // flags (reserved)
+            write_leb128(&mut payload, g.entries.len() as u32);
+            for &(kind, idx) in &g.entries {
+                payload.push(kind);
+                write_leb128(&mut payload, idx);
+            }
+        }
+        link_data.push(7);
+        write_leb128(&mut link_data, payload.len() as u32);
+        link_data.extend_from_slice(&payload);
+    }
+
+    // WASM_SEGMENT_INFO (subsection 5).
+    if !segment_names.is_empty() {
+        let mut seg_payload = Vec::new();
+        write_leb128(&mut seg_payload, segment_names.len() as u32);
+        for (i, name) in segment_names.iter().enumerate() {
+            write_name(&mut seg_payload, name);
+            let align = data_segments.get(i).map(|(_, a)| *a).unwrap_or(1);
+            let align_log2 = if align > 1 { align.trailing_zeros() } else { 0 };
+            write_leb128(&mut seg_payload, align_log2);
+            write_leb128(&mut seg_payload, 0); // flags
+        }
+        link_data.push(5);
+        write_leb128(&mut link_data, seg_payload.len() as u32);
+        link_data.extend_from_slice(&seg_payload);
+    }
+    link_data
+}
+
+/// Build the payload bytes of a `reloc.<name>` custom section per
+/// spec §3: `section_index | count | { type, offset, sym, addend? }
+/// * count`. The addend is included for kinds where
+/// `reloc_has_addend` returns true. Returns the section payload
+/// bytes (the bytes that follow the section name).
+fn build_reloc_section_payload(target_section_index: u32, relocs: &[WasmReloc]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_leb128(&mut payload, target_section_index);
+    write_leb128(&mut payload, relocs.len() as u32);
+    for r in relocs {
+        payload.push(r.reloc_type);
+        write_leb128(&mut payload, r.offset);
+        write_leb128(&mut payload, r.symbol_index);
+        if reloc_has_addend(r.reloc_type) {
+            write_sleb128(&mut payload, r.addend);
+        }
+    }
+    payload
+}
+
+/// Build the `name` custom-section payload (function/global/data
+/// segment names). Pulls names from the merged symbol table so the
+/// caller doesn't have to re-walk inputs. Returns `None` when no
+/// non-empty names are present (the `-r` emitter then skips the
+/// section entirely).
+fn build_name_section_payload(
+    symbol_entries: &[SymEntry],
+    segment_names: &[Vec<u8>],
+) -> Option<Vec<u8>> {
+    // Per-function-index name picker: when multiple symbols share
+    // an output function index (a weak alias scenario, e.g.
+    // `alias_fn = direct_fn`), lld emits the STRONG (non-weak)
+    // name in the `name` custom section's FunctionNames subsection.
+    // Tie-break alphabetically so the output is deterministic
+    // when both candidates are equally strong.
+    let mut weak_names: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for e in symbol_entries {
+        if e.kind == 0 && (e.flags & 0x01) != 0 {
+            weak_names.insert(e.name.as_slice());
+        }
+    }
+
+    let mut function_names: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut global_names: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut per_func_idx_pick: std::collections::HashMap<u32, (Vec<u8>, bool)> = Default::default();
+    for e in symbol_entries {
+        if e.name.is_empty() {
+            continue;
+        }
+        match e.kind {
+            0 => {
+                let is_weak = weak_names.contains(e.name.as_slice());
+                let pick_new = match per_func_idx_pick.get(&e.index) {
+                    None => true,
+                    Some((existing, existing_weak)) => match (is_weak, *existing_weak) {
+                        (false, true) => true,             // strong beats weak
+                        (true, false) => false,            // keep strong
+                        _ => e.name.as_slice() < existing.as_slice(), // tie → alphabetical
+                    },
+                };
+                if pick_new {
+                    per_func_idx_pick.insert(e.index, (e.name.clone(), is_weak));
+                }
+            }
+            2 => global_names.push((e.index, e.name.clone())),
+            _ => {}
+        }
+    }
+    for (idx, (name, _)) in per_func_idx_pick {
+        function_names.push((idx, name));
+    }
+    // DataSegmentNames is keyed by SEGMENT index and uses the
+    // segment's own name (e.g. `.rodata.hello_str`), not a data
+    // symbol's name. lld builds it that way and obj2yaml prints
+    // exactly those bytes — using the symbol name here would
+    // compare unequal.
+    let data_names: Vec<(u32, Vec<u8>)> = segment_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as u32, n.clone()))
+        .collect();
+    function_names.sort_by_key(|(i, _)| *i);
+    function_names.dedup_by_key(|(i, _)| *i);
+    global_names.sort_by_key(|(i, _)| *i);
+    global_names.dedup_by_key(|(i, _)| *i);
+
+    if function_names.is_empty() && global_names.is_empty() && data_names.is_empty() {
+        return None;
+    }
+
+    let mut payload = Vec::new();
+    if !function_names.is_empty() {
+        let mut sub = Vec::new();
+        write_leb128(&mut sub, function_names.len() as u32);
+        for (idx, name) in &function_names {
+            write_leb128(&mut sub, *idx);
+            write_name(&mut sub, name);
+        }
+        payload.push(1);
+        write_leb128(&mut payload, sub.len() as u32);
+        payload.extend_from_slice(&sub);
+    }
+    if !global_names.is_empty() {
+        let mut sub = Vec::new();
+        write_leb128(&mut sub, global_names.len() as u32);
+        for (idx, name) in &global_names {
+            write_leb128(&mut sub, *idx);
+            write_name(&mut sub, name);
+        }
+        payload.push(7);
+        write_leb128(&mut payload, sub.len() as u32);
+        payload.extend_from_slice(&sub);
+    }
+    if !data_names.is_empty() {
+        let mut sub = Vec::new();
+        write_leb128(&mut sub, data_names.len() as u32);
+        for (idx, name) in &data_names {
+            write_leb128(&mut sub, *idx);
+            write_name(&mut sub, name);
+        }
+        payload.push(9);
+        write_leb128(&mut payload, sub.len() as u32);
+        payload.extend_from_slice(&sub);
+    }
+    Some(payload)
+}
+
+/// `.bss.*` classification, shared by the executable layout pass
+/// (`merge_inputs`) and the relocatable emit path. A segment whose
+/// name starts with `.bss` is zero-init data; in `-r` output ld
+/// elides bss content entirely (the final exec link allocates the
+/// real space). For unnamed segments fall back to "all-zero content"
+/// so we don't accidentally treat a real `.data.*` blob as bss.
+fn is_bss_segment(seg: &ParsedDataSegment) -> bool {
+    if !seg.name.is_empty() {
+        seg.name.starts_with(b".bss")
+    } else {
+        seg.data.iter().all(|&b| b == 0)
+    }
+}
+
+/// Append `input_types` into the merged `types` vector and return a
+/// per-input `type_map` that maps each input local type-index to its
+/// position in `types`. Identical FuncType signatures are coalesced
+/// — the spec doesn't require type uniqueness but obj2yaml + most
+/// runtimes prefer a deduplicated TYPE section. Shared by the
+/// executable layout and the `-r` emit path.
+fn dedup_types_for_input(input_types: &[FuncType], types: &mut Vec<FuncType>) -> Vec<u32> {
+    let mut type_map: Vec<u32> = Vec::with_capacity(input_types.len());
+    for input_type in input_types {
+        let output_idx = if let Some(pos) = types.iter().position(|t| t == input_type) {
+            pos as u32
+        } else {
+            let idx = types.len() as u32;
+            types.push(input_type.clone());
+            idx
+        };
+        type_map.push(output_idx);
+    }
+    type_map
+}
+
+/// One COMDAT group in the merged output's linking section. Each
+/// entry references the *output*-space index of a function, data
+/// segment, or tag. wasm-ld emits these so the next link step can
+/// re-validate group integrity.
+#[derive(Clone, Debug)]
+struct OutputComdatGroup {
+    name: Vec<u8>,
+    /// `(kind, output_index)` per spec §7: kind 0 = data segment,
+    /// 1 = function, 2 = section, 3 = tag.
+    entries: Vec<(u8, u32)>,
+}
+
+/// Compute the per-input COMDAT-skip sets — function/data/tag
+/// indices that belong to a duplicate group (one already claimed by
+/// an earlier input). Spec §7: first definition wins. `seen_groups`
+/// is threaded across calls so the "earlier input" view is global.
+/// Returned tuple matches the field order of `merge_inputs`'s
+/// `ObjectInfo`: (functions, data, tags).
+fn compute_comdat_skip_sets(
+    parsed: &ParsedInput,
+    seen_groups: &mut std::collections::HashSet<Vec<u8>>,
+) -> (
+    std::collections::HashSet<u32>,
+    std::collections::HashSet<u32>,
+    std::collections::HashSet<u32>,
+) {
+    let mut skip_functions: std::collections::HashSet<u32> = Default::default();
+    let mut skip_data: std::collections::HashSet<u32> = Default::default();
+    let mut skip_tags: std::collections::HashSet<u32> = Default::default();
+    for (group_name, entries) in &parsed.comdat_groups {
+        if !seen_groups.insert(group_name.clone()) {
+            for &(kind, index) in entries {
+                match kind {
+                    0 => {
+                        skip_data.insert(index);
+                    }
+                    1 => {
+                        skip_functions.insert(index);
+                    }
+                    3 => {
+                        skip_tags.insert(index);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (skip_functions, skip_data, skip_tags)
+}
+
+/// True for reloc kinds whose immediate encodes a TABLE index
+/// rather than a function index. TABLE indices aren't known until
+/// the merged ELEM segments are finalised, so the per-file walk
+/// skips these and a post-walk pass patches them once
+/// `func_to_table_slot` is built.
+fn reloc_is_table_index(reloc_type: u8) -> bool {
+    matches!(reloc_type, 1 | 2 | 17 | 18 | 19)
+}
+
+/// Partial reloc application: overwrite the LEB / SLEB / u32 / u64
+/// at `byte_offset` in `bytes` with `sym_addr + addend` (or just
+/// `sym_addr` for index-only relocs). Mirrors what wasm-ld does in
+/// `-r` mode — leaves the reloc entry in `reloc.CODE`/`reloc.DATA`
+/// for the next link step but pre-resolves the immediate so
+/// disassemblers can show the symbolic value. Returns `false` if
+/// the reloc kind isn't handled (the caller leaves the bytes alone).
+fn patch_reloc_immediate(
+    bytes: &mut [u8],
+    byte_offset: usize,
+    reloc_type: u8,
+    sym_addr: u32,
+    addend: i32,
+) -> bool {
+    let value_u32 = sym_addr.wrapping_add(addend as u32);
+    let value_i32 = value_u32 as i32;
+    match reloc_type {
+        // R_WASM_FUNCTION_INDEX_LEB
+        0 => write_padded_leb128(bytes, byte_offset, sym_addr),
+        // R_WASM_TABLE_INDEX_SLEB
+        1 => write_padded_sleb128(bytes, byte_offset, sym_addr as i32),
+        // R_WASM_TABLE_INDEX_I32 (u32 LE)
+        2 => write_u32_le(bytes, byte_offset, sym_addr),
+        // R_WASM_MEMORY_ADDR_LEB / SLEB / I32
+        3 => write_padded_leb128(bytes, byte_offset, value_u32),
+        4 => write_padded_sleb128(bytes, byte_offset, value_i32),
+        5 => write_u32_le(bytes, byte_offset, value_u32),
+        // R_WASM_TYPE_INDEX_LEB
+        6 => write_padded_leb128(bytes, byte_offset, sym_addr),
+        // R_WASM_GLOBAL_INDEX_LEB
+        7 => write_padded_leb128(bytes, byte_offset, sym_addr),
+        // R_WASM_FUNCTION_OFFSET_I32 / SECTION_OFFSET_I32
+        8 | 9 => write_u32_le(bytes, byte_offset, value_u32),
+        // R_WASM_TAG_INDEX_LEB
+        10 | 24 => write_padded_leb128(bytes, byte_offset, sym_addr),
+        // R_WASM_GLOBAL_INDEX_I32
+        13 => write_u32_le(bytes, byte_offset, sym_addr),
+        // R_WASM_MEMORY_ADDR_LEB64 / SLEB64 / I64 (memory64)
+        14 => write_padded_leb128_u64(bytes, byte_offset, value_u32 as u64),
+        15 => write_padded_sleb128_i64(bytes, byte_offset, value_i32 as i64),
+        16 => write_u64_le(bytes, byte_offset, value_u32 as u64),
+        // R_WASM_FUNCTION_INDEX_I32
+        20 => write_u32_le(bytes, byte_offset, sym_addr),
+        // R_WASM_TABLE_INDEX_SLEB64
+        18 => write_padded_sleb128_i64(bytes, byte_offset, sym_addr as i64),
+        // R_WASM_TABLE_INDEX_I64
+        19 => write_u64_le(bytes, byte_offset, sym_addr as u64),
+        // R_WASM_FUNCTION_OFFSET_I64
+        22 => write_u64_le(bytes, byte_offset, value_u32 as u64),
+        // R_WASM_MEMORY_ADDR_TLS_SLEB / SLEB64 / LOCREL_I32 / TLS_REL_SLEB
+        21 => write_padded_sleb128(bytes, byte_offset, value_i32),
+        25 => write_padded_sleb128_i64(bytes, byte_offset, value_i32 as i64),
+        27 => write_u32_le(bytes, byte_offset, value_u32),
+        _ => return false,
+    }
+    true
+}
+
+/// u32 little-endian write at `offset` — mirror of the LEB-padded
+/// helpers but for the fixed-width I32 reloc kinds.
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+    if offset + 4 <= bytes.len() {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// u64 little-endian write at `offset`.
+fn write_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
+    if offset + 8 <= bytes.len() {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Per-spec §3: which reloc kinds carry an addend in their on-disk
+/// encoding. Used by the `reloc.CODE` / `reloc.DATA` writer to decide
+/// whether to append an SLEB128 addend after the symbol-index field.
+///
+/// Reloc-type IDs match LLVM's `WasmRelocs.def`. The canonical
+/// "has-addend" set is mirrored from
+/// `llvm/lib/ObjectYAML/WasmEmitter.cpp::WriteRelocAddend`:
+/// MEMORY_ADDR_* (LEB/LEB64/SLEB/SLEB64/REL_SLEB/REL_SLEB64/I32/I64
+/// /TLS_SLEB/TLS_SLEB64/LOCREL_I32) + FUNCTION_OFFSET_I32/I64 +
+/// SECTION_OFFSET_I32. Note 23 = MEMORY_ADDR_LOCREL_I32 (NOT 27),
+/// and 11 = MEMORY_ADDR_REL_SLEB (32-bit PIC) — both required for
+/// the `--emit-relocs` path so obj2yaml's SLEB128 reader doesn't
+/// run off the end of `reloc.CODE`.
+fn reloc_has_addend(reloc_type: u8) -> bool {
+    matches!(
+        reloc_type,
+        // R_WASM_MEMORY_ADDR_LEB / SLEB / I32 / LEB64 / SLEB64 / I64
+        3 | 4 | 5 | 14 | 15 | 16
+        // R_WASM_MEMORY_ADDR_REL_SLEB / REL_SLEB64
+        | 11 | 17
+        // R_WASM_MEMORY_ADDR_TLS_SLEB / TLS_SLEB64
+        | 21 | 25
+        // R_WASM_MEMORY_ADDR_LOCREL_I32
+        | 23
+        // R_WASM_FUNCTION_OFFSET_I32 / I64
+        | 8 | 22
+        // R_WASM_SECTION_OFFSET_I32
+        | 9
+    )
+}
 
 /// Per-spec §2: relocation entry from a reloc.* section.
 #[derive(Debug, Clone)]
@@ -4894,6 +9322,8 @@ struct WasmSymbolInfo {
     segment_index: u32,
     /// For data symbols: offset within segment.
     segment_offset: u32,
+    /// For data symbols: byte size (defined only). 0 for undef.
+    segment_size: u32,
 }
 
 /// A user-defined global from the input object's GLOBAL section.
@@ -4909,8 +9339,15 @@ struct ParsedInputGlobal {
 struct ParsedImport {
     module: Vec<u8>,
     field: Vec<u8>,
-    kind: u8,        // 0=func, 1=table, 2=memory, 3=global
+    kind: u8,        // 0=func, 1=table, 2=memory, 3=global, 4=tag
     type_index: u32, // for functions: type index; for globals: encoded as valtype<<1|mutable
+    /// Raw bytes of the kind-specific encoding tail (after the kind
+    /// byte, before the next import). For table/memory, this lets
+    /// the `-r` writer pass them through verbatim without
+    /// reconstructing the limits encoding from a single u32. For
+    /// other kinds left empty — the writer reconstructs from
+    /// `type_index`.
+    kind_tail: Vec<u8>,
 }
 
 /// A parsed data segment from the input object.
@@ -4944,6 +9381,17 @@ struct ParsedInput {
     /// bytes; unresolved global/function references get the 0xFFFFFFFF
     /// sentinel convention.
     custom_relocations: std::collections::HashMap<Vec<u8>, Vec<WasmReloc>>,
+    /// Highest table index reached by any active element segment in
+    /// this input (`max(offset + count)`). Used by the `-r` writer
+    /// to widen the merged TABLE import's `Min` so it actually fits
+    /// every entry the inputs initialize. Zero when no active
+    /// element segments exist.
+    elem_table_reach: u32,
+    /// Active element segments declared in this input — `(offset,
+    /// function_indices_in_input_space)`. The `-r` writer remaps
+    /// each function index into the merged output's function-index
+    /// space and re-emits the segments.
+    element_segments: Vec<(u32, Vec<u32>)>,
     /// Local tag definitions: one entry per tag, value = type index.
     tags: Vec<u32>,
     /// Number of imported tags (offset for local tag indices).
@@ -5011,6 +9459,8 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
     let mut custom_sections: Vec<CustomSection> = Vec::new();
     let mut code_section_index: Option<usize> = None;
     let mut data_section_index: Option<usize> = None;
+    let mut elem_table_reach: u32 = 0;
+    let mut element_segments: Vec<(u32, Vec<u32>)> = Vec::new();
     let mut section_counter = 0usize;
     // Track custom sections' position in the section stream so reloc.*
     // sections targeting a custom section by index can resolve to its name.
@@ -5071,11 +9521,15 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                                 field: field_name.to_vec(),
                                 kind: 0,
                                 type_index: type_idx as u32,
+                                kind_tail: Vec::new(),
                             });
                             num_imports += 1;
                         }
                         0x01 => {
-                            // table
+                            // table import — preserve the full tail
+                            // (elem_type + limits) for verbatim
+                            // pass-through to the merged output.
+                            let tail_start = off;
                             off += 1; // elemtype
                             let (flags, c) = read_leb128(&payload[off..])?;
                             off += c;
@@ -5085,9 +9539,19 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                                 let (_max, c) = read_leb128(&payload[off..])?;
                                 off += c;
                             }
+                            parsed_imports.push(ParsedImport {
+                                module: module_name.to_vec(),
+                                field: field_name.to_vec(),
+                                kind: 1,
+                                type_index: 0,
+                                kind_tail: payload[tail_start..off].to_vec(),
+                            });
                         }
                         0x02 => {
-                            // memory
+                            // memory import — same verbatim tail
+                            // approach so memory64 limits and any
+                            // shared-memory flags pass through.
+                            let tail_start = off;
                             let (flags, c) = read_leb128(&payload[off..])?;
                             off += c;
                             if flags & 0x04 != 0 {
@@ -5099,6 +9563,13 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                                 let (_max, c) = read_leb128(&payload[off..])?;
                                 off += c;
                             }
+                            parsed_imports.push(ParsedImport {
+                                module: module_name.to_vec(),
+                                field: field_name.to_vec(),
+                                kind: 2,
+                                type_index: 0,
+                                kind_tail: payload[tail_start..off].to_vec(),
+                            });
                         }
                         0x03 => {
                             // global import
@@ -5113,6 +9584,7 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                                 field: field_name.to_vec(),
                                 kind: 3,
                                 type_index: ((valtype as u32) << 1) | (mutable as u32),
+                                kind_tail: Vec::new(),
                             });
                         }
                         0x04 => {
@@ -5128,6 +9600,7 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                                 field: field_name.to_vec(),
                                 kind: 4,
                                 type_index: type_idx as u32,
+                                kind_tail: Vec::new(),
                             });
                         }
                         _ => {}
@@ -5271,6 +9744,52 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                     tags.push(type_idx as u32);
                 }
             }
+            SECTION_ELEMENT => {
+                // Active mode-0 element segments only — the variants
+                // (passive, explicit-table, expression-based) need
+                // tighter parsing that this loop doesn't yet do.
+                // Wrap in a bounded helper so a malformed or
+                // unsupported segment doesn't take the whole link
+                // down: we lose reach data, but the rest of the
+                // input still parses.
+                let _ = (|| -> Option<()> {
+                    let (seg_count, mut eoff) = read_leb128(payload).ok()?;
+                    for _ in 0..seg_count {
+                        if eoff >= payload.len() {
+                            return Some(());
+                        }
+                        let mode = payload[eoff];
+                        eoff += 1;
+                        if mode != 0 {
+                            return Some(());
+                        }
+                        // Active mode 0: offset expr (i32.const N + end)
+                        // + funcref count + indices.
+                        if eoff >= payload.len() || payload[eoff] != 0x41 {
+                            return Some(());
+                        }
+                        eoff += 1;
+                        let (v, c) = read_leb128(&payload[eoff..]).ok()?;
+                        let const_val = v as u32;
+                        eoff += c;
+                        if eoff >= payload.len() || payload[eoff] != 0x0B {
+                            return Some(());
+                        }
+                        eoff += 1;
+                        let (count, c) = read_leb128(&payload[eoff..]).ok()?;
+                        eoff += c;
+                        elem_table_reach = elem_table_reach.max(const_val + count as u32);
+                        let mut indices: Vec<u32> = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            let (idx, c) = read_leb128(&payload[eoff..]).ok()?;
+                            eoff += c;
+                            indices.push(idx as u32);
+                        }
+                        element_segments.push((const_val, indices));
+                    }
+                    Some(())
+                })();
+            }
             _ => {}
         }
 
@@ -5305,6 +9824,8 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
         comdat_groups,
         input_globals,
         num_global_imports,
+        elem_table_reach,
+        element_segments,
         tags,
         num_tag_imports,
         import_tag_names,
@@ -5730,6 +10251,7 @@ fn parse_symbol_table_entries(data: &[u8], _num_imports: u32) -> Vec<WasmSymbolI
                     index: index as u32,
                     segment_index: 0,
                     segment_offset: 0,
+                    segment_size: 0,
                 });
             }
             1 => {
@@ -5741,7 +10263,7 @@ fn parse_symbol_table_entries(data: &[u8], _num_imports: u32) -> Vec<WasmSymbolI
                 let name = data[off..off + name_len].to_vec();
                 off += name_len;
 
-                let (segment_index, segment_offset) = if !is_undefined {
+                let (segment_index, segment_offset, segment_size) = if !is_undefined {
                     let Ok((seg, c)) = read_leb128(&data[off..]) else {
                         return syms;
                     };
@@ -5750,13 +10272,13 @@ fn parse_symbol_table_entries(data: &[u8], _num_imports: u32) -> Vec<WasmSymbolI
                         return syms;
                     };
                     off += c;
-                    let Ok((_, c)) = read_leb128(&data[off..]) else {
+                    let Ok((sz, c)) = read_leb128(&data[off..]) else {
                         return syms;
                     };
-                    off += c; // size
-                    (seg as u32, seg_off as u32)
+                    off += c;
+                    (seg as u32, seg_off as u32, sz as u32)
                 } else {
-                    (0, 0)
+                    (0, 0, 0)
                 };
 
                 syms.push(WasmSymbolInfo {
@@ -5766,6 +10288,7 @@ fn parse_symbol_table_entries(data: &[u8], _num_imports: u32) -> Vec<WasmSymbolI
                     index: 0,
                     segment_index,
                     segment_offset,
+                    segment_size,
                 });
             }
             3 => {
@@ -5781,6 +10304,7 @@ fn parse_symbol_table_entries(data: &[u8], _num_imports: u32) -> Vec<WasmSymbolI
                     index: section as u32,
                     segment_index: 0,
                     segment_offset: 0,
+                    segment_size: 0,
                 });
             }
             _ => return syms,
@@ -6319,6 +10843,23 @@ fn leb128_len(mut value: u32) -> usize {
     n
 }
 
+/// Byte count of `write_sleb128(value)` — mirrors that loop without
+/// allocating. Used to size the i32.const offset expression in
+/// `-r` data-segment framing so reloc offsets stay consistent with
+/// what the emitter actually writes.
+fn sleb128_len(mut value: i32) -> usize {
+    let mut n = 0;
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        n += 1;
+        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+        if done {
+            return n;
+        }
+    }
+}
+
 /// Write an unsigned LEB128 value.
 fn write_leb128<B: Buf>(out: &mut B, mut value: u32) {
     loop {
@@ -6559,6 +11100,61 @@ fn read_leb128(data: &[u8]) -> crate::error::Result<(usize, usize)> {
 /// - A feature USED by one input and DISALLOWED by another is a conflict.
 /// - Output carries `+` for every USED feature and `-` for every feature DISALLOWED by at least one
 ///   input that no input uses.
+/// True if any input object declares the `mutable-globals` target
+/// feature (prefix `+` or `=`). lld uses this to gate auto-export of
+/// linker-synthesized mutable globals (e.g. `__stack_pointer`,
+/// `__tls_base`) under `--export-dynamic`: without `mutable-globals`,
+/// the wasm runtime can't import a mutable global, so exporting one
+/// would produce a module that can't be instantiated.
+///
+/// See `lld/wasm/Writer.cpp::calculateExports` (Apache-2.0 with LLVM
+/// Exceptions): `if (!hasMutableGlobals && g->getGlobalType()->Mutable
+/// && !g->getFile() && !g->isExportedExplicit()) continue;`
+fn has_mutable_globals_feature(layout: &Layout<'_, Wasm>) -> bool {
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+            for cs in &parsed.custom_sections {
+                if cs.name != b"target_features" {
+                    continue;
+                }
+                let Ok((count, mut off)) = read_leb128(&cs.data) else {
+                    continue;
+                };
+                for _ in 0..count {
+                    if off >= cs.data.len() {
+                        break;
+                    }
+                    let prefix = cs.data[off];
+                    off += 1;
+                    let Ok((nlen, c)) = read_leb128(&cs.data[off..]) else {
+                        break;
+                    };
+                    off += c;
+                    if off + nlen > cs.data.len() {
+                        break;
+                    }
+                    let name = &cs.data[off..off + nlen];
+                    off += nlen;
+                    if (prefix == b'+' || prefix == b'=') && name == b"mutable-globals" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn merge_target_features<'a>(
     per_object_custom: impl IntoIterator<Item = &'a [CustomSection]>,
     shared_memory: bool,

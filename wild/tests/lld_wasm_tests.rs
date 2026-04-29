@@ -116,6 +116,68 @@ const KNOWN_PASSING: &[&str] = &[
     "duplicate-function-imports",
     "alias",
     "debug-undefined-fs",
+    // Wasm `--relocatable` output: minimal-but-correct shape for
+    // single-input fixtures landed 2026-04-27. `stack-pointer`
+    // exercises a TYPE/IMPORT/FUNCTION/MEMORY/CODE+reloc.CODE/
+    // linking/name pipeline and is the canary for that path.
+    "stack-pointer",
+    // Per-segment offset assignment + COMDAT data dedup landed
+    // 2026-04-27. `relocatable-comdat` verifies that
+    // non-COMDAT and COMDAT-grouped `.data.foo` segments coexist
+    // with the right cumulative-aligned offset on the second.
+    "relocatable-comdat",
+    // Partial reloc application landed 2026-04-27. Code/data body
+    // bytes have their LEB-encoded immediates overwritten with
+    // `sym_addr + addend` so disassemblers show the resolved value;
+    // the reloc entry is still preserved in `reloc.CODE` /
+    // `reloc.DATA` for the next link step. `reloc-addend` exercises
+    // the full pipeline: BSS-elided symbol address assignment,
+    // multi-reloc body patching, signed/unsigned LEB.
+    "reloc-addend",
+    // Sig-mismatch import elision + stub-first ordering landed
+    // 2026-04-27. Pre-pass detects cross-file mismatched function
+    // names; main pass elides the conflicting import, synthesizes
+    // a `unreachable; end` trap stub at the first defined slot,
+    // and renames the new symbol to `signature_mismatch:<name>`
+    // BINDING_LOCAL with reloc-target sentinel fixup.
+    "signature-mismatch-relocatable",
+    // Dynamic count-LEB sizing landed 2026-04-27. CODE/DATA
+    // section-content positions account for the count LEB's
+    // actual byte width (1 below 128 entries, 2 above), so reloc
+    // offsets stay correct when crossing the LEB boundary —
+    // exactly what `many-functions` exercises with 128 funcs.
+    "many-functions",
+    // The full `-r` integration fixture: TABLE imports passing
+    // through, ELEM section emission, table import min widening
+    // from element reach, type-table rebuild in usage order,
+    // import sort with TABLE before FUNCTION, data-segment
+    // classification (.rodata. before .data.), TABLE_INDEX_*
+    // post-walk patches, COMDAT subsection emission, and
+    // DataSegmentNames in the name section using actual segment
+    // names. Lots of architecture in one place — landed
+    // 2026-04-27.
+    "relocatable",
+    // `--emit-relocs` integration fixtures landed 2026-04-28.
+    // gather_emit_relocs walks the post-merge module to build a
+    // SymEntry list, demotes BSS-elided data symbols to UNDEF,
+    // and remaps code relocs through the function_name_map. The
+    // shared linking / reloc.CODE / reloc.DATA / reloc.<custom>
+    // emit helpers are wired into write_direct under
+    // `args.emit_relocs`. emit-relocs.s exercises the live-symbol
+    // path + .debug_info reloc tombstone for stripped funcs;
+    // emit-relocs-fpic.s exercises the PIC SLEB128 addend.
+    "emit-relocs",
+    "emit-relocs-fpic",
+    "weak-alias",
+    "fatal-warnings",
+    "signature-mismatch-weak",
+    "tls",
+    // Imports' LLVM-level symbol names are now propagated into the
+    // `name` custom section's FunctionNames / GlobalNames subsections
+    // (sourced from UNDEF function/global symbols with EXPLICIT_NAME).
+    // Lets `import-name`'s `f0`/`f1` and `duplicate-global-imports`'s
+    // `g1`/`g3`/`g4` show up where lld emits them.
+    "duplicate-global-imports",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
@@ -149,7 +211,6 @@ fn should_skip(content: &str, path: &Path) -> bool {
             "init-fini-no-gc"
                 | "export-name"
                 | "signature-mismatch-export"
-                | "import-name"
                 | "debuginfo"
                 // export-all now passes
                 | "debug-removed-fn"
@@ -312,13 +373,22 @@ struct TestContext {
 
 impl TestContext {
     /// Expand lit-style substitutions in a command string.
+    ///
+    /// `%t` matches lit's convention: `<work_dir>/<file_name>.tmp`,
+    /// so `%t.wasm` becomes `<work_dir>/<file_name>.tmp.wasm`. Some
+    /// fixtures (e.g. `weak-alias.s` line 104) check
+    /// `HeaderSecSizeEncodingLen: 2` which only fires when the
+    /// output basename in lld's `WASM_NAMES_MODULE` subsection is
+    /// long enough to push the name section past 128 bytes — using
+    /// the full filename (not just the stem) reproduces lit's
+    /// basename length so those CHECK lines hit.
     fn expand(&self, cmd: &str, test_path: &Path) -> String {
-        let stem = test_path.file_stem().unwrap().to_string_lossy();
+        let file_name = test_path.file_name().unwrap().to_string_lossy();
         let test_parent = test_path.parent().unwrap();
 
         let t_expanded = self
             .work_dir
-            .join(stem.as_ref())
+            .join(format!("{file_name}.tmp"))
             .to_string_lossy()
             .to_string();
         cmd.replace("%s", &test_path.to_string_lossy())
