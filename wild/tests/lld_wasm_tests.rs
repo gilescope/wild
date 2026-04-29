@@ -233,6 +233,11 @@ const KNOWN_PASSING: &[&str] = &[
     // `--max-memory` / `--shared-memory` (HAS_MAX / IS_SHARED flags).
     "memory-naming",
     "import-memory",
+    // `version.s` is just a header-format check via `llvm-readobj
+    // --file-headers`. wild emits a standard MVP header so the
+    // CHECK lines hit cleanly. (`version.test`, the `--version`-
+    // string check, stays skipped — wild doesn't print "LLD ...".)
+    "version.s",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
@@ -269,13 +274,21 @@ const KNOWN_PASSING_LTO: &[&str] = &[
 /// Check if this test should be skipped entirely.
 fn should_skip(content: &str, path: &Path) -> bool {
     // Known-passing tests override pattern-based skipping.
+    // Match either bare stem (`foo`) or stem with extension (`foo.s`) — the
+    // latter disambiguates duplicate stems like `version.s` (passes) vs.
+    // `version.test` (uses `--version`, not yet supported).
     let is_lto = path.to_string_lossy().contains("/lto/");
+    let known = if is_lto {
+        KNOWN_PASSING_LTO
+    } else {
+        KNOWN_PASSING
+    };
+    if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+        if known.contains(&file_name) {
+            return false;
+        }
+    }
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        let known = if is_lto {
-            KNOWN_PASSING_LTO
-        } else {
-            KNOWN_PASSING
-        };
         if known.contains(&stem) {
             return false;
         }
@@ -300,7 +313,7 @@ fn should_skip(content: &str, path: &Path) -> bool {
                 | "local-symbols"
                 | "name-section-mangling"
                 | "weak-undefined"
-                | "version"  // uses llvm-readobj
+                | "version"  // .test variant expects "LLD {{.+}}" from --version
                 | "data-segment-merging" // needs segment merging by name
                 | "dylink"   // needs full PIC GOT support
                 | "dylink-non-pie"
@@ -453,6 +466,9 @@ struct TestContext {
     llc: PathBuf,
     obj2yaml: PathBuf,
     filecheck: PathBuf,
+    llvm_readobj: PathBuf,
+    llvm_nm: PathBuf,
+    llvm_objdump: PathBuf,
     wild_bin: PathBuf,
     work_dir: PathBuf,
 }
@@ -533,9 +549,15 @@ fn rewrite_command(line: &str, ctx: &TestContext) -> String {
     let wild_cmd = format!("{} --target wasm32", ctx.wild_bin.display());
     result = result.replace("wasm-ld", &wild_cmd);
 
-    // Replace llvm tools with full paths
+    // Replace llvm tools with full paths.
+    // Order matters: longer-prefixed names (`llvm-readobj`, `llvm-objdump`,
+    // `llvm-nm`, `llvm-ar`, `llvm-mc`) before the bare `llc ` so we don't
+    // accidentally chop a tool name in half.
+    result = result.replace("llvm-readobj", &ctx.llvm_readobj.to_string_lossy());
+    result = result.replace("llvm-objdump", &ctx.llvm_objdump.to_string_lossy());
     result = result.replace("llvm-mc", &ctx.llvm_mc.to_string_lossy());
     result = result.replace("llvm-ar", &ctx.llvm_ar.to_string_lossy());
+    result = result.replace("llvm-nm", &ctx.llvm_nm.to_string_lossy());
     result = result.replace("obj2yaml", &ctx.obj2yaml.to_string_lossy());
     result = result.replace("FileCheck", &ctx.filecheck.to_string_lossy());
     // llc must be replaced AFTER llvm-mc to avoid partial match
@@ -666,6 +688,11 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
     let llc = find_llvm_tool("llc").unwrap_or_else(|| PathBuf::from("llc"));
     let obj2yaml = find_llvm_tool("obj2yaml").unwrap_or_else(|| PathBuf::from("obj2yaml"));
     let filecheck = find_llvm_tool("FileCheck").unwrap_or_else(|| PathBuf::from("FileCheck"));
+    let llvm_readobj =
+        find_llvm_tool("llvm-readobj").unwrap_or_else(|| PathBuf::from("llvm-readobj"));
+    let llvm_nm = find_llvm_tool("llvm-nm").unwrap_or_else(|| PathBuf::from("llvm-nm"));
+    let llvm_objdump =
+        find_llvm_tool("llvm-objdump").unwrap_or_else(|| PathBuf::from("llvm-objdump"));
 
     let wild_bin = wild_binary_path();
     let test_dir = lld_tests_dir();
@@ -678,9 +705,28 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
         llc,
         obj2yaml,
         filecheck,
+        llvm_readobj,
+        llvm_nm,
+        llvm_objdump,
         wild_bin,
         work_dir,
     });
+
+    // Pre-scan to find stems that occur in multiple variants
+    // (e.g. version.s / version.test): for those, use stem.ext as the
+    // test name so they're individually addressable.
+    let mut stem_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for entry in std::fs::read_dir(&test_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !matches!(ext, Some("s" | "ll" | "test")) {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            *stem_counts.entry(stem.to_string()).or_insert(0) += 1;
+        }
+    }
 
     for entry in std::fs::read_dir(&test_dir).unwrap() {
         let entry = entry.unwrap();
@@ -693,7 +739,12 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
         }
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let test_name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let test_name = if stem_counts.get(&stem).copied().unwrap_or(0) > 1 {
+            path.file_name().unwrap().to_string_lossy().to_string()
+        } else {
+            stem
+        };
         let skip = should_skip(&content, &path);
         let ctx = ctx.clone();
         let test_path = path.clone();

@@ -543,7 +543,16 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             "--no-check-features" => {}
             "-t" | "--trace" => {}
-            _ if arg.starts_with("-y") => {} // trace symbol
+            // `-y` and `--trace-symbol` accept a symbol either glued
+            // (`-yfoo`, `--trace-symbol=foo`) or space-separated
+            // (`-y foo`, `--trace-symbol foo` / `-trace-symbol foo`).
+            // The bare-flag forms must consume the next argument so a
+            // following symbol name isn't mistaken for a positional
+            // input file.
+            "-y" | "-trace-symbol" | "--trace-symbol" => {
+                iter.next();
+            }
+            _ if arg.starts_with("-y") => {} // -ysym (glued form)
             _ if arg.starts_with("--trace-symbol=") => {}
             _ if arg.starts_with("--wrap=") => {}
             "-wrap" | "--wrap" => {
