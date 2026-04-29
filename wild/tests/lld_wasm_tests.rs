@@ -178,6 +178,31 @@ const KNOWN_PASSING: &[&str] = &[
     // Lets `import-name`'s `f0`/`f1` and `duplicate-global-imports`'s
     // `g1`/`g3`/`g4` show up where lld emits them.
     "duplicate-global-imports",
+    // Strong override of a weak alias: when this file defines
+    // `alias_fn` strong, the merge picks it over the weak version
+    // from `Inputs/weak-alias.s`. Already worked — it was just
+    // hidden by the broad "weak-alias" content skip.
+    "weak-alias-overide",
+    // `func-attr` (already passing) emits a custom section with
+    // `<sym>@FUNCINDEX` payloads. `func-attr-tombstone` tests the
+    // GC'd-symbol tombstone case: when a symbol's function got
+    // discarded, the relocation payload becomes 0xFFFFFFFF. This
+    // is what the existing reloc-resolution code already does on
+    // the merge_inputs path.
+    "func-attr-tombstone",
+    // Verifies wild doesn't crash and merges sections correctly
+    // when `.debug_info` chunks together exceed 2 GB (post-merge
+    // size 2,348,810,248). Real test — uses `llvm-readobj
+    // --sections` to confirm the merged size. Skipped under the
+    // generic llvm-readobj guard but works because wild's debug
+    // section merging keeps each chunk's bytes intact.
+    "large-debug-section",
+    // `--import-table` now emits an `env.__indirect_function_table`
+    // import even when no function indices were added to the table
+    // (e.g. a `call_indirect` with no `.functype` registrations
+    // populating the table). Matches wasm-ld's min=1 default.
+    "import-table",
+    "import-table-explicit",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
@@ -224,7 +249,6 @@ fn should_skip(content: &str, path: &Path) -> bool {
                 | "rpath"    // needs shared lib rpath
                 | "tag-section"  // needs PIC nopic mode
                 | "merge-func-attr-section" // func_attr index remapping
-                | "func-attr-tombstone" // func_attr tombstone values
                 | "custom-section-align" // custom section alignment padding
                 | "debug-undefined-fs" // debug section reloc payloads
                 | "debuginfo-undefined-global" // debug section globals

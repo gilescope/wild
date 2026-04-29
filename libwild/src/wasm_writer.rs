@@ -8257,9 +8257,16 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         });
     }
 
-    // --import-table: add table import (spec §9.6).
-    if layout.symbol_db.args.import_table && !table_entries.is_empty() {
-        let table_size = table_entries.len() as u32 + 1;
+    // --import-table: add table import (spec §9.6). Emit even when
+    // `table_entries` is empty — call_indirect references the table
+    // by index regardless of whether anything was added to it, and
+    // wasm-ld emits a min=1 import in that case.
+    if layout.symbol_db.args.import_table {
+        let table_size = if table_entries.is_empty() {
+            1
+        } else {
+            table_entries.len() as u32 + 1
+        };
         output_imports.push(OutputImport {
             module: b"env".to_vec(),
             field: b"__indirect_function_table".to_vec(),
