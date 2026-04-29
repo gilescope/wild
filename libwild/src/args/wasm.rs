@@ -110,6 +110,14 @@ pub struct WasmArgs {
     pub(crate) opt_level: u8,
     /// Cross-input LTO configuration. See `wild-lto-plan.md` P4.
     pub(crate) lto: crate::lto::LtoConfig,
+    /// Bit-for-bit compatibility with wasm-ld. Off by default — wild
+    /// stays fast and skips outputs that lld emits unconditionally
+    /// even when no input references them (e.g. the full set of synth
+    /// layout globals under `--export-all`, the empty
+    /// `__wasm_call_ctors` stub when no ctors registered). Turn on
+    /// when a downstream consumer needs byte-identical output.
+    /// Mach-O has the analogous `-ld64_compat` flag.
+    pub(crate) lld_compat: bool,
 }
 
 impl Default for WasmArgs {
@@ -155,6 +163,7 @@ impl Default for WasmArgs {
             is_pic: false,
             opt_level: 0,
             lto: crate::lto::LtoConfig::default(),
+            lld_compat: false,
         }
     }
 }
@@ -542,6 +551,11 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                 }
             }
             "--no-check-features" => {}
+            // Bit-for-bit lld compatibility mode. Off by default; turn
+            // on when byte-identical output to wasm-ld matters. See
+            // the field doc on `WasmArgs::lld_compat`.
+            "--lld-compat" | "-lld_compat" => args.lld_compat = true,
+            "--no-lld-compat" | "-no_lld_compat" => args.lld_compat = false,
             "-t" | "--trace" => {}
             // `-y` and `--trace-symbol` accept a symbol either glued
             // (`-yfoo`, `--trace-symbol=foo`) or space-separated

@@ -244,6 +244,13 @@ const KNOWN_PASSING: &[&str] = &[
     // immediate (1 under `--page-size=1`, 65536 by default). Skipped
     // via the broad `llvm-objdump` content pattern.
     "page-size",
+    // `export-all.s` passes under `--lld-compat --export-all`: full
+    // synth-globals set (PIC bases, layout globals, `__wasm_first_page_end`,
+    // `__tls_base` last), `__wasm_call_ctors` stub, mutable-globals
+    // export gate suppressing `__stack_pointer`, BINDING_LOCAL
+    // functions excluded from auto-export, and lld's bespoke EXPORT
+    // ordering for the synth globals.
+    "export-all.s",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
@@ -550,8 +557,15 @@ fn do_split_file(content: &str, out_dir: &Path) -> Result<(), String> {
 fn rewrite_command(line: &str, ctx: &TestContext) -> String {
     let mut result = line.to_string();
 
-    // Replace wasm-ld with wild --target wasm32
-    let wild_cmd = format!("{} --target wasm32", ctx.wild_bin.display());
+    // Replace wasm-ld with wild --target wasm32 --lld-compat. The
+    // lld-compat flag turns on byte-for-byte parity behaviours that
+    // are wasteful in the common case (synthesising the full layout-
+    // globals set under `--export-all`, emitting an empty
+    // `__wasm_call_ctors` stub when no ctors registered, etc.). lld
+    // emits these unconditionally; wild only emits them when the
+    // flag is on. The fixtures here all expect lld's shape, so opt
+    // in for the whole suite.
+    let wild_cmd = format!("{} --target wasm32 --lld-compat", ctx.wild_bin.display());
     result = result.replace("wasm-ld", &wild_cmd);
 
     // Replace llvm tools with full paths.

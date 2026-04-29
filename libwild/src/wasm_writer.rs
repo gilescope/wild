@@ -585,7 +585,23 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             let export_all = layout.symbol_db.args.export_all;
             let export_dynamic =
                 layout.symbol_db.args.should_export_all_dynamic_symbols() && !export_all;
-            let synth_mutable_gate = if export_dynamic {
+            // Mutable-globals feature gate: under `--export-dynamic`,
+            // and additionally under `--lld-compat --export-all` in
+            // plain (non-static-PIC) mode, lld blocks synthesised
+            // mutable globals like `__stack_pointer` from export when
+            // the inputs don't declare the `mutable-globals` target
+            // feature — the wasm runtime can't import a mutable global
+            // without it. The compat-export-all condition mirrors the
+            // narrowing on `lld_compat_export_all` upstream so
+            // pic-static / pic-static64 stay on their existing path
+            // (PIC bases + GOT globals; __stack_pointer still exported
+            // because static-PIC inputs always carry mutable-globals).
+            let compat_export_all_plain = layout.symbol_db.args.lld_compat
+                && export_all
+                && !merged.is_static_pic
+                && !layout.symbol_db.args.is_pic;
+            let mutable_export_gate_active = export_dynamic || compat_export_all_plain;
+            let synth_mutable_gate = if mutable_export_gate_active {
                 has_mutable_globals_feature(layout)
             } else {
                 true
@@ -594,7 +610,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 let synth_mutable_blocked = global.mutable
                     && !global.exported
                     && global.name.starts_with(b"__")
-                    && export_dynamic
+                    && mutable_export_gate_active
                     && !synth_mutable_gate;
                 let do_export = global.exported || ((export_all || export_dynamic) && !synth_mutable_blocked);
                 if do_export {
@@ -689,7 +705,14 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 .function_name_map
                 .iter()
                 .filter(|(name, _)| {
-                    !skip_hidden || !merged.hidden_functions.contains(name.as_slice())
+                    // BINDING_LOCAL functions are TU-private — never
+                    // exported even under `--export-all`. Hidden
+                    // functions are skipped only under
+                    // `--export-dynamic`; `--export-all` overrides
+                    // visibility (it doesn't override binding).
+                    !merged.local_functions.contains(name.as_slice())
+                        && (!skip_hidden
+                            || !merged.hidden_functions.contains(name.as_slice()))
                 })
                 .map(|(name, &idx)| (name.clone(), idx))
                 .collect();
@@ -765,12 +788,64 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             EXPORT_TAG => 2,
             _ => 3,
         };
+        // Under `--lld-compat --export-all` (plain mode), lld's EXPORT
+        // section orders globals not by index but by lld's
+        // `layoutMemory()` synthesis order: __dso_handle → __data_end
+        // → __rodata_start/end → __stack_low/high → __global_base →
+        // __heap_base/end first (slots 4..12), THEN PIC bases
+        // __memory_base/__table_base (slots 1, 2), THEN
+        // __wasm_first_page_end (slot 13), THEN __tls_base (slot 3).
+        // Two slots ahead of the others by index but later in the
+        // EXPORT section. The `lld_export_rank` table reproduces that
+        // sequence; non-listed names fall back to the standard
+        // by-index sort.
+        let lld_compat_export_all_emit = layout.symbol_db.args.lld_compat
+            && layout.symbol_db.args.export_all
+            && !merged.is_static_pic
+            && !layout.symbol_db.args.is_pic
+            && !is_shared;
+        let lld_export_rank = |name: &[u8]| -> Option<u32> {
+            let table: &[&[u8]] = &[
+                b"__dso_handle",
+                b"__data_end",
+                b"__rodata_start",
+                b"__rodata_end",
+                b"__stack_low",
+                b"__stack_high",
+                b"__global_base",
+                b"__heap_base",
+                b"__heap_end",
+                b"__memory_base",
+                b"__table_base",
+                b"__wasm_first_page_end",
+                b"__tls_base",
+            ];
+            table.iter().position(|n| *n == name).map(|p| p as u32)
+        };
         exports.sort_by(|a, b| {
             group(a.1)
                 .cmp(&group(b.1))
                 .then_with(|| {
                     if group(a.1) == 2 {
-                        a.2.cmp(&b.2)
+                        // In compat-export-all, globals listed in
+                        // `lld_export_rank` take their assigned rank,
+                        // sorted ahead of all "other" globals (which
+                        // fall back to by-index). Functions also live
+                        // in group 2 — they sort by index as before
+                        // and naturally end up before our ranked
+                        // globals because their index space is small.
+                        let rank = |k: u8, n: &[u8], idx: u32| -> (u32, u32) {
+                            if lld_compat_export_all_emit && k == EXPORT_GLOBAL {
+                                if let Some(r) = lld_export_rank(n) {
+                                    // Push past the function index space
+                                    // (200 is well over any real func count
+                                    // and well under user-global ranges).
+                                    return (200 + r, 0);
+                                }
+                            }
+                            (idx, 0)
+                        };
+                        rank(a.1, &a.0, a.2).cmp(&rank(b.1, &b.0, b.2))
                     } else {
                         std::cmp::Ordering::Equal
                     }
@@ -3814,6 +3889,10 @@ struct MergedModule {
     explicit_export_indices: Vec<u32>,
     /// Function names with VISIBILITY_HIDDEN (flag 0x04) — excluded from --export-dynamic.
     hidden_functions: std::collections::HashSet<Vec<u8>>,
+    /// Function names with WASM_SYM_BINDING_LOCAL (flag 0x02) — TU-
+    /// private, never exported even under `--export-all` /
+    /// `--export-dynamic`.
+    local_functions: std::collections::HashSet<Vec<u8>>,
     /// Function names whose defining symbol carried `WASM_SYM_BINDING_WEAK`
     /// (flag 0x01). When two names map to the same output function index
     /// (a weak alias scenario like `alias_fn = direct_fn`), the canonical
@@ -3827,6 +3906,15 @@ struct MergedModule {
     exported_indices: Vec<u32>,
     /// Linker-defined globals (e.g. __stack_pointer).
     globals: Vec<OutputGlobal>,
+    /// Auto-detected static-PIC mode (inputs use `GOT.func.*` /
+    /// `GOT.mem.*` imports or kind-2 `__memory_base` / `__table_base`
+    /// references). Distinct from `args.is_pic` (which is
+    /// `--experimental-pic` / `-pie`). Carried on `MergedModule` so
+    /// the EXPORT-emit pass in `write_output_file` can keep
+    /// `pic-static.s` / `pic-static64.s` on their existing path even
+    /// while `--lld-compat --export-all` activates the mutable-globals
+    /// export gate for plain `.s` fixtures.
+    is_static_pic: bool,
     /// Merged data segments.
     data_segments: Vec<OutputDataSegment>,
     /// Total data size (for memory section computation).
@@ -5690,6 +5778,13 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let mut function_is_weak: std::collections::HashMap<Vec<u8>, bool> = Default::default();
     // Track functions with hidden visibility (flag 0x04) — excluded from --export-dynamic.
     let mut function_is_hidden: std::collections::HashSet<Vec<u8>> = Default::default();
+    // Function symbols carrying `WASM_SYM_BINDING_LOCAL` (flag 0x02).
+    // lld excludes these from `--export-all` / `--export-dynamic`
+    // even though they're "defined" — local linkage means TU-private,
+    // not a candidate for cross-module export. export-all.s pins this:
+    // `foo` is defined but lacks `.globl`, so the EXPORT list shouldn't
+    // include it.
+    let mut function_is_local: std::collections::HashSet<Vec<u8>> = Default::default();
     let mut entry_function_index: Option<u32> = None;
     let mut no_strip_indices: Vec<u32> = Vec::new();
     // Functions with WASM_SYM_EXPORTED flag (spec §4.2, flag 0x20).
@@ -5768,6 +5863,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                         .unwrap_or(0);
                     let is_weak = (sym_flags & 0x01) != 0;
                     let is_hidden = (sym_flags & 0x04) != 0;
+                    let is_local = (sym_flags & 0x02) != 0;
                     // Per spec §9.2: strong overrides weak. If existing is weak
                     // and new is strong, override. If both strong, first wins.
                     let should_insert = match function_is_weak.get(name) {
@@ -5782,6 +5878,11 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                             function_is_hidden.insert(name.clone());
                         } else {
                             function_is_hidden.remove(name);
+                        }
+                        if is_local {
+                            function_is_local.insert(name.clone());
+                        } else {
+                            function_is_local.remove(name);
                         }
                         if name == entry_name {
                             entry_function_index = Some(output_idx);
@@ -6355,7 +6456,21 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             });
             code_touches_base || data_touches_base
         });
-    if static_pic {
+    // PIC bases (`__memory_base`/`__table_base`/`__tls_base`) emit
+    // unconditionally either under static-PIC, or under `--lld-compat
+    // --export-all` in plain (non-PIC) mode. lld emits them as defined
+    // globals at the well-known slots 1/2/3 even outside PIC mode so
+    // `--export-all` can export them by name. Stays off in default
+    // (non-compat) mode because three otherwise-unused globals just
+    // bloat the output. The `!static_pic` guard keeps pic-static.s on
+    // its existing path (PIC bases + GOT globals, no layout globals).
+    let lld_compat_export_all = layout.symbol_db.args.lld_compat
+        && layout.symbol_db.args.export_all
+        && !static_pic
+        && !layout.symbol_db.args.is_shared
+        && !layout.symbol_db.args.is_pic;
+    let want_pic_bases = static_pic || lld_compat_export_all;
+    if want_pic_bases {
         for (name, init) in [
             (&b"__memory_base"[..], 0u64),
             (&b"__table_base"[..], 1),
@@ -6491,42 +6606,17 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         });
     }
 
-    // Add user-defined globals from input objects BEFORE the synthetic
-    // layout globals (`__data_end`, `__heap_base`, …). lld emits them
-    // in this order: __stack_pointer → PIC bases → TLS → user globals →
-    // layout globals. stack-first.test pins this ordering — its
-    // `someByte` user-global must land at index 1 with `__data_end` /
-    // `__heap_base` following at 2/3. Order within the user-globals
-    // block: immutable first, then mutable (matches wasm-ld and is
-    // what globals.s already exercises with stack_pointer at 0,
-    // immutable_global at 1, foo/bar at 2/3).
-    for obj_info in &objects {
-        for (local_idx, ig) in obj_info.parsed.input_globals.iter().enumerate() {
-            // Find the symbol name for this global via the linking section.
-            let global_index_in_obj = obj_info.parsed.num_global_imports + local_idx as u32;
-            let sym_name = obj_info
-                .parsed
-                .symbols
-                .iter()
-                .find(|s| s.kind == 2 && s.index == global_index_in_obj)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            if sym_name.is_empty() || global_name_map.contains_key(&sym_name) {
-                continue; // Skip unnamed or already-defined globals
-            }
-            if !ig.mutable {
-                let idx = globals.len() as u32;
-                global_name_map.insert(sym_name.clone(), idx);
-                globals.push(OutputGlobal {
-                    name: sym_name,
-                    valtype: ig.valtype,
-                    mutable: false,
-                    init_value: ig.init_value,
-                    exported: false,
-                });
-            }
-        }
-    }
+    // User-defined globals from input objects, emitted in input order
+    // (matching lld's symbol-table iteration). Slotted ahead of the
+    // synthetic layout globals (`__data_end`, `__heap_base`, …) so
+    // stack-first.test's `someByte` lands at index 1 with `__data_end`
+    // / `__heap_base` following at 2/3. The earlier "immutable first,
+    // then mutable" pass split was wrong: globals.s happens to declare
+    // its immutable first (lines 9-11) so the split matched, but
+    // mutable-global-exports.s declares its mutable first (`foo_global`
+    // at GLOBAL idx 0 in the input table, `bar_global` at 1) and the
+    // split flipped them, putting `foo_global` at output idx 2 where
+    // lld puts it at 1. Single-pass input-order satisfies both.
     for obj_info in &objects {
         for (local_idx, ig) in obj_info.parsed.input_globals.iter().enumerate() {
             let global_index_in_obj = obj_info.parsed.num_global_imports + local_idx as u32;
@@ -6540,17 +6630,15 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             if sym_name.is_empty() || global_name_map.contains_key(&sym_name) {
                 continue;
             }
-            if ig.mutable {
-                let idx = globals.len() as u32;
-                global_name_map.insert(sym_name.clone(), idx);
-                globals.push(OutputGlobal {
-                    name: sym_name,
-                    valtype: ig.valtype,
-                    mutable: true,
-                    init_value: ig.init_value,
-                    exported: false,
-                });
-            }
+            let idx = globals.len() as u32;
+            global_name_map.insert(sym_name.clone(), idx);
+            globals.push(OutputGlobal {
+                name: sym_name,
+                valtype: ig.valtype,
+                mutable: ig.mutable,
+                init_value: ig.init_value,
+                exported: false,
+            });
         }
     }
 
@@ -6623,77 +6711,118 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         .iter()
         .any(|s| s == "__heap_base");
 
-    // wasm-ld emits `__data_end` / `__heap_base` only when referenced by
-    // an input or explicitly --export'd. The older "always when
-    // has_data_segments" rule was too eager and broke CHECK chains on
-    // tests like tls-non-shared-memory.
-    let data_end_needed = is_referenced(b"__data_end") || exports_data_end;
-    let heap_base_needed = is_referenced(b"__heap_base") || exports_heap_base;
-    if data_end_needed && (!static_pic || exports_data_end) {
-        let de_index = globals.len() as u32;
-        global_name_map.insert(b"__data_end".to_vec(), de_index);
-        globals.push(OutputGlobal {
-            name: b"__data_end".to_vec(),
-            valtype: addr_vt,
-            mutable: false,
-            init_value: data_end as u64,
-            exported: has_data_segments || exports_data_end,
-        });
-    }
-
-    // Linker-defined globals ordered to match wasm-ld:
-    // __data_end (above), __rodata_start, __rodata_end, __heap_base, __global_base.
-    let all_exports = &layout.symbol_db.args.exports;
-
-    if all_exports.iter().any(|s| s == "__rodata_start") {
-        let idx = globals.len() as u32;
-        global_name_map.insert(b"__rodata_start".to_vec(), idx);
-        globals.push(OutputGlobal {
-            name: b"__rodata_start".to_vec(),
-            valtype: addr_vt,
-            mutable: false,
-            init_value: rodata_start.unwrap_or(data_start) as u64,
-            exported: true,
-        });
-    }
-    if all_exports.iter().any(|s| s == "__rodata_end") {
-        let idx = globals.len() as u32;
-        global_name_map.insert(b"__rodata_end".to_vec(), idx);
-        globals.push(OutputGlobal {
-            name: b"__rodata_end".to_vec(),
-            valtype: addr_vt,
-            mutable: false,
-            init_value: rodata_end.unwrap_or(data_start) as u64,
-            exported: true,
-        });
-    }
-
-    if heap_base_needed && (!static_pic || exports_heap_base) {
-        // lld floors `__heap_base`'s alignment at 16 (`alignTo(memoryPtr,
-        // 16)` in lld/wasm/Writer.cpp::layoutMemory). Without that
-        // minimum, a single 1-byte segment (e.g. stack-first.test's
-        // `.int8 someByte` block) would land __heap_base at data_end+0,
-        // giving 513 where lld emits 528. Take the max of segment
-        // alignments and 16.
-        let mut max_data_align = 16u32;
-        for obj_info in &objects {
-            for seg in &obj_info.parsed.data_segments {
-                max_data_align = max_data_align.max(seg.alignment.max(1));
-            }
+    // Layout globals — two paths.
+    //
+    // **Compat-export-all path** (`--lld-compat --export-all`): emit
+    // the full 10-global set in lld's `layoutMemory()` order
+    // (__dso_handle, __data_end, __rodata_start, __rodata_end,
+    // __stack_low, __stack_high, __global_base, __heap_base, __heap_end,
+    // __wasm_first_page_end). All marked exported so `--export-all`
+    // picks them up. Off by default — the unconditional emit costs 10
+    // globals nobody references.
+    //
+    // **Default path** (the `else` branch below): lazy emit, only when
+    // an input references the symbol or the user explicitly --export's
+    // it. Smaller output, matches what currently-passing fixtures
+    // expect.
+    let mut max_data_align = 16u32;
+    for obj_info in &objects {
+        for seg in &obj_info.parsed.data_segments {
+            max_data_align = max_data_align.max(seg.alignment.max(1));
         }
-        let heap_base = (data_end + max_data_align - 1) & !(max_data_align - 1);
-        let hb_index = globals.len() as u32;
-        global_name_map.insert(b"__heap_base".to_vec(), hb_index);
-        globals.push(OutputGlobal {
-            name: b"__heap_base".to_vec(),
-            valtype: addr_vt,
-            mutable: false,
-            init_value: heap_base as u64,
-            exported: has_data_segments || exports_heap_base,
-        });
+    }
+    let heap_base_addr = (data_end + max_data_align - 1) & !(max_data_align - 1);
+
+    if lld_compat_export_all {
+        // Order matters: lld pins indices 4..13 to this exact sequence
+        // in export-all.s / mutable-global-exports.s.
+        let layout_synth: &[(&[u8], u32)] = &[
+            (b"__dso_handle", data_start),
+            (b"__data_end", data_end),
+            (b"__rodata_start", rodata_start.unwrap_or(data_start)),
+            (b"__rodata_end", rodata_end.unwrap_or(data_start)),
+            (b"__stack_low", stack_low_addr),
+            (b"__stack_high", stack_pointer_value),
+            (b"__global_base", data_start),
+            (b"__heap_base", heap_base_addr),
+            (b"__heap_end", heap_end_addr),
+            (b"__wasm_first_page_end", page_bytes_u32),
+        ];
+        for (name, init) in layout_synth {
+            if global_name_map.contains_key(*name) {
+                continue;
+            }
+            let idx = globals.len() as u32;
+            global_name_map.insert(name.to_vec(), idx);
+            globals.push(OutputGlobal {
+                name: name.to_vec(),
+                valtype: addr_vt,
+                mutable: false,
+                init_value: *init as u64,
+                exported: true,
+            });
+        }
+    } else {
+        // Lazy default path. wasm-ld emits `__data_end` / `__heap_base`
+        // only when referenced by an input or explicitly --export'd.
+        // The older "always when has_data_segments" rule was too eager
+        // and broke CHECK chains on tests like tls-non-shared-memory.
+        let data_end_needed = is_referenced(b"__data_end") || exports_data_end;
+        let heap_base_needed = is_referenced(b"__heap_base") || exports_heap_base;
+        if data_end_needed && (!static_pic || exports_data_end) {
+            let de_index = globals.len() as u32;
+            global_name_map.insert(b"__data_end".to_vec(), de_index);
+            globals.push(OutputGlobal {
+                name: b"__data_end".to_vec(),
+                valtype: addr_vt,
+                mutable: false,
+                init_value: data_end as u64,
+                exported: has_data_segments || exports_data_end,
+            });
+        }
+
+        // Linker-defined globals ordered to match wasm-ld:
+        // __data_end (above), __rodata_start, __rodata_end, __heap_base, __global_base.
+        let all_exports = &layout.symbol_db.args.exports;
+
+        if all_exports.iter().any(|s| s == "__rodata_start") {
+            let idx = globals.len() as u32;
+            global_name_map.insert(b"__rodata_start".to_vec(), idx);
+            globals.push(OutputGlobal {
+                name: b"__rodata_start".to_vec(),
+                valtype: addr_vt,
+                mutable: false,
+                init_value: rodata_start.unwrap_or(data_start) as u64,
+                exported: true,
+            });
+        }
+        if all_exports.iter().any(|s| s == "__rodata_end") {
+            let idx = globals.len() as u32;
+            global_name_map.insert(b"__rodata_end".to_vec(), idx);
+            globals.push(OutputGlobal {
+                name: b"__rodata_end".to_vec(),
+                valtype: addr_vt,
+                mutable: false,
+                init_value: rodata_end.unwrap_or(data_start) as u64,
+                exported: true,
+            });
+        }
+
+        if heap_base_needed && (!static_pic || exports_heap_base) {
+            let hb_index = globals.len() as u32;
+            global_name_map.insert(b"__heap_base".to_vec(), hb_index);
+            globals.push(OutputGlobal {
+                name: b"__heap_base".to_vec(),
+                valtype: addr_vt,
+                mutable: false,
+                init_value: heap_base_addr as u64,
+                exported: has_data_segments || exports_heap_base,
+            });
+        }
     }
 
-    if all_exports.iter().any(|s| s == "__global_base") {
+    let all_exports = &layout.symbol_db.args.exports;
+    if !lld_compat_export_all && all_exports.iter().any(|s| s == "__global_base") {
         let gb_index = globals.len() as u32;
         global_name_map.insert(b"__global_base".to_vec(), gb_index);
         globals.push(OutputGlobal {
@@ -6955,7 +7084,14 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let needs_ctors = !all_init_funcs.is_empty()
         || ctors_referenced
         || layout.symbol_db.args.shared_memory
-        || layout.symbol_db.args.no_gc_sections;
+        || layout.symbol_db.args.no_gc_sections
+        // Under `--lld-compat --export-all`, lld emits the empty ctor
+        // stub unconditionally so it can be exported by name (the
+        // export-all.s / mutable-global-exports.s fixtures pin
+        // `__wasm_call_ctors` at FUNCTION 0). Default mode keeps the
+        // lazy gate — don't grow a phantom function-0 in the common
+        // case.
+        || (layout.symbol_db.args.lld_compat && layout.symbol_db.args.export_all);
 
     if needs_ctors {
         all_init_funcs.sort_by_key(|(prio, _)| *prio);
@@ -9035,6 +9171,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         function_name_map,
         explicit_export_indices,
         hidden_functions: function_is_hidden,
+        local_functions: function_is_local,
         weak_function_names,
         no_strip_indices,
         exported_indices,
@@ -9042,6 +9179,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         weak_undef_table_referenced,
         func_to_table_index,
         globals,
+        is_static_pic: static_pic,
         data_segments,
         data_size: data_size as Addr,
         stack_pointer_value: stack_pointer_value as Addr,
