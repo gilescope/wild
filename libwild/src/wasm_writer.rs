@@ -782,12 +782,6 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             0x01 /* table */ => 1,
             _ => 2,
         };
-        let kind_tiebreak = |k: u8| match k {
-            EXPORT_GLOBAL => 0,
-            EXPORT_FUNC => 1,
-            EXPORT_TAG => 2,
-            _ => 3,
-        };
         // Under `--lld-compat --export-all` (plain mode), lld's EXPORT
         // section orders globals not by index but by lld's
         // `layoutMemory()` synthesis order: __dso_handle → __data_end
@@ -850,7 +844,36 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                         std::cmp::Ordering::Equal
                     }
                 })
-                .then_with(|| kind_tiebreak(a.1).cmp(&kind_tiebreak(b.1)))
+                .then_with(|| {
+                    // Kind tiebreak. Default order is GLOBAL before
+                    // FUNCTION (matches `visibility-hidden.ll`'s
+                    // expected layout: GLOBAL `__stack_pointer` at idx
+                    // 0 precedes FUNCTION `objectDefault` at idx 1).
+                    // Under `--lld-compat --export-all`, lld flips it
+                    // — `__wasm_call_ctors` (FUNC 0) precedes
+                    // `__stack_pointer` (GLOBAL 0) in
+                    // mutable-global-exports.s's CHECK-ALL.
+                    let tb = if lld_compat_export_all_emit {
+                        |k: u8| -> u32 {
+                            match k {
+                                EXPORT_FUNC => 0,
+                                EXPORT_GLOBAL => 1,
+                                EXPORT_TAG => 2,
+                                _ => 3,
+                            }
+                        }
+                    } else {
+                        |k: u8| -> u32 {
+                            match k {
+                                EXPORT_GLOBAL => 0,
+                                EXPORT_FUNC => 1,
+                                EXPORT_TAG => 2,
+                                _ => 3,
+                            }
+                        }
+                    };
+                    tb(a.1).cmp(&tb(b.1))
+                })
                 .then_with(|| a.0.cmp(&b.0))
         });
 
@@ -8977,6 +9000,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let merged_tf_payload = merge_target_features(
         objects.iter().map(|o| o.parsed.custom_sections.as_slice()),
         layout.symbol_db.args.shared_memory,
+        &layout.symbol_db.args.extra_features,
     )?;
     if !merged_tf_payload.is_empty() {
         custom_section_index.insert(b"target_features".to_vec(), merged_custom_sections.len());
@@ -11730,6 +11754,19 @@ fn read_leb128(data: &[u8]) -> crate::error::Result<(usize, usize)> {
 /// Exceptions): `if (!hasMutableGlobals && g->getGlobalType()->Mutable
 /// && !g->getFile() && !g->isExportedExplicit()) continue;`
 fn has_mutable_globals_feature(layout: &Layout<'_, Wasm>) -> bool {
+    // `--extra-features=mutable-globals` (or `--features=mutable-globals`)
+    // satisfies the gate even when no input declares the feature in its
+    // target_features section. Matches lld: the user telling the
+    // linker "the runtime has it" is enough.
+    if layout
+        .symbol_db
+        .args
+        .extra_features
+        .iter()
+        .any(|f| f == "mutable-globals")
+    {
+        return true;
+    }
     for group in &layout.group_layouts {
         for file in &group.files {
             let FileLayout::Object(obj) = file else {
@@ -11777,11 +11814,24 @@ fn has_mutable_globals_feature(layout: &Layout<'_, Wasm>) -> bool {
 fn merge_target_features<'a>(
     per_object_custom: impl IntoIterator<Item = &'a [CustomSection]>,
     shared_memory: bool,
+    extra_features: &[String],
 ) -> crate::error::Result<Vec<u8>> {
     use std::collections::BTreeSet;
     let mut used: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut disallowed: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut saw_any = false;
+
+    // `--extra-features=NAME` (and `--features=NAME`) injects USED
+    // entries into the merged set even when no input declares them.
+    // Matches lld: the user telling the linker "the runtime supports
+    // this" should propagate to the output's target_features so
+    // downstream toolchain sees it.
+    if !extra_features.is_empty() {
+        saw_any = true;
+        for f in extra_features {
+            used.insert(f.as_bytes().to_vec());
+        }
+    }
 
     for obj in per_object_custom {
         for cs in obj {
@@ -12111,7 +12161,7 @@ mod tests {
     fn target_features_union_of_used() {
         let a = tf(&[(b'+', b"atomics"), (b'+', b"simd128")]);
         let b = tf(&[(b'+', b"atomics"), (b'+', b"bulk-memory")]);
-        let merged = merge_target_features([a.as_slice(), b.as_slice()], false).unwrap();
+        let merged = merge_target_features([a.as_slice(), b.as_slice()], false, &[]).unwrap();
         let mut got = parse_tf(&merged);
         got.sort();
         assert_eq!(
@@ -12128,7 +12178,7 @@ mod tests {
     fn target_features_disallowed_without_use_survives() {
         let a = tf(&[(b'+', b"simd128")]);
         let b = tf(&[(b'-', b"atomics")]);
-        let merged = merge_target_features([a.as_slice(), b.as_slice()], false).unwrap();
+        let merged = merge_target_features([a.as_slice(), b.as_slice()], false, &[]).unwrap();
         let mut got = parse_tf(&merged);
         got.sort_by(|(_, n1), (_, n2)| n1.cmp(n2));
         assert_eq!(
@@ -12141,7 +12191,7 @@ mod tests {
     fn target_features_conflict_errors() {
         let a = tf(&[(b'+', b"atomics")]);
         let b = tf(&[(b'-', b"atomics")]);
-        let err = merge_target_features([a.as_slice(), b.as_slice()], false)
+        let err = merge_target_features([a.as_slice(), b.as_slice()], false, &[])
             .expect_err("expected conflict error");
         let msg = format!("{err:?}");
         assert!(
@@ -12155,14 +12205,14 @@ mod tests {
         // '=' (0x3d) is the deprecated REQUIRED prefix; wild folds it into '+'.
         let a = tf(&[(b'=', b"multivalue")]);
         let b = tf(&[(b'-', b"multivalue")]);
-        merge_target_features([a.as_slice(), b.as_slice()], false)
+        merge_target_features([a.as_slice(), b.as_slice()], false, &[])
             .expect_err("'=' in one input and '-' in another must conflict");
     }
 
     #[test]
     fn target_features_empty_when_no_inputs_carry_section() {
         let empty: Vec<CustomSection> = Vec::new();
-        let payload = merge_target_features([empty.as_slice()], false).unwrap();
+        let payload = merge_target_features([empty.as_slice()], false, &[]).unwrap();
         assert!(payload.is_empty());
     }
 
@@ -12171,7 +12221,7 @@ mod tests {
         // An input that disallows atomics combined with --shared-memory
         // must error per spec §8.
         let a = tf(&[(b'-', b"atomics")]);
-        let err = merge_target_features([a.as_slice()], true)
+        let err = merge_target_features([a.as_slice()], true, &[])
             .expect_err("shared_memory + '-atomics' must error");
         let msg = format!("{err:?}");
         assert!(
@@ -12179,7 +12229,7 @@ mod tests {
             "unexpected error: {msg}"
         );
         // Same input without shared_memory is fine.
-        merge_target_features([a.as_slice()], false).unwrap();
+        merge_target_features([a.as_slice()], false, &[]).unwrap();
     }
 
     /// Encode a memory import with the given limits flag byte and a single

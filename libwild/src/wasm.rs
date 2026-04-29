@@ -448,6 +448,18 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             {
                 continue;
             }
+            // The object crate fabricates a defined kind-Data pseudo-
+            // symbol per entry of the wasm GLOBAL section (the wasm-
+            // ld view is "globals", not "data" — but `object` types
+            // them as Data with empty names). Multiple such symbols
+            // collide in the symbol_db's strong/strong duplicate
+            // check (same section_index, value, both empty names).
+            // The real linker-level names live in the linking section,
+            // which `parse_wasm_sections` handles downstream — so
+            // these object-crate fabrications are pure noise here.
+            if !sym.is_undefined() && name.is_empty() {
+                continue;
+            }
             let raw_section = sym.section_index().unwrap_or(object::SectionIndex(0));
             let mut section_index =
                 object::SectionIndex(section_index_map.get(&raw_section.0).copied().unwrap_or(0));

@@ -118,6 +118,13 @@ pub struct WasmArgs {
     /// when a downstream consumer needs byte-identical output.
     /// Mach-O has the analogous `-ld64_compat` flag.
     pub(crate) lld_compat: bool,
+    /// Names from `--extra-features=NAME[,…]` (and `--features=NAME`)
+    /// that signal "the runtime supports this even though no input
+    /// declares it." Currently consumed only by the mutable-globals
+    /// export gate: when `mutable-globals` is in here, synthesised
+    /// mutable globals like `__stack_pointer` are eligible for export
+    /// regardless of input target_features.
+    pub(crate) extra_features: Vec<String>,
 }
 
 impl Default for WasmArgs {
@@ -164,6 +171,7 @@ impl Default for WasmArgs {
             opt_level: 0,
             lto: crate::lto::LtoConfig::default(),
             lld_compat: false,
+            extra_features: Vec::new(),
         }
     }
 }
@@ -541,12 +549,21 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                     if feat == "+memory64" {
                         args.memory64 = true;
                     }
+                    // Strip leading `+`/`=` if present, store the bare name.
+                    let bare = feat.trim_start_matches(|c| c == '+' || c == '=');
+                    if !bare.is_empty() {
+                        args.extra_features.push(bare.to_string());
+                    }
                 }
             }
             _ if arg.starts_with("--extra-features=") => {
                 for feat in arg["--extra-features=".len()..].split(',') {
                     if feat == "+memory64" {
                         args.memory64 = true;
+                    }
+                    let bare = feat.trim_start_matches(|c| c == '+' || c == '=');
+                    if !bare.is_empty() {
+                        args.extra_features.push(bare.to_string());
                     }
                 }
             }

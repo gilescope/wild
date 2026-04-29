@@ -251,6 +251,11 @@ const KNOWN_PASSING: &[&str] = &[
     // functions excluded from auto-export, and lld's bespoke EXPORT
     // ordering for the synth globals.
     "export-all.s",
+    // Same machinery as export-all.s plus `--extra-features=mutable-globals`
+    // satisfies the mutable-globals gate (so `__stack_pointer` exports),
+    // and the stripped object-crate fabricated unnamed wasm-globals
+    // pseudo-symbols stop tripping the `duplicate symbol` check.
+    "mutable-global-exports",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
