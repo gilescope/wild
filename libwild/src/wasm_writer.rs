@@ -744,19 +744,38 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         // collected the explicit one first. lld implements the same
         // ordering implicitly via its DenseMap iteration over the
         // function-index space.
-        let kind_priority = |k: u8| match k {
+        // Memory and table pin the head of the section; everything else
+        // sorts by its own-namespace index regardless of kind, with the
+        // kind only acting as a tiebreaker. lld's behaviour: a GLOBAL
+        // at index 0 (e.g. `__stack_pointer` under `--export-dynamic`
+        // in visibility-hidden.ll) precedes a FUNCTION at index 1
+        // (`objectDefault`); a FUNCTION at 0 (`_start` in
+        // stack-first.test) precedes a GLOBAL at 1 (`someByte`). The
+        // older "all globals before all functions" sort got
+        // visibility-hidden right by accident but was wrong for any
+        // mixed-kind layout.
+        let group = |k: u8| match k {
             EXPORT_MEMORY => 0,
             0x01 /* table */ => 1,
-            EXPORT_GLOBAL => 2,
-            EXPORT_FUNC => 3,
-            EXPORT_TAG => 4,
-            _ => 5,
+            _ => 2,
         };
-        // Stable so memory's order is preserved (single entry anyway).
+        let kind_tiebreak = |k: u8| match k {
+            EXPORT_GLOBAL => 0,
+            EXPORT_FUNC => 1,
+            EXPORT_TAG => 2,
+            _ => 3,
+        };
         exports.sort_by(|a, b| {
-            kind_priority(a.1)
-                .cmp(&kind_priority(b.1))
-                .then_with(|| a.2.cmp(&b.2))
+            group(a.1)
+                .cmp(&group(b.1))
+                .then_with(|| {
+                    if group(a.1) == 2 {
+                        a.2.cmp(&b.2)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| kind_tiebreak(a.1).cmp(&kind_tiebreak(b.1)))
                 .then_with(|| a.0.cmp(&b.0))
         });
 
@@ -6472,6 +6491,121 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         });
     }
 
+    // Add user-defined globals from input objects BEFORE the synthetic
+    // layout globals (`__data_end`, `__heap_base`, …). lld emits them
+    // in this order: __stack_pointer → PIC bases → TLS → user globals →
+    // layout globals. stack-first.test pins this ordering — its
+    // `someByte` user-global must land at index 1 with `__data_end` /
+    // `__heap_base` following at 2/3. Order within the user-globals
+    // block: immutable first, then mutable (matches wasm-ld and is
+    // what globals.s already exercises with stack_pointer at 0,
+    // immutable_global at 1, foo/bar at 2/3).
+    for obj_info in &objects {
+        for (local_idx, ig) in obj_info.parsed.input_globals.iter().enumerate() {
+            // Find the symbol name for this global via the linking section.
+            let global_index_in_obj = obj_info.parsed.num_global_imports + local_idx as u32;
+            let sym_name = obj_info
+                .parsed
+                .symbols
+                .iter()
+                .find(|s| s.kind == 2 && s.index == global_index_in_obj)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            if sym_name.is_empty() || global_name_map.contains_key(&sym_name) {
+                continue; // Skip unnamed or already-defined globals
+            }
+            if !ig.mutable {
+                let idx = globals.len() as u32;
+                global_name_map.insert(sym_name.clone(), idx);
+                globals.push(OutputGlobal {
+                    name: sym_name,
+                    valtype: ig.valtype,
+                    mutable: false,
+                    init_value: ig.init_value,
+                    exported: false,
+                });
+            }
+        }
+    }
+    for obj_info in &objects {
+        for (local_idx, ig) in obj_info.parsed.input_globals.iter().enumerate() {
+            let global_index_in_obj = obj_info.parsed.num_global_imports + local_idx as u32;
+            let sym_name = obj_info
+                .parsed
+                .symbols
+                .iter()
+                .find(|s| s.kind == 2 && s.index == global_index_in_obj)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            if sym_name.is_empty() || global_name_map.contains_key(&sym_name) {
+                continue;
+            }
+            if ig.mutable {
+                let idx = globals.len() as u32;
+                global_name_map.insert(sym_name.clone(), idx);
+                globals.push(OutputGlobal {
+                    name: sym_name,
+                    valtype: ig.valtype,
+                    mutable: true,
+                    init_value: ig.init_value,
+                    exported: false,
+                });
+            }
+        }
+    }
+
+    // `--export=NAME` for a data symbol: lld synthesises an immutable
+    // wasm global whose init value is the symbol's output address (e.g.
+    // `--export=someByte` for a `.data.someByte` byte makes a global
+    // holding `0x200` under `--stack-first -z stack-size=512`). Skip
+    // names that are already a wasm global (input-defined or one of the
+    // synthesized ones the blocks below own — `__data_end`, `__heap_base`,
+    // `__rodata_*`, `__global_base`, the new `__dso_handle` /
+    // `__stack_low` / `__stack_high` / `__heap_end` /
+    // `__wasm_first_page_end`). The remaining names are pure data
+    // symbols that need their own global slot here, ahead of the layout
+    // globals so stack-first.test's `someByte`-at-index-1 ordering hits.
+    let layout_synth_names: &[&[u8]] = &[
+        b"__data_end",
+        b"__heap_base",
+        b"__rodata_start",
+        b"__rodata_end",
+        b"__global_base",
+        b"__dso_handle",
+        b"__stack_low",
+        b"__stack_high",
+        b"__heap_end",
+        b"__wasm_first_page_end",
+    ];
+    // Only run in static, non-shared mode. Shared/PIC links route data
+    // exports through GOT.mem / GOT.tls imports that get internalised
+    // later — synthesising a plain global here would collide with that
+    // path (the export ends up referencing the wrong global index in
+    // the merged global table). pic-empty.s exercised that breakage.
+    if !layout.symbol_db.args.is_shared && !layout.symbol_db.args.is_pic {
+        for export_name in &layout.symbol_db.args.exports {
+            let name_bytes = export_name.as_bytes();
+            if global_name_map.contains_key(name_bytes) {
+                continue;
+            }
+            if layout_synth_names.iter().any(|n| *n == name_bytes) {
+                continue;
+            }
+            let Some(&addr) = data_name_map.get(name_bytes) else {
+                continue;
+            };
+            let idx = globals.len() as u32;
+            global_name_map.insert(name_bytes.to_vec(), idx);
+            globals.push(OutputGlobal {
+                name: name_bytes.to_vec(),
+                valtype: addr_vt,
+                mutable: false,
+                init_value: addr as u64,
+                exported: true,
+            });
+        }
+    }
+
     // __data_end / __heap_base: only emitted when there are actual data segments
     // in the output (not BSS-only) or when explicitly exported.
     let data_end = data_start + data_size;
@@ -6535,7 +6669,13 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     }
 
     if heap_base_needed && (!static_pic || exports_heap_base) {
-        let mut max_data_align = 1u32;
+        // lld floors `__heap_base`'s alignment at 16 (`alignTo(memoryPtr,
+        // 16)` in lld/wasm/Writer.cpp::layoutMemory). Without that
+        // minimum, a single 1-byte segment (e.g. stack-first.test's
+        // `.int8 someByte` block) would land __heap_base at data_end+0,
+        // giving 513 where lld emits 528. Take the max of segment
+        // alignments and 16.
+        let mut max_data_align = 16u32;
         for obj_info in &objects {
             for seg in &obj_info.parsed.data_segments {
                 max_data_align = max_data_align.max(seg.alignment.max(1));
@@ -6563,62 +6703,6 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             init_value: data_start as u64,
             exported: true,
         });
-    }
-
-    // Add user-defined globals from input objects.
-    // Order: immutable globals first, then mutable (matching wasm-ld).
-    for obj_info in &objects {
-        for (local_idx, ig) in obj_info.parsed.input_globals.iter().enumerate() {
-            // Find the symbol name for this global via the linking section.
-            let global_index_in_obj = obj_info.parsed.num_global_imports + local_idx as u32;
-            let sym_name = obj_info
-                .parsed
-                .symbols
-                .iter()
-                .find(|s| s.kind == 2 && s.index == global_index_in_obj)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            if sym_name.is_empty() || global_name_map.contains_key(&sym_name) {
-                continue; // Skip unnamed or already-defined globals
-            }
-            if !ig.mutable {
-                let idx = globals.len() as u32;
-                global_name_map.insert(sym_name.clone(), idx);
-                globals.push(OutputGlobal {
-                    name: sym_name,
-                    valtype: ig.valtype,
-                    mutable: false,
-                    init_value: ig.init_value,
-                    exported: false,
-                });
-            }
-        }
-    }
-    for obj_info in &objects {
-        for (local_idx, ig) in obj_info.parsed.input_globals.iter().enumerate() {
-            let global_index_in_obj = obj_info.parsed.num_global_imports + local_idx as u32;
-            let sym_name = obj_info
-                .parsed
-                .symbols
-                .iter()
-                .find(|s| s.kind == 2 && s.index == global_index_in_obj)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            if sym_name.is_empty() || global_name_map.contains_key(&sym_name) {
-                continue;
-            }
-            if ig.mutable {
-                let idx = globals.len() as u32;
-                global_name_map.insert(sym_name.clone(), idx);
-                globals.push(OutputGlobal {
-                    name: sym_name,
-                    valtype: ig.valtype,
-                    mutable: true,
-                    init_value: ig.init_value,
-                    exported: false,
-                });
-            }
-        }
     }
 
     // --- Pass 1.75: internalise GOT.func.* / GOT.mem.* imports (PIC → static). ---

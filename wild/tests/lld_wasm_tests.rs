@@ -332,7 +332,6 @@ fn should_skip(content: &str, path: &Path) -> bool {
                 | "unresolved-symbols-dynamic" // --unresolved-symbols=import-dynamic
                 | "export-optional" // __start_/__stop_ section symbols
                 | "call-indirect" // type dedup across indirect calls
-                | "stack-first" // needs user-defined global exports
                 | "command-exports" // needs __indirect_function_table + complex exports
                 | "multi-table" // needs reference-types tables
         ) {
