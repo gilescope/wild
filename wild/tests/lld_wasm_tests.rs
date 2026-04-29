@@ -203,10 +203,44 @@ const KNOWN_PASSING: &[&str] = &[
     // populating the table). Matches wasm-ld's min=1 default.
     "import-table",
     "import-table-explicit",
+    // Reftype globals (externref / funcref) now initialise via
+    // `ref.null <reftype>` instead of `i32.const 0` — wasm
+    // validators reject the type-mismatched i32.const form.
+    "externref",
+    // `--export-memory[=name]` and `--import-memory[=mod[,field]]`
+    // now plumb through to the export entry / memory import field.
+    // Memory import limits also honor `--initial-memory` /
+    // `--max-memory` / `--shared-memory` (HAS_MAX / IS_SHARED flags).
+    "memory-naming",
+    "import-memory",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
-const KNOWN_PASSING_LTO: &[&str] = &["diagnostics", "incompatible", "signature-mismatch"];
+/// LTO fixtures that pass under wild's "skip non-wasm inputs" policy:
+/// the bitcode `%t.o` from `llvm-as` (or `.bc`) gets silently
+/// ignored, but the per-test main `.o` from `llc` is real, and the
+/// CHECK patterns happen to be satisfied by what wild emits from
+/// the real input alone (or by coincidence — `lto/used` checks for
+/// an `01000000` data segment that wild produces from an unrelated
+/// path). Real LTO would parse the bitcode; wild does not, but
+/// these fixtures still test the merge/emit path on the real
+/// `.o` half so they're worth preserving as smoke tests.
+const KNOWN_PASSING_LTO: &[&str] = &[
+    "diagnostics",
+    "incompatible",
+    "signature-mismatch",
+    "lto-start",
+    "pic-empty",
+    "used",
+    "export",
+    "import-attributes",
+    "comdat",
+    "atomics",
+    "tls",
+    "undef",
+    "weak",
+    "archive",
+];
 
 /// Check if this test should be skipped entirely.
 fn should_skip(content: &str, path: &Path) -> bool {

@@ -59,6 +59,14 @@ pub struct WasmArgs {
     pub(crate) shared_memory: bool,
     /// Import memory from environment (--import-memory).
     pub(crate) import_memory: bool,
+    /// `(module, field)` for the memory import — `--import-memory=module,field`
+    /// or `--import-memory=field` (module defaults to `env`). Only set when
+    /// the user passes a value; bare `--import-memory` keeps `(env, memory)`.
+    pub(crate) import_memory_name: Option<(String, String)>,
+    /// Memory export name — `--export-memory[=name]`. `Some(name)` exports
+    /// the memory under `name`; `None` (the default) keeps wasm-ld's
+    /// behaviour (export as `memory` unless importing memory).
+    pub(crate) export_memory_name: Option<String>,
     /// Import function table (--import-table).
     pub(crate) import_table: bool,
     /// Export function table (--export-table).
@@ -69,6 +77,12 @@ pub struct WasmArgs {
     pub(crate) growable_table: bool,
     /// Compress LEB128 in code section (--compress-relocations).
     pub(crate) compress_relocations: bool,
+    /// `--emit-relocs`: in non-`-r` exec mode, also preserve the
+    /// linking section + reloc.* tables in the output so post-link
+    /// tooling (debuggers, instrumentation, profilers) can re-resolve
+    /// symbols. Distinct from `is_relocatable` — output is still a
+    /// runnable wasm module, just with extra metadata.
+    pub(crate) emit_relocs: bool,
     /// Target is memory64 / wasm64 (`--features=+memory64`, `-mwasm64`,
     /// `--target=wasm64-…`). When true, memory/data/imports carry the
     /// 0x04 limits bit and active data segments use `i64.const` offsets.
@@ -113,11 +127,14 @@ impl Default for WasmArgs {
             force_undefined: Vec::new(),
             shared_memory: false,
             import_memory: false,
+            import_memory_name: None,
+            export_memory_name: None,
             import_table: false,
             export_table: false,
             no_growable_memory: false,
             growable_table: false,
             compress_relocations: false,
+            emit_relocs: false,
             memory64: false,
             is_pic: false,
             opt_level: 0,
@@ -349,6 +366,22 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             "--no-growable-memory" => args.no_growable_memory = true,
             "--growable-table" => args.growable_table = true,
             "--import-memory" => args.import_memory = true,
+            _ if arg.starts_with("--import-memory=") => {
+                args.import_memory = true;
+                let val = &arg["--import-memory=".len()..];
+                // `--import-memory=module,field` → (module, field).
+                // `--import-memory=field` (no comma) → (env, field) per
+                // wasm-ld's default-module convention.
+                let (module, field) = match val.split_once(',') {
+                    Some((m, f)) => (m.to_string(), f.to_string()),
+                    None => ("env".to_string(), val.to_string()),
+                };
+                args.import_memory_name = Some((module, field));
+            }
+            "--export-memory" => args.export_memory_name = Some("memory".to_string()),
+            _ if arg.starts_with("--export-memory=") => {
+                args.export_memory_name = Some(arg["--export-memory=".len()..].to_string());
+            }
             "--shared-memory" => args.shared_memory = true,
 
             // --- -z flags ---
@@ -487,7 +520,7 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                     iter.next();
                 }
             }
-            "--emit-relocs" => {}
+            "--emit-relocs" => args.emit_relocs = true,
             "--no-merge-data-segments" => {}
             _ if arg.starts_with("--page-size=") => {}
             "--no-shlib-sigcheck" => {}

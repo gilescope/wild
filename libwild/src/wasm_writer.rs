@@ -316,13 +316,35 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     payload.push(0x00); // no max
                     write_leb128(&mut payload, *min);
                 }
-                ImportKind::Memory { min, memory64 } => {
+                ImportKind::Memory {
+                    min,
+                    max,
+                    shared,
+                    memory64,
+                } => {
                     payload.push(0x02); // memory
-                    payload.push(if *memory64 { 0x04 } else { 0x00 }); // no max [+ mem64]
+                    // Limits flags: bit 0 = HAS_MAX, bit 1 = SHARED, bit 2 = mem64.
+                    let mut flags: u8 = 0;
+                    if max.is_some() {
+                        flags |= 0x01;
+                    }
+                    if *shared {
+                        flags |= 0x02;
+                    }
+                    if *memory64 {
+                        flags |= 0x04;
+                    }
+                    payload.push(flags);
                     if *memory64 {
                         write_leb128_u64(&mut payload, *min);
+                        if let Some(m) = max {
+                            write_leb128_u64(&mut payload, *m);
+                        }
                     } else {
                         write_leb128(&mut payload, *min as u32);
+                        if let Some(m) = max {
+                            write_leb128(&mut payload, *m as u32);
+                        }
                     }
                 }
                 ImportKind::Global { valtype, mutable } => {
@@ -453,7 +475,11 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         for global in &merged.globals {
             payload.push(global.valtype);
             payload.push(if global.mutable { 1 } else { 0 });
-            // Init expression: type-appropriate const + end
+            // Init expression: type-appropriate const + end.
+            // Reftypes (externref/funcref) initialise to ref.null
+            // <reftype> rather than i32.const 0 — `i32.const` would
+            // be a type mismatch on a reftype global and a wasm
+            // validator would reject the module.
             match global.valtype {
                 0x7D => {
                     // f32
@@ -469,6 +495,11 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     // i64
                     payload.push(0x42); // i64.const
                     write_sleb128_i64(&mut payload, global.init_value as i64);
+                }
+                0x6F | 0x70 => {
+                    // externref (0x6F) / funcref (0x70): ref.null <reftype>
+                    payload.push(0xD0); // ref.null
+                    payload.push(global.valtype);
                 }
                 _ => {
                     // i32 (0x7F) and others
@@ -488,9 +519,25 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         let mut payload = Vec::new();
         let mut exports: Vec<(Vec<u8>, u8, u32)> = Vec::new();
 
-        // Memory export (unless importing or shared).
-        if !layout.symbol_db.args.import_memory && !is_shared {
-            exports.push((b"memory".to_vec(), EXPORT_MEMORY, 0));
+        // Memory export. Default name is `memory`, overridden by
+        // `--export-memory=<name>`. wasm-ld also exports the memory
+        // when `--export-memory` is given even if memory is being
+        // imported (the `memory-naming.test` --both case), so the
+        // import gate only applies when no explicit export-memory
+        // name was set.
+        let export_memory_name = layout
+            .symbol_db
+            .args
+            .export_memory_name
+            .as_deref();
+        let export_memory = if export_memory_name.is_some() {
+            !is_shared
+        } else {
+            !layout.symbol_db.args.import_memory && !is_shared
+        };
+        if export_memory {
+            let name = export_memory_name.unwrap_or("memory").as_bytes().to_vec();
+            exports.push((name, EXPORT_MEMORY, 0));
         }
 
         // Linker-defined global exports (__stack_pointer, __data_end, __heap_base).
@@ -653,14 +700,40 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             }
         }
 
-        // Entry function export (after explicit exports).
-        if !entry_name.is_empty() {
-            if let Some(func_idx) = merged.entry_function_index {
-                if !exports.iter().any(|(n, _, _)| n == entry_name) {
-                    exports.push((entry_name.to_vec(), EXPORT_FUNC, func_idx));
-                }
-            }
+        // Entry function export.
+        if !entry_name.is_empty()
+            && let Some(func_idx) = merged.entry_function_index
+            && !exports.iter().any(|(n, _, _)| n == entry_name)
+        {
+            exports.push((entry_name.to_vec(), EXPORT_FUNC, func_idx));
         }
+
+        // Sort exports by (kind-priority, index, name) to match
+        // wasm-ld's EXPORT order. Memory/table come first (kind
+        // priorities pin them), then globals and functions sort by
+        // their index in the output. Two function exports at the
+        // same index sort by name (stable for aliases). This matters
+        // for fixtures like `name-section-mangling.s` where the
+        // entry export `_start` (idx 1) must come before the
+        // explicit `--export=_Z3fooi` (idx 2) even though wild
+        // collected the explicit one first. lld implements the same
+        // ordering implicitly via its DenseMap iteration over the
+        // function-index space.
+        let kind_priority = |k: u8| match k {
+            EXPORT_MEMORY => 0,
+            0x01 /* table */ => 1,
+            EXPORT_GLOBAL => 2,
+            EXPORT_FUNC => 3,
+            EXPORT_TAG => 4,
+            _ => 5,
+        };
+        // Stable so memory's order is preserved (single entry anyway).
+        exports.sort_by(|a, b| {
+            kind_priority(a.1)
+                .cmp(&kind_priority(b.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // --export-table: export the indirect function table.
         if layout.symbol_db.args.export_table && has_table {
@@ -3612,6 +3685,26 @@ struct OutputImport {
     kind: ImportKind,
 }
 
+/// Compute `(min_pages, max_pages)` for an `--import-memory` import,
+/// honoring `--initial-memory` / `--max-memory`. wasm-ld's behavior
+/// when neither is given: min=1, no max. Match that. When
+/// `--shared-memory` is on, lld also requires a max — falling back
+/// to min when the user didn't set one.
+fn compute_imported_memory_limits(args: &crate::args::wasm::WasmArgs) -> (u64, Option<u64>) {
+    let pages_from_bytes = |b: u64| ((b + 65535) / 65536).max(1);
+    let min = args
+        .initial_memory
+        .map(pages_from_bytes)
+        .unwrap_or(1);
+    let max = args.max_memory.map(pages_from_bytes);
+    let max = if args.shared_memory && max.is_none() {
+        Some(min)
+    } else {
+        max
+    };
+    (min, max)
+}
+
 enum ImportKind {
     Function(u32), // type index
     Table {
@@ -3619,6 +3712,8 @@ enum ImportKind {
     },
     Memory {
         min: u64,
+        max: Option<u64>,
+        shared: bool,
         memory64: bool,
     },
     Global {
@@ -3814,16 +3909,19 @@ fn compute_custom_section_index_in_output(merged: &MergedModule, name: &[u8]) ->
 /// inverse `func_to_table_index`), `init_memory_func_idx`, and the
 /// `call` / `return_call` / `ref.func` operands inside every body.
 ///
-/// Synth order matches lld's: ctors, init-memory, init-tls,
+/// Synth order matches lld's: ctors, init-tls, init-memory,
 /// apply-tls-relocs. Bodies' call operands resolve to whatever
 /// the synth functions land at after this pass — without it, the
 /// index encoded by `merge_inputs`'s synth-emit code (e.g.
 /// `__wasm_init_tls`'s `call <apply_idx>`) becomes stale.
+/// (lld assigns `__wasm_init_tls` before `__wasm_init_memory`
+/// in `Driver::createSyntheticSymbols` ordering — see
+/// `tls-init-symbols.s` which CHECKs that order.)
 fn reorder_synth_functions_first(merged: &mut MergedModule) {
     const SYNTH_NAMES: &[&[u8]] = &[
         b"__wasm_call_ctors",
-        b"__wasm_init_memory",
         b"__wasm_init_tls",
+        b"__wasm_init_memory",
         b"__wasm_apply_global_tls_relocs",
     ];
     let num_imports = merged.num_imported_functions;
@@ -8136,15 +8234,27 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         }
     }
 
-    // Non-PIC --import-memory: add an `env.memory` import instead of
-    // a local memory section. Skipped when `is_shared` because that
+    // Non-PIC --import-memory: add a memory import instead of a
+    // local memory section. Skipped when `is_shared` because that
     // branch below emits its own memory import plus the dylink globals.
+    // `--import-memory=module,field` (or `--import-memory=field` →
+    // `(env, field)`) overrides the default `(env, memory)`.
     if layout.symbol_db.args.import_memory && !layout.symbol_db.args.is_shared {
+        let (module, field) = layout
+            .symbol_db
+            .args
+            .import_memory_name
+            .as_ref()
+            .map(|(m, f)| (m.as_bytes().to_vec(), f.as_bytes().to_vec()))
+            .unwrap_or_else(|| (b"env".to_vec(), b"memory".to_vec()));
+        let (min, max) = compute_imported_memory_limits(layout.symbol_db.args);
         output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"memory".to_vec(),
+            module,
+            field,
             kind: ImportKind::Memory {
-                min: 1,
+                min,
+                max,
+                shared: layout.symbol_db.args.shared_memory,
                 memory64: layout.symbol_db.args.memory64,
             },
         });
@@ -8160,6 +8270,8 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             field: b"memory".to_vec(),
             kind: ImportKind::Memory {
                 min: 1,
+                max: None,
+                shared: false,
                 memory64: layout.symbol_db.args.memory64,
             },
         });
@@ -11961,6 +12073,8 @@ mod tests {
             field: b"memory".to_vec(),
             kind: ImportKind::Memory {
                 min: 3,
+                max: None,
+                shared: false,
                 memory64: true,
             },
         };
@@ -11970,9 +12084,24 @@ mod tests {
         write_name(&mut payload, &imp.module);
         write_name(&mut payload, &imp.field);
         match &imp.kind {
-            ImportKind::Memory { min, memory64 } => {
+            ImportKind::Memory {
+                min,
+                max,
+                shared,
+                memory64,
+            } => {
                 payload.push(0x02);
-                payload.push(if *memory64 { 0x04 } else { 0x00 });
+                let mut flags: u8 = 0;
+                if max.is_some() {
+                    flags |= 0x01;
+                }
+                if *shared {
+                    flags |= 0x02;
+                }
+                if *memory64 {
+                    flags |= 0x04;
+                }
+                payload.push(flags);
                 if *memory64 {
                     write_leb128_u64(&mut payload, *min);
                 } else {
