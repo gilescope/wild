@@ -6845,6 +6845,10 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     // Algorithm derived from `lld/wasm/SymbolTable.cpp::replaceWithUndefined`
     // (Apache-2.0 with LLVM Exceptions). Skipped under `-shared`/`-pie`
     // where weak undef is meant to be deferred to the dynamic linker.
+    // `--unresolved-symbols=ignore-all` / `--warn-unresolved-symbols`
+    // extend the stub treatment to all undef function symbols, not
+    // just weak ones.
+    let stub_all_undef = layout.symbol_db.args.stub_unresolved_functions;
     let weak_undef_stub_names: Vec<(Vec<u8>, u32)> = if !layout.symbol_db.args.is_shared
         && !layout.symbol_db.args.is_pic
     {
@@ -6858,7 +6862,10 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 }
                 let undef = (sym.flags & 0x10) != 0;
                 let weak = (sym.flags & 0x01) != 0;
-                if !undef || !weak {
+                if !undef {
+                    continue;
+                }
+                if !weak && !stub_all_undef {
                     continue;
                 }
                 let name: &[u8] = if !sym.name.is_empty() {

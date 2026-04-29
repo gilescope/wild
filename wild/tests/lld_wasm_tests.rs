@@ -553,6 +553,13 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
         return Err("no RUN lines found".into());
     }
 
+    // Track cwd across RUN lines — lit runs every RUN line in the
+    // same shell (chained with `;`), so `cd <dir>` in one line takes
+    // effect in the next. We mimic that by remembering the cwd from
+    // any cd-prefixed RUN line and applying it to subsequent
+    // invocations.
+    let mut current_cwd: Option<PathBuf> = None;
+
     for raw_line in &run_lines {
         let line = ctx.expand(raw_line, test_path);
 
@@ -591,8 +598,35 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
 
         let shell_cmd = rewrite_command(&shell_line, ctx);
 
-        let output = Command::new("sh")
-            .args(["-c", &shell_cmd])
+        // If the line is exactly `cd <dir>` (or starts with one and
+        // chains via `&&`/`;`), update `current_cwd` and continue —
+        // the shell would have just changed directory and exited.
+        // The chained form `cd %t && mkdir d` runs in a single sh
+        // (cd takes effect for mkdir), but the next RUN line gets a
+        // fresh sh; remembering the cwd makes it persist.
+        let trimmed = shell_cmd.trim();
+        if let Some(rest) = trimmed.strip_prefix("cd ") {
+            // Treat `cd X && rest` and `cd X; rest` as the
+            // multi-statement form — fall through to the spawn so
+            // the rest of the line still runs, but pre-set the cwd.
+            let (dir, _has_more) = match rest.split_once(" && ").or_else(|| rest.split_once("; ")) {
+                Some((d, _r)) => (d.trim(), true),
+                None => (rest.trim(), false),
+            };
+            current_cwd = Some(PathBuf::from(dir));
+            // Single-statement `cd X` is the common case in lit
+            // tests; nothing else to run.
+            if !rest.contains("&&") && !rest.contains(';') {
+                continue;
+            }
+        }
+
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &shell_cmd]);
+        if let Some(d) = &current_cwd {
+            cmd.current_dir(d);
+        }
+        let output = cmd
             .output()
             .map_err(|e| format!("sh exec: {e}"))?;
 
