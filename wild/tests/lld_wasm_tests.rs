@@ -238,6 +238,12 @@ const KNOWN_PASSING: &[&str] = &[
     // CHECK lines hit cleanly. (`version.test`, the `--version`-
     // string check, stays skipped — wild doesn't print "LLD ...".)
     "version.s",
+    // `--page-size=N` is wired through to the `__wasm_first_page_end`
+    // synth absolute symbol via `data_name_map`. The fixture does
+    // `i32.const __wasm_first_page_end` and FileChecks the resolved
+    // immediate (1 under `--page-size=1`, 65536 by default). Skipped
+    // via the broad `llvm-objdump` content pattern.
+    "page-size",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

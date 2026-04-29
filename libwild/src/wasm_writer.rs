@@ -321,9 +321,11 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     max,
                     shared,
                     memory64,
+                    page_size,
                 } => {
                     payload.push(0x02); // memory
-                    // Limits flags: bit 0 = HAS_MAX, bit 1 = SHARED, bit 2 = mem64.
+                    // Limits flags: bit 0 = HAS_MAX, bit 1 = SHARED, bit 2 = mem64,
+                    // bit 3 = HAS_PAGE_SIZE (custom-page-sizes proposal).
                     let mut flags: u8 = 0;
                     if max.is_some() {
                         flags |= 0x01;
@@ -333,6 +335,9 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     }
                     if *memory64 {
                         flags |= 0x04;
+                    }
+                    if page_size.is_some() {
+                        flags |= 0x08;
                     }
                     payload.push(flags);
                     if *memory64 {
@@ -345,6 +350,10 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                         if let Some(m) = max {
                             write_leb128(&mut payload, *m as u32);
                         }
+                    }
+                    if let Some(ps) = page_size {
+                        // Encoded as log2(bytes) per the proposal.
+                        write_leb128_u64(&mut payload, ps.trailing_zeros() as u64);
                     }
                 }
                 ImportKind::Global { valtype, mutable } => {
@@ -3715,12 +3724,27 @@ struct OutputImport {
 /// when neither is given: min=1, no max. Match that. When
 /// `--shared-memory` is on, lld also requires a max — falling back
 /// to min when the user didn't set one.
-fn compute_imported_memory_limits(args: &crate::args::wasm::WasmArgs) -> (u64, Option<u64>) {
-    let pages_from_bytes = |b: u64| ((b + 65535) / 65536).max(1);
+/// Pages required for an `--import-memory` import.
+///
+/// `default_min_bytes` is the layout-derived lower bound — what would be
+/// the local memory section's minimum if we were emitting one (data +
+/// stack [+ heap]). When `--initial-memory` isn't given we fall back to
+/// it instead of `1`, because page-size.s's `--import-memory
+/// --page-size=1` arm expects `Minimum: 0x10004` (= 65,540 bytes worth
+/// of 1-byte pages, not 1).
+///
+/// Page size for the arithmetic comes from `--page-size=N` (custom-page-
+/// sizes proposal) and falls back to 64 KiB.
+fn compute_imported_memory_limits(
+    args: &crate::args::wasm::WasmArgs,
+    default_min_bytes: u64,
+) -> (u64, Option<u64>) {
+    let page_bytes: u64 = args.page_size.unwrap_or(65536);
+    let pages_from_bytes = |b: u64| b.div_ceil(page_bytes).max(1);
     let min = args
         .initial_memory
         .map(pages_from_bytes)
-        .unwrap_or(1);
+        .unwrap_or_else(|| pages_from_bytes(default_min_bytes));
     let max = args.max_memory.map(pages_from_bytes);
     let max = if args.shared_memory && max.is_none() {
         Some(min)
@@ -3740,6 +3764,12 @@ enum ImportKind {
         max: Option<u64>,
         shared: bool,
         memory64: bool,
+        /// Custom page size in bytes (`--page-size=N`). `None` keeps the
+        /// 64 KiB default. When set, the limits flags gain HAS_PAGE_SIZE
+        /// (bit 3 = 0x08) and the encoded page size (`log2(bytes)`) is
+        /// appended after min/max — same wire format as the local memory
+        /// section emit at the top of `write_direct`.
+        page_size: Option<u64>,
     },
     Global {
         valtype: u8,
@@ -6153,6 +6183,19 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let data_end_addr = data_offset;
     data_name_map.insert(b"__data_end".to_vec(), data_end_addr);
     data_name_map.insert(b"__heap_base".to_vec(), data_end_addr);
+    // lld's other synthetic absolute data symbols. An input that does
+    // `i32.const __dso_handle` (etc.) emits an undefined kind-1 data
+    // symbol; the reloc-resolution pass below looks it up here. Values
+    // match lld/wasm/Writer.cpp::layoutMemory (`__dso_handle` and
+    // `__global_base` both land at `dataStart`; `__wasm_first_page_end`
+    // is just the active page size, so it tracks `--page-size=N`).
+    // Stack-pointer-dependent ones (`__stack_low`, `__stack_high`,
+    // `__heap_end`) are inserted further down once stack_pointer_value
+    // is computed.
+    data_name_map.insert(b"__dso_handle".to_vec(), data_start);
+    data_name_map.insert(b"__global_base".to_vec(), data_start);
+    let page_bytes_u32 = layout.symbol_db.args.page_size.unwrap_or(65536) as u32;
+    data_name_map.insert(b"__wasm_first_page_end".to_vec(), page_bytes_u32);
 
     let data_size = if data_offset > data_start {
         data_offset - data_start
@@ -6181,6 +6224,32 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         let aligned_data_end = (data_offset + 15) & !15;
         aligned_data_end + stack_size
     };
+    // Stack-pointer-dependent absolute data symbols. lld uses these
+    // values:
+    //   __stack_low  = stack region bottom (0 under --stack-first,
+    //                  16-aligned data_end under --no-stack-first)
+    //   __stack_high = stack region top = __stack_pointer init value
+    //   __heap_end   = top of linear memory = pages * page_size
+    // Inserted here so any input doing `i32.const __stack_low` (etc.)
+    // resolves to the right value via `data_name_map` further below.
+    let stack_low_addr = if stack_first {
+        0u32
+    } else {
+        (data_offset + 15) & !15
+    };
+    data_name_map.insert(b"__stack_low".to_vec(), stack_low_addr);
+    data_name_map.insert(b"__stack_high".to_vec(), stack_pointer_value);
+    let initial_heap_u64 = layout.symbol_db.args.initial_heap.unwrap_or(0);
+    let total_memory_bytes_u64: u64 = if stack_first {
+        stack_size as u64 + (data_offset.saturating_sub(data_start)) as u64 + initial_heap_u64
+    } else {
+        stack_pointer_value as u64 + initial_heap_u64
+    };
+    let pages_for_heap_end = total_memory_bytes_u64
+        .div_ceil(page_bytes_u32 as u64)
+        .max(1);
+    let heap_end_addr = (pages_for_heap_end * page_bytes_u32 as u64) as u32;
+    data_name_map.insert(b"__heap_end".to_vec(), heap_end_addr);
     // Forward-declare these so Pass 1.72's static-PIC synthesis can
     // record the local global index; the PIC-import path (Pass 4) may
     // also assign a value later under shared mode.
@@ -8439,7 +8508,21 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             .as_ref()
             .map(|(m, f)| (m.as_bytes().to_vec(), f.as_bytes().to_vec()))
             .unwrap_or_else(|| (b"env".to_vec(), b"memory".to_vec()));
-        let (min, max) = compute_imported_memory_limits(layout.symbol_db.args);
+        // Layout-derived lower bound for `--initial-memory`-less links:
+        // matches the local memory section's calc (data + stack [+ heap]).
+        let stack_size_u64 = layout
+            .symbol_db
+            .args
+            .stack_size
+            .unwrap_or(DEFAULT_STACK_SIZE as u64);
+        let heap_size_u64 = layout.symbol_db.args.initial_heap.unwrap_or(0);
+        let default_min_bytes = if stack_first {
+            stack_size_u64 + data_size as u64 + heap_size_u64
+        } else {
+            stack_pointer_value as u64 + heap_size_u64
+        };
+        let (min, max) =
+            compute_imported_memory_limits(layout.symbol_db.args, default_min_bytes);
         output_imports.push(OutputImport {
             module,
             field,
@@ -8448,6 +8531,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 max,
                 shared: layout.symbol_db.args.shared_memory,
                 memory64: layout.symbol_db.args.memory64,
+                page_size: layout.symbol_db.args.page_size,
             },
         });
     }
@@ -8465,6 +8549,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                 max: None,
                 shared: false,
                 memory64: layout.symbol_db.args.memory64,
+                page_size: layout.symbol_db.args.page_size,
             },
         });
         let addr_vt_imp = if layout.symbol_db.args.memory64 {
@@ -12269,6 +12354,7 @@ mod tests {
                 max: None,
                 shared: false,
                 memory64: true,
+                page_size: None,
             },
         };
         // Hand-roll the import-section emission subset (mirrors the writer).
@@ -12282,6 +12368,7 @@ mod tests {
                 max,
                 shared,
                 memory64,
+                page_size: _,
             } => {
                 payload.push(0x02);
                 let mut flags: u8 = 0;
