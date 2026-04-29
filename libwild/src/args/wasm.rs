@@ -424,8 +424,8 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             "--no-gc-sections" | "-no-gc-sections" => args.no_gc_sections = true,
 
             // --- Strip ---
-            "--strip-debug" | "-S" => args.strip = Strip::Debug,
-            "--strip-all" | "-s" => args.strip = Strip::All,
+            "--strip-debug" | "-strip-debug" | "-S" => args.strip = Strip::Debug,
+            "--strip-all" | "-strip-all" | "-s" => args.strip = Strip::All,
             _ if arg.starts_with("--keep-section=") => {
                 args.keep_sections.push(arg["--keep-section=".len()..].to_string());
             }

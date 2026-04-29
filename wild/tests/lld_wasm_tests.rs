@@ -210,6 +210,19 @@ const KNOWN_PASSING: &[&str] = &[
     // extraction (matching wasm-ld's `Driver::createFiles`), so an
     // archive member providing NAME gets pulled in.
     "export-optional-lazy",
+    // Weak-undefined function symbols synthesise an `unreachable;
+    // end` stub instead of an env import; the stub gets two name-
+    // section entries (`<name>` weak and `undefined_weak:<name>`
+    // strong) so the FunctionNames picker emits the prefixed form.
+    // R_WASM_TABLE_INDEX_* relocs to weak-undef patch to 0, and the
+    // TABLE section is still emitted as min=1 so the function table
+    // is present even when no defined funcs are address-taken.
+    // Single-dash `-strip-debug` / `-strip-all` aliases now parse
+    // (lld accepts both forms).
+    "weak-undefined",
+    // Weak-undef stubs combine with archive load: weak references
+    // do NOT pull archive members, so `ret32` stays a stub.
+    "archive-weak-undefined",
     // Reftype globals (externref / funcref) now initialise via
     // `ref.null <reftype>` instead of `i32.const 0` — wasm
     // validators reject the type-mismatched i32.const form.
@@ -247,6 +260,10 @@ const KNOWN_PASSING_LTO: &[&str] = &[
     "undef",
     "weak",
     "archive",
+    // Pulls in via the weak-undef stub path (now exercised on the
+    // exec build above): a weak undef declared in the bitcode half
+    // gets a stub even though wild skips bitcode otherwise.
+    "weak-undefined",
 ];
 
 /// Check if this test should be skipped entirely.

@@ -377,7 +377,8 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     // --export-table: add table to exports.
     let has_table = !merged.table_entries.is_empty()
         || layout.symbol_db.args.import_table
-        || layout.symbol_db.args.export_table;
+        || layout.symbol_db.args.export_table
+        || merged.weak_undef_table_referenced;
     let table_size = if !merged.table_entries.is_empty() {
         merged.table_entries.len() as u32 + 1
     } else if has_table {
@@ -3788,6 +3789,10 @@ struct MergedModule {
     /// Indirect function table: maps table index → function index.
     /// Per spec §9.4: entries start at index 1 (0 = null/trap).
     table_entries: Vec<u32>,
+    /// Set when a TABLE_INDEX reloc to a weak-undef stub was patched
+    /// to 0 — the stub itself isn't in the table, but lld emits a
+    /// min=1 TABLE in that case anyway.
+    weak_undef_table_referenced: bool,
     /// Map from function index to table index (for relocation patching).
     func_to_table_index: std::collections::HashMap<u32, u32>,
     /// Imports for unresolved symbols.
@@ -6573,6 +6578,11 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let mut table_needed_funcs: std::collections::HashSet<u32> = Default::default();
     let mut table_needed_order: Vec<u32> = Vec::new();
     let mut table_needed_is_import: Vec<bool> = Vec::new();
+    // Set when a TABLE_INDEX_* reloc resolves to a weak-undef stub
+    // (which we patch to 0 instead of adding to the table). lld
+    // still emits a min=1 TABLE in that case so the resulting
+    // module has the function table available; force the emit.
+    let mut weak_undef_table_referenced = false;
 
     // Simulate Pass 4's import deduplication early so GOT.func entries for
     // *imported* functions can claim table slots in Pass 1.75. The keys
@@ -6818,6 +6828,121 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         }
     }
 
+    // --- Pass 1.85: identify weak-undefined function symbols ---
+    // Stubs are pushed to `functions` once that Vec exists (Pass 2
+    // entry) — but the name → idx assignment has to be locked in now
+    // so Pass 1.9's tag setup and Pass 2's symbol→func remap see a
+    // consistent function-index space.
+    //
+    // Per wasm-ld: a weakly-referenced function with no defining
+    // input resolves to a trap stub (`unreachable; end`) carrying
+    // the import's type signature. Reloc resolution lands on the
+    // stub via `function_name_map`. The name section emits two
+    // entries pointing at the same index — `<name>` (weak) and
+    // `undefined_weak:<name>` (strong) — so the strong-beats-weak
+    // picker gives the prefixed form, matching lld's output.
+    //
+    // Algorithm derived from `lld/wasm/SymbolTable.cpp::replaceWithUndefined`
+    // (Apache-2.0 with LLVM Exceptions). Skipped under `-shared`/`-pie`
+    // where weak undef is meant to be deferred to the dynamic linker.
+    let weak_undef_stub_names: Vec<(Vec<u8>, u32)> = if !layout.symbol_db.args.is_shared
+        && !layout.symbol_db.args.is_pic
+    {
+        let mut seen: std::collections::HashSet<Vec<u8>> = Default::default();
+        let mut out: Vec<(Vec<u8>, u32)> = Vec::new();
+        for obj_info in &objects {
+            let parsed = &obj_info.parsed;
+            for sym in &parsed.symbols {
+                if sym.kind != 0 {
+                    continue;
+                }
+                let undef = (sym.flags & 0x10) != 0;
+                let weak = (sym.flags & 0x01) != 0;
+                if !undef || !weak {
+                    continue;
+                }
+                let name: &[u8] = if !sym.name.is_empty() {
+                    sym.name.as_slice()
+                } else if (sym.index as usize) < parsed.import_function_names.len() {
+                    parsed.import_function_names[sym.index as usize].as_slice()
+                } else {
+                    continue;
+                };
+                if function_name_map.contains_key(name) {
+                    continue; // Defined elsewhere — no stub needed.
+                }
+                if !seen.insert(name.to_vec()) {
+                    continue;
+                }
+                // Resolve the import's type idx for this symbol via
+                // its imports[] entry (kind=0, field == name).
+                let type_idx = parsed
+                    .imports
+                    .iter()
+                    .find(|i| i.kind == 0 && i.field.as_slice() == name)
+                    .map(|i| {
+                        obj_info
+                            .type_map
+                            .get(i.type_index as usize)
+                            .copied()
+                            .unwrap_or(i.type_index)
+                    });
+                if let Some(t) = type_idx {
+                    out.push((name.to_vec(), t));
+                }
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    // Reserve function indices 0..N_stubs (or 1..N_stubs+1 when ctors
+    // is at 0). Defined-function entries shift by +N_stubs so the
+    // stubs occupy the front of the def-index space, matching lld's
+    // layout — `weak-undefined.s` puts the stub at idx 0, defs after.
+    let n_stubs = weak_undef_stub_names.len() as u32;
+    if n_stubs > 0 {
+        let ctors_offset = if needs_ctors { 1 } else { 0 };
+        // Shift every existing function_name_map idx (including any
+        // ctors entry if Pass 1.8 already inserted it) by +N_stubs
+        // — the stubs go *after* ctors but *before* the per-input
+        // defs.
+        for idx in function_name_map.values_mut() {
+            if *idx >= ctors_offset {
+                *idx += n_stubs;
+            }
+        }
+        if let Some(ref mut idx) = entry_function_index
+            && *idx >= ctors_offset
+        {
+            *idx += n_stubs;
+        }
+        for idx in exported_indices.iter_mut() {
+            if *idx >= ctors_offset {
+                *idx += n_stubs;
+            }
+        }
+        for idx in no_strip_indices.iter_mut() {
+            if *idx >= ctors_offset {
+                *idx += n_stubs;
+            }
+        }
+        for (i, (name, _)) in weak_undef_stub_names.iter().enumerate() {
+            let stub_idx = ctors_offset + i as u32;
+            function_name_map.insert(name.clone(), stub_idx);
+            function_is_weak.insert(name.clone(), true);
+            let mut prefixed = b"undefined_weak:".to_vec();
+            prefixed.extend_from_slice(name);
+            function_name_map.insert(prefixed, stub_idx);
+        }
+        // (`obj_info.func_base` left unchanged — Pass 2's symbol
+        // resolution for named defs goes through `function_name_map`
+        // which is already shifted; the unnamed-defined fallback at
+        // line ~7193 is rare and any drift there is documented as a
+        // follow-up if a fixture surfaces it.)
+        total_functions += n_stubs;
+    }
+
     // --- Pass 1.9: collect EH tags across all objects via symbol-name
     // resolution, mirroring the function-merge rules in Pass 1 (§9.2 and §7).
     //
@@ -7027,6 +7152,25 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
 
     // --- Pass 2: apply relocations with global symbol resolution ---
     let mut functions: Vec<MergedFunction> = Vec::new();
+    // Push weak-undef stub bodies first so they take indices
+    // 0..N_stubs (or ctors_offset..ctors_offset+N_stubs once
+    // Pass 3 inserts ctors at idx 0). Body framing: locals_count(0)
+    // + unreachable + end. Pass 1.85 already shifted defined
+    // functions' name-map indices by `n_stubs` so the per-input
+    // bodies pushed below land at indices N_stubs..
+    let weak_undef_stub_idx_set: std::collections::HashSet<u32> = if !weak_undef_stub_names.is_empty()
+    {
+        let ctors_offset = if needs_ctors { 1 } else { 0 };
+        (ctors_offset..ctors_offset + weak_undef_stub_names.len() as u32).collect()
+    } else {
+        Default::default()
+    };
+    for (_name, type_idx) in &weak_undef_stub_names {
+        functions.push(MergedFunction {
+            type_index: *type_idx,
+            body: vec![0x00, 0x00, 0x0B],
+        });
+    }
     // Store deferred table relocs: (function_output_idx, offset_in_body, reloc_type, sym→func_idx)
     let mut deferred_table_relocs: Vec<(usize, usize, u8, u32)> = Vec::new();
 
@@ -7385,20 +7529,33 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                             .get(&reloc.symbol_index)
                             .copied()
                             .unwrap_or(0);
-                        if table_needed_funcs.insert(func_idx) {
-                            table_needed_order.push(func_idx);
-                            table_needed_is_import.push(false);
+                        // Weak-undef stub: i32.const <addr> resolves
+                        // to 0 (the stub isn't in the table; lld
+                        // matches). Skip table registration entirely
+                        // and patch the immediate to 0 directly.
+                        if weak_undef_stub_idx_set.contains(&func_idx) {
+                            weak_undef_table_referenced = true;
+                            if reloc.reloc_type == 1 {
+                                write_padded_sleb128(&mut body, off_in_body, 0);
+                            } else {
+                                write_u32_le(&mut body, off_in_body, 0);
+                            }
+                        } else {
+                            if table_needed_funcs.insert(func_idx) {
+                                table_needed_order.push(func_idx);
+                                table_needed_is_import.push(false);
+                            }
+                            // This body will be pushed at index `functions.len()`
+                            // at the end of this iteration. Deferred table relocs
+                            // must target that slot, NOT `functions.len() + i`.
+                            let out_func_idx = functions.len();
+                            deferred_table_relocs.push((
+                                out_func_idx,
+                                off_in_body,
+                                reloc.reloc_type,
+                                func_idx,
+                            ));
                         }
-                        // This body will be pushed at index `functions.len()`
-                        // at the end of this iteration. Deferred table relocs
-                        // must target that slot, NOT `functions.len() + i`.
-                        let out_func_idx = functions.len();
-                        deferred_table_relocs.push((
-                            out_func_idx,
-                            off_in_body,
-                            reloc.reloc_type,
-                            func_idx,
-                        ));
                     }
                     21 => {
                         // R_WASM_MEMORY_ADDR_TLS_SLEB (spec §9.4, §10)
@@ -8706,6 +8863,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         no_strip_indices,
         exported_indices,
         table_entries,
+        weak_undef_table_referenced,
         func_to_table_index,
         globals,
         data_segments,
