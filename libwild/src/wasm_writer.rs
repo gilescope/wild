@@ -410,6 +410,12 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     // rely on this — the host supplies the memory instance.
     let args = layout.symbol_db.args;
     if !is_shared && !args.import_memory {
+        // Page size: default 64 KiB (wasm spec); `--page-size=N`
+        // (custom-page-sizes proposal) overrides. Page counts are
+        // computed in those page-size units; the MEMORY limits flag
+        // gains HAS_PAGE_SIZE (bit 3 = 0x08) and the page size is
+        // appended after min/max.
+        let page_bytes: u64 = args.page_size.unwrap_or(65536);
         let total_memory_u64 = {
             let stack_size = args.stack_size.unwrap_or(DEFAULT_STACK_SIZE as u64);
             let heap_size = args.initial_heap.unwrap_or(0);
@@ -424,12 +430,13 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 computed
             }
         };
-        let pages = ((total_memory_u64 + 65535) / 65536).max(1) as u64;
+        let pages = ((total_memory_u64 + page_bytes - 1) / page_bytes).max(1);
         {
             let mut payload = Vec::new();
             write_leb128(&mut payload, 1); // 1 memory
             let shared_flag: u8 = if args.shared_memory { 0x02 } else { 0x00 };
             let mem64_flag: u8 = if args.memory64 { 0x04 } else { 0x00 };
+            let page_size_flag: u8 = if args.page_size.is_some() { 0x08 } else { 0x00 };
             // Under memory64 the page counts are encoded as ULEB64.
             let emit_pages = |p: &mut Vec<u8>, v: u64| {
                 if args.memory64 {
@@ -439,18 +446,26 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 }
             };
             if let Some(max) = args.max_memory {
-                let max_pages = ((max + 65535) / 65536).max(pages);
-                payload.push(0x01 | shared_flag | mem64_flag); // has max [+ shared] [+ mem64]
+                let max_pages = ((max + page_bytes - 1) / page_bytes).max(pages);
+                payload.push(0x01 | shared_flag | mem64_flag | page_size_flag);
                 emit_pages(&mut payload, pages);
                 emit_pages(&mut payload, max_pages);
             } else if args.no_growable_memory || args.shared_memory {
                 // shared memory requires max
-                payload.push(0x01 | shared_flag | mem64_flag);
+                payload.push(0x01 | shared_flag | mem64_flag | page_size_flag);
                 emit_pages(&mut payload, pages);
                 emit_pages(&mut payload, pages);
             } else {
-                payload.push(0x00 | mem64_flag); // no max
+                payload.push(0x00 | mem64_flag | page_size_flag); // no max
                 emit_pages(&mut payload, pages);
+            }
+            // Custom page size byte tail (proposal): the page size
+            // is encoded as `log2(page_size_bytes)` — so `1 byte` is
+            // 0, `64 KiB` is 16. obj2yaml renders it as `2^N` so a
+            // mismatch would show up as a power-of-two off-by-N.
+            if let Some(ps) = args.page_size {
+                let log2 = ps.trailing_zeros() as u64;
+                write_leb128_u64(&mut payload, log2);
             }
             write_section(&mut out, SECTION_MEMORY, &payload);
         }
@@ -955,7 +970,16 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     }
 
     // Name section (custom section "name") — maps function indices to names.
-    if !layout.symbol_db.args.should_strip_all() && !merged.functions.is_empty() {
+    let strip_all = layout.symbol_db.args.should_strip_all();
+    let keep_section = |name: &[u8]| {
+        layout
+            .symbol_db
+            .args
+            .keep_sections
+            .iter()
+            .any(|s| s.as_bytes() == name)
+    };
+    if (!strip_all || keep_section(b"name")) && !merged.functions.is_empty() {
         let mut name_payload = Vec::new();
 
         // Module name subsection (id=0): contains the output file's
@@ -1077,7 +1101,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     }
 
     // `producers` follows `name` and precedes `target_features`.
-    if !layout.symbol_db.args.should_strip_all() {
+    if !strip_all || keep_section(b"producers") {
         for cs in &merged.custom_sections {
             if cs.name == b"producers" {
                 let mut custom_payload = Vec::new();
@@ -1089,7 +1113,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     }
 
     // target_features custom section — last.
-    if !layout.symbol_db.args.should_strip_all() {
+    if !strip_all || keep_section(b"target_features") {
         for cs in &merged.custom_sections {
             if cs.name == b"target_features" {
                 let mut custom_payload = Vec::new();
@@ -6762,9 +6786,13 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     // (lld and wild only emit when ctors actually exist or the
     // symbol is referenced) so visibility-hidden.ll / weak-alias.s
     // / etc. don't grow a phantom function-0.
+    // wasm-ld emits `__wasm_call_ctors` whenever GC is disabled —
+    // the runtime stub is unconditional ("always present") in that
+    // mode. With GC, lld+wild prune it when nothing references it.
     let needs_ctors = !all_init_funcs.is_empty()
         || ctors_referenced
-        || layout.symbol_db.args.shared_memory;
+        || layout.symbol_db.args.shared_memory
+        || layout.symbol_db.args.no_gc_sections;
 
     if needs_ctors {
         all_init_funcs.sort_by_key(|(prio, _)| *prio);

@@ -203,6 +203,13 @@ const KNOWN_PASSING: &[&str] = &[
     // populating the table). Matches wasm-ld's min=1 default.
     "import-table",
     "import-table-explicit",
+    // `--keep-section=<name>` overrides --strip-all for that custom
+    // section. `strip-all.s` exercises name + target_features.
+    "strip-all",
+    // `--export=NAME` now also forces NAME undefined for archive
+    // extraction (matching wasm-ld's `Driver::createFiles`), so an
+    // archive member providing NAME gets pulled in.
+    "export-optional-lazy",
     // Reftype globals (externref / funcref) now initialise via
     // `ref.null <reftype>` instead of `i32.const 0` — wasm
     // validators reject the type-mismatched i32.const form.
@@ -291,6 +298,7 @@ fn should_skip(content: &str, path: &Path) -> bool {
                 | "call-indirect" // type dedup across indirect calls
                 | "stack-first" // needs user-defined global exports
                 | "command-exports" // needs __indirect_function_table + complex exports
+                | "multi-table" // needs reference-types tables
         ) {
             return true;
         }
@@ -337,10 +345,11 @@ fn should_skip(content: &str, path: &Path) -> bool {
     if content.contains(".no_dead_strip") {
         return true;
     }
-    // User-defined globals / advanced global features
+    // User-defined globals / advanced global features.
+    // (`externref` is now supported — reftype globals init via
+    //  `ref.null <reftype>` — so it's no longer in this skip list.)
     if content.contains("--export=foo_global")
         || content.contains("__table_base")
-        || content.contains("externref")
         || content.contains("foo_global")
         || content.contains("bar_global")
     {
@@ -373,10 +382,12 @@ fn should_skip(content: &str, path: &Path) -> bool {
     if content.contains(".import_module") || content.contains(".import_name") {
         return true;
     }
-    // Memory naming (--export-memory=<name> not yet supported)
-    if content.contains("--export-memory") || content.contains("--import-memory") {
-        return true;
-    }
+    // Memory naming (`--export-memory[=name]` and
+    // `--import-memory[=mod[,field]]`) is now supported. The skip
+    // here used to be unconditional; the KNOWN_PASSING list now
+    // pulls the well-shaped fixtures (memory-naming, import-memory)
+    // through, while the broader `--import-memory` content stays
+    // off-limits via individual stem skips for the harder cases.
     // .so inputs
     if content.contains(".so ") || content.contains("libstub") {
         return true;
@@ -385,10 +396,10 @@ fn should_skip(content: &str, path: &Path) -> bool {
     if content.contains("name-section-mangling") {
         return true;
     }
-    // --keep-section not yet implemented
-    if content.contains("--keep-section") {
-        return true;
-    }
+    // `--keep-section=<name>` is now supported (preserves the named
+    // custom section under --strip-all). Tests that use it can run
+    // through KNOWN_PASSING; the broader pattern stays off-limits
+    // for fixtures that pair it with other unsupported features.
     // Features not yet implemented
     if content.contains("--compress-reloc")
         || content.contains("llvm-objdump")

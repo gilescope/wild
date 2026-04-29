@@ -34,6 +34,10 @@ pub struct WasmArgs {
     /// Export all non-hidden symbols.
     pub(crate) export_all: bool,
     pub(crate) strip: Strip,
+    /// Custom sections to keep even under `--strip-all` /
+    /// `--strip-debug` (`--keep-section=<name>`, repeatable).
+    /// Compared against the section's bytes (no quoting).
+    pub(crate) keep_sections: Vec<String>,
     /// Relocatable output (-r/--relocatable).
     pub(crate) is_relocatable: bool,
     /// Shared library output (-shared).
@@ -42,6 +46,11 @@ pub struct WasmArgs {
     pub(crate) initial_memory: Option<u64>,
     /// Maximum memory size (--max-memory).
     pub(crate) max_memory: Option<u64>,
+    /// Custom page size (`--page-size=N`, custom-page-sizes proposal).
+    /// When set, the MEMORY section uses HAS_PAGE_SIZE limits + the
+    /// given byte-count page size; min/max are interpreted in those
+    /// page units rather than the default 64 KiB.
+    pub(crate) page_size: Option<u64>,
     /// Stack size override (-z stack-size=N).
     pub(crate) stack_size: Option<u64>,
     /// Place stack before data (--stack-first).
@@ -115,10 +124,12 @@ impl Default for WasmArgs {
             exports_if_defined: Vec::new(),
             export_all: false,
             strip: Strip::Nothing,
+            keep_sections: Vec::new(),
             is_relocatable: false,
             is_shared: false,
             initial_memory: None,
             max_memory: None,
+            page_size: None,
             stack_size: None,
             stack_first: true, // wasm-ld default
             global_base: None,
@@ -335,11 +346,21 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             "--export-all" => args.export_all = true,
             _ if arg.starts_with("--export=") => {
-                args.exports.push(arg[9..].to_string());
+                let name = arg[9..].to_string();
+                // wasm-ld treats `--export=NAME` as also forcing the
+                // symbol undefined for archive extraction (see lld
+                // `Driver::createFiles` — exported symbols seed the
+                // resolution graph). Without this `archive-export`
+                // and similar fixtures don't pull `archive2_symbol`
+                // out of `%t.a`.
+                args.force_undefined.push(name.clone());
+                args.exports.push(name);
             }
             "--export" => {
                 if let Some(sym) = iter.next() {
-                    args.exports.push(sym.as_ref().to_string());
+                    let name = sym.as_ref().to_string();
+                    args.force_undefined.push(name.clone());
+                    args.exports.push(name);
                 }
             }
             _ if arg.starts_with("--export-if-defined=") => {
@@ -354,6 +375,9 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             _ if arg.starts_with("--max-memory=") => {
                 args.max_memory = arg[13..].parse().ok();
+            }
+            _ if arg.starts_with("--page-size=") => {
+                args.page_size = arg["--page-size=".len()..].parse().ok();
             }
             _ if arg.starts_with("--global-base=") => {
                 args.global_base = arg[14..].parse().ok();
@@ -402,6 +426,9 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             // --- Strip ---
             "--strip-debug" | "-S" => args.strip = Strip::Debug,
             "--strip-all" | "-s" => args.strip = Strip::All,
+            _ if arg.starts_with("--keep-section=") => {
+                args.keep_sections.push(arg["--keep-section=".len()..].to_string());
+            }
 
             // --- Relocatable / shared ---
             "-r" | "--relocatable" => args.is_relocatable = true,
