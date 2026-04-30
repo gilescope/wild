@@ -228,6 +228,24 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         merged.function_origin = function_origin;
     }
 
+    // Strong-undef function refs that survived GC: error out by
+    // default (lld's behaviour). Skipped under `--allow-undefined`,
+    // `--shared`, `-pie`, and the `--unresolved-symbols=ignore-all`
+    // / `--warn-unresolved-symbols` paths (those are routed via
+    // `stub_unresolved_functions` which already converted strong
+    // undefs to trap stubs upstream). Runs after GC because tests
+    // like data-layout's `--no-entry` arm intentionally have no
+    // roots — every undef ref vanishes with the bodies that called
+    // it, so there's nothing to error on.
+    if !layout.symbol_db.args.allow_undefined
+        && !layout.symbol_db.args.is_shared
+        && !layout.symbol_db.args.is_pic
+        && !layout.symbol_db.args.stub_unresolved_functions
+        && !layout.symbol_db.args.import_undefined
+    {
+        report_undefined_strong_refs(layout, &merged)?;
+    }
+
     // Pad call_indirect / return_call_indirect tableidx LEBs to 5 bytes
     // in every body. Has to happen before any custom-section reloc
     // re-patch (which uses CODE-relative body offsets) so the offsets
@@ -5846,6 +5864,148 @@ fn remap_call_targets(body: &mut [u8], index_map: &[Option<u32>]) {
 /// Two-pass approach:
 /// 1. Parse all objects, assign output indices, build global name→index map
 /// 2. Apply relocations using the global map
+/// Walk every live (post-GC) function body. For each `call N` /
+/// `return_call N` / `ref.func N` where N is in the import range
+/// (`< merged.num_imported_functions`), check whether the import's
+/// target name is satisfied by an input definition. Strong-undef
+/// references that survive GC are a hard error unless the user opted
+/// out via `--allow-undefined` / `--unresolved-symbols=ignore-all` /
+/// `--warn-unresolved-symbols`, or it's a `--shared` / `-pie` link
+/// where the dynamic linker resolves the import at load time.
+///
+/// Doing this after GC matters for `--no-entry` builds with stray
+/// undef refs in dead code (data-layout's `_max.wasm` arm is the
+/// canary): all bodies are unreachable → all dropped → no live
+/// calls → no error. why-extract.s case 3 (the failing-link arm)
+/// has live `_start` → `a` → `_Z1bv` so the error fires there.
+fn report_undefined_strong_refs(
+    layout: &Layout<'_, Wasm>,
+    merged: &MergedModule,
+) -> crate::error::Result<()> {
+    if merged.num_imported_functions == 0 {
+        return Ok(());
+    }
+    // Collect every funcidx referenced from any live body.
+    let mut referenced_imports: std::collections::HashSet<u32> = Default::default();
+    for f in &merged.functions {
+        let _ = walk_funcidx_operands(&f.body, |_off, idx| {
+            if idx < merged.num_imported_functions {
+                referenced_imports.insert(idx);
+            }
+        });
+    }
+    // Same for table_entries (address-taken via ref.func / table init).
+    for &idx in &merged.table_entries {
+        if idx < merged.num_imported_functions {
+            referenced_imports.insert(idx);
+        }
+    }
+    if referenced_imports.is_empty() {
+        return Ok(());
+    }
+
+    // Build the set of "implicit" undef-ref names. A name is
+    // implicit when some input has an UNDEFINED strong function
+    // symbol whose own name matches the import field — i.e. the
+    // input wrote `.functype foo …; call foo` and llvm-mc emitted
+    // an `env.foo` import as the default. Explicit foreign imports
+    // (`.import_module env; .import_name f`, where the symbol is
+    // named `f1` but the import field is `f`) keep symbol_name !=
+    // field, and we leave those alone — they're real env-provided
+    // imports the user opted into.
+    let mut implicit_undef_names: std::collections::HashSet<Vec<u8>> = Default::default();
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+            for sym in &parsed.symbols {
+                if sym.kind != 0 {
+                    continue;
+                }
+                let undef = (sym.flags & 0x10) != 0;
+                let weak = (sym.flags & 0x01) != 0;
+                if !undef || weak {
+                    continue;
+                }
+                // Resolve the symbol's name: explicit name on the
+                // sym entry, or via import_function_names at sym.index
+                // for the default-named undef refs (the WASM_SYM_EXPLICIT_NAME
+                // bit was off so the parser elided it).
+                let sym_name: Vec<u8> = if !sym.name.is_empty() {
+                    sym.name.clone()
+                } else if (sym.index as usize) < parsed.import_function_names.len() {
+                    parsed.import_function_names[sym.index as usize].clone()
+                } else {
+                    continue;
+                };
+                if sym_name.is_empty() {
+                    continue;
+                }
+                // Find the matching import for this symbol's index.
+                let mut k0 = 0u32;
+                for imp in &parsed.imports {
+                    if imp.kind != 0 {
+                        continue;
+                    }
+                    if k0 == sym.index {
+                        // Implicit if module=env and field matches the
+                        // symbol name verbatim. Anything else is an
+                        // explicit foreign import.
+                        if imp.module == b"env" && imp.field == sym_name {
+                            implicit_undef_names.insert(sym_name.clone());
+                        }
+                        break;
+                    }
+                    k0 += 1;
+                }
+            }
+        }
+    }
+
+    // Map each live import-funcidx back to (module, field). Imports
+    // live in `merged.imports` in order — kind=0 entries go through
+    // the function-namespace import indices in their declaration order.
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = Default::default();
+    let mut k0_idx = 0u32;
+    for imp in &merged.imports {
+        if !matches!(imp.kind, ImportKind::Function(_)) {
+            continue;
+        }
+        let this_idx = k0_idx;
+        k0_idx += 1;
+        if !referenced_imports.contains(&this_idx) {
+            continue;
+        }
+        if imp.module != b"env" {
+            continue;
+        }
+        if !implicit_undef_names.contains(imp.field.as_slice()) {
+            continue;
+        }
+        if !seen.insert(imp.field.clone()) {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&imp.field);
+        errors.push(format!("undefined symbol: {name}"));
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("wild: error: {e}");
+        }
+        crate::bail!("{} undefined symbol(s)", errors.len());
+    }
+    Ok(())
+}
+
 /// `--why-extract` / `--incremental-cache` shared instrumentation.
 ///
 /// Walks inputs in command-line order, builds the (defined, undef-ref)
@@ -6002,13 +6162,20 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
         if emitted {
             continue;
         }
-        // Otherwise: first earlier input in cmdline order with this
-        // name in its undef_refs wins.
+        // Otherwise: any other input that has this name in its
+        // undef_refs (cmdline order, skipping self). Looking forward
+        // matters because archives can be cmdline-listed *before*
+        // the input that drives their load — `b.a a_b.a main.o`
+        // pulls b.o via a_b.o (later) which itself was pulled by
+        // main.o (later still).
         for sym in &view.defines {
             let mut found = None;
-            for earlier in &inputs[..i] {
-                if earlier.undef_refs.iter().any(|r| r == sym) {
-                    found = Some(earlier.label.clone());
+            for (j, other) in inputs.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                if other.undef_refs.iter().any(|r| r == sym) {
+                    found = Some(other.label.clone());
                     break;
                 }
             }

@@ -269,6 +269,12 @@ const KNOWN_PASSING: &[&str] = &[
     // determinism. `undefined-weak-call.s` covers the diagnostic +
     // weak-undef stub-vs-GC interaction.
     "undefined-weak-call",
+    // `--why-extract=PATH` (or `-` for stdout) emits archive-load
+    // edges as TSV. Plus `--import-undefined`, `-u SYM` (with
+    // `<internal>` source), `-e SYM` (with `--entry` source). Plus
+    // GC-aware strong-undef-symbol error reporting (so `not wasm-ld
+    // main.o a_b.a` errors on undef `_Z1bv`).
+    "why-extract",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

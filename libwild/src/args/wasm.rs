@@ -156,6 +156,13 @@ pub struct WasmArgs {
     /// canonical use case: instrumenting a single function without
     /// touching its callers.
     pub(crate) wrap: Vec<String>,
+    /// `--import-undefined`: undefined symbols become env-imports
+    /// without erroring. Stronger than `--allow-undefined` — that
+    /// one allows undef refs but doesn't auto-import non-`env`
+    /// modules; this one also opts out of the strong-undef-symbol
+    /// error report introduced under default behaviour. Used by
+    /// debug-undefined-fs.s.
+    pub(crate) import_undefined: bool,
 }
 
 impl Default for WasmArgs {
@@ -207,6 +214,7 @@ impl Default for WasmArgs {
             print_gc_sections: false,
             why_extract: None,
             wrap: Vec::new(),
+            import_undefined: false,
         }
     }
 }
@@ -391,6 +399,10 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
 
             // --- Symbol resolution (spec §9.2) ---
             "--allow-undefined" | "-allow-undefined" => args.allow_undefined = true,
+            "--import-undefined" | "-import-undefined" => {
+                args.import_undefined = true;
+                args.allow_undefined = true;
+            }
             "--allow-multiple-definition" => args.allow_multiple_definitions = true,
             "--no-allow-multiple-definition" => args.allow_multiple_definitions = false,
 
