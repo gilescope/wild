@@ -296,6 +296,17 @@ const KNOWN_PASSING: &[&str] = &[
     // That's a separate issue in `write_relocatable` and stays a
     // follow-up — keep `.s` skipped for now.
     "signature-mismatch-export",
+    // `--wrap NAME` body rewrite (Phase 1c). Pass 4a pre-allocates
+    // `env.__wrap_<name>` imports at the lowest unified indices.
+    // Pass 4b walks all bodies and replaces call operands that
+    // referenced the wrapped def's unified idx with the wrap
+    // import's unified idx; the original def is normally GC'd.
+    // `__real_<name>` is also synthesized as an alias to the
+    // original def for inputs that reference it. `wrap_import.s`
+    // exercises the simple case (wrapped target undefined for
+    // `__wrap_foo`); was previously caught by the broad `-wrap` /
+    // `--wrap` content skip.
+    "wrap_import",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

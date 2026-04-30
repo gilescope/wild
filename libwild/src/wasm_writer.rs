@@ -9307,6 +9307,17 @@ fn merge_inputs(
     let mut output_imports: Vec<OutputImport> = Vec::new();
     let mut num_imported_functions = 0u32;
     let mut num_imported_globals = 0u32;
+
+    // Wrap target set, used by Pass 4a (pre-allocate wrap imports)
+    // and Pass 4b (rewrite body operands of calls to wrapped defs).
+    let wrap_set: std::collections::HashSet<Vec<u8>> = layout
+        .symbol_db
+        .args
+        .wrap
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    let mut wrap_redirect: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     let mut seen_imports: std::collections::HashSet<(Vec<u8>, Vec<u8>, u8, u32)> =
         Default::default();
     // (LLVM symbol name, pre-shift import wasm idx) — applied to
@@ -9318,6 +9329,47 @@ fn merge_inputs(
     // section so e.g. `g1` appears at idx 0 even though the import
     // field is `g` (via `.import_name g1, g`).
     let mut import_global_name_map: Vec<(Vec<u8>, u32)> = Vec::new();
+
+    // --- Pass 4a: pre-allocate `--wrap NAME` imports.
+    //
+    // For each `--wrap X` flag, lld inserts an `env.__wrap_X`
+    // function import and reroutes every call site that referenced
+    // `X` to that import; the original `X` def stays in the module
+    // but has no callers and is normally GC'd. (Refs to `__real_X`
+    // resolve to the original `X` def — handled by Pass 4b below.)
+    //
+    // Wrap imports go *before* any other imports so they take the
+    // lowest unified-namespace indices and can be resolved during
+    // body reloc apply without further bookkeeping. Type comes from
+    // the wrapped function's def in `functions[def_idx_pre_shift]`.
+    for wrap_name in &wrap_set {
+        let Some(&def_idx_pre_shift) = function_name_map.get(wrap_name) else {
+            // No def for this wrap target — wasm-ld accepts that
+            // (with `-allow-undefined`); skip silently here. The
+            // referencing call sites stay as their original UNDEF
+            // import, which Pass 4 below will turn into an `env.X`
+            // entry.
+            continue;
+        };
+        let Some(func) = functions.get(def_idx_pre_shift as usize) else {
+            continue;
+        };
+        let type_idx = func.type_index;
+        let wrap_unified_idx = num_imported_functions;
+        let mut field = b"__wrap_".to_vec();
+        field.extend_from_slice(wrap_name);
+        output_imports.push(OutputImport {
+            module: b"env".to_vec(),
+            field: field.clone(),
+            kind: ImportKind::Function(type_idx),
+        });
+        // Register the wrap import's name in `import_function_name_map`
+        // so the `name` custom section's FunctionNames subsection
+        // emits `__wrap_<name>` at this idx — matches lld's output.
+        import_function_name_map.push((field, wrap_unified_idx));
+        num_imported_functions += 1;
+        wrap_redirect.insert(wrap_name.clone(), wrap_unified_idx);
+    }
 
     for obj_info in &objects {
         // Position of each kind=0 import within this object's imports
@@ -9702,6 +9754,53 @@ fn merge_inputs(
     if num_imported_globals > 0 {
         for idx in global_name_map.values_mut() {
             *idx += num_imported_globals;
+        }
+    }
+
+    // --- Pass 4b: apply `--wrap` redirects to body call operands.
+    //
+    // Pass 4a pre-allocated `env.__wrap_X` imports at the lowest
+    // unified-namespace indices. function_name_map[X] still points at
+    // the original def's unified idx (post-shift), which Pass 2 wrote
+    // into every call site referencing X. Walk all bodies and rewrite
+    // those operands to point at the wrap import instead. The
+    // original def remains in the module (callable via `__real_X` if
+    // anyone synthesizes that ref) — its lack of callers means the GC
+    // pass below typically drops it.
+    //
+    // We also alias `__real_X` → original-def in `function_name_map`
+    // so any input that calls `__real_X` (an UNDEF symbol expecting
+    // the unwrapped def) resolves to the right place.
+    if !wrap_redirect.is_empty() {
+        for (wrap_name, &wrap_unified_idx) in &wrap_redirect {
+            let Some(&def_unified_idx) = function_name_map.get(wrap_name) else {
+                continue;
+            };
+            for func in functions.iter_mut() {
+                let body_len = func.body.len();
+                let mut patches: Vec<(usize, u32)> = Vec::new();
+                let walk = walk_funcidx_operands(&func.body, |off, old_idx| {
+                    if old_idx == def_unified_idx {
+                        patches.push((off, wrap_unified_idx));
+                    }
+                });
+                if walk.is_err() {
+                    continue;
+                }
+                for (off, new_idx) in patches {
+                    debug_assert!(off + 5 <= body_len);
+                    write_padded_leb128(&mut func.body, off, new_idx);
+                }
+            }
+            // Synthesize `__real_<wrap_name>` → original def alias so
+            // any input that calls the unwrapped function via the
+            // `__real_` prefix gets the canonical def. (No-op if
+            // nothing references `__real_<wrap_name>`.)
+            let mut real_name = b"__real_".to_vec();
+            real_name.extend_from_slice(wrap_name);
+            function_name_map
+                .entry(real_name)
+                .or_insert(def_unified_idx);
         }
     }
 
