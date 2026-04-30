@@ -29,9 +29,17 @@ and risk. Phases run independently and can ship as separate commits.
   `-emit-relocs` — a separate path, not unlocked.
 - ✅ **Phase 1d — fixture probe**: tried 6 candidates, none pass
   incidentally. No additional wins from this bucket.
-- ⏸ **Phase 2 — Map file**: started args parsing; needs byte-level
-  format matching with lld's output that's hard to verify without
-  running lld locally. Reverted partial work.
+- 🟡 **Phase 2 — Map file**: shipped as infrastructure (commits
+  752f083, c5a4897). Wild now emits a structurally-correct link map
+  on `-M` / `-Map=PATH` / `-print-map` covering sections, GLOBAL
+  sub-rows, CODE per-function rows with input attribution, and the
+  DATA segment top row. Plus `R_WASM_TABLE_INDEX_I32` /`_I64` in
+  data segments now register the target in the indirect function
+  table and patch the resolved table index back into the segment
+  bytes. The `map-file.s` fixture still fails on byte-level
+  parity (function body sizes, `.data`/`.bss` segment naming, per-
+  data-symbol sub-rows, name-section size), but the infra is in
+  for users who want a debug map.
 - ⏸ **Phase 3a — init/fini wrappers**: substantial — per-priority
   `.Lcall_dtors.<P>` / `.Lregister_call_dtors.<P>` synthesis plus
   `<func>.command_export` wrappers. Estimated >100 LOC, not the
