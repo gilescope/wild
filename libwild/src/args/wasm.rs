@@ -140,6 +140,14 @@ pub struct WasmArgs {
     /// debugging "why was my function dropped" — combined with
     /// `--no-gc-sections` to prove a function wasn't actually GC'd.
     pub(crate) print_gc_sections: bool,
+    /// `--why-extract=PATH`: write a TSV (header `reference<tab>
+    /// extracted<tab>symbol`) listing each archive member that got
+    /// pulled in, the file/entry that referenced it, and the symbol
+    /// that drove the load. `PATH` may be `-` for stdout. Same
+    /// dependency graph the incremental cache wants for archive-
+    /// resolution invalidation, so the instrumentation is shared
+    /// (gated on either flag being on).
+    pub(crate) why_extract: Option<String>,
 }
 
 impl Default for WasmArgs {
@@ -189,6 +197,7 @@ impl Default for WasmArgs {
             extra_features: Vec::new(),
             trace_symbols: Vec::new(),
             print_gc_sections: false,
+            why_extract: None,
         }
     }
 }
@@ -632,6 +641,16 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             "--print-gc-sections" => args.print_gc_sections = true,
             "--no-print-gc-sections" => args.print_gc_sections = false,
+            "--demangle" => args.common.demangle = true,
+            "--no-demangle" => args.common.demangle = false,
+            "--why-extract" => {
+                if let Some(p) = iter.next() {
+                    args.why_extract = Some(p.as_ref().to_string());
+                }
+            }
+            _ if arg.starts_with("--why-extract=") => {
+                args.why_extract = Some(arg["--why-extract=".len()..].to_string());
+            }
             "--compress-relocations" => args.compress_relocations = true,
             _ if arg.starts_with("--compress-relocations") => args.compress_relocations = true,
             _ if arg.starts_with("-M") | arg.starts_with("--Map") => {

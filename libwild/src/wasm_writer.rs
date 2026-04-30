@@ -187,6 +187,22 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         emit_sig_mismatch_warnings(&pre.sig_mismatch_diagnostics, &pre.sig_mismatch_types);
     }
 
+    // `--why-extract=PATH` (or via `--incremental-cache` for the same
+    // dependency edges): emit a TSV of archive-resolution edges.
+    // Runs before merge_inputs because merge_inputs may filter or
+    // reorder symbols; the raw input-symbol view is what we want
+    // here. `IncrementalCacheMode::Off` is the no-op default; both
+    // `Write` and `ReadWrite` activate the same instrumentation so
+    // the cache's reverse-resolution pass can replay the edges.
+    let want_why_extract = layout.symbol_db.args.why_extract.is_some()
+        || !matches!(
+            layout.symbol_db.args.common.incremental_cache,
+            crate::args::IncrementalCacheMode::Off,
+        );
+    if want_why_extract {
+        emit_why_extract(layout)?;
+    }
+
     // Collect functions from all input objects.
     let mut merged = merge_inputs(layout)?;
 
@@ -5830,6 +5846,168 @@ fn remap_call_targets(body: &mut [u8], index_map: &[Option<u32>]) {
 /// Two-pass approach:
 /// 1. Parse all objects, assign output indices, build global name→index map
 /// 2. Apply relocations using the global map
+/// `--why-extract` / `--incremental-cache` shared instrumentation.
+///
+/// Walks inputs in command-line order, builds the (defined, undef-ref)
+/// symbol set per input, then for each archive entry emits a row
+/// `<reference>\t<extracted>\t<symbol>` where:
+///   * `reference` = first earlier input (in cmdline order) that has
+///     an undef ref to one of this entry's defined symbols, formatted
+///     as `<basename>` for plain inputs and `<archive>(<member>)` for
+///     archive entries;
+///   * `extracted` = `<archive>(<member>)` of the loaded entry;
+///   * `symbol` = the defining symbol that drove the load, demangled
+///     by default (Itanium C++ ABI), raw under `--no-demangle`.
+///
+/// Wild's symbol_db loads archive members eagerly, so this is a
+/// post-hoc reconstruction of what *would* have been extracted under
+/// lazy semantics. Same dependency edges the incremental cache wants
+/// for archive-resolution invalidation — when the reference set
+/// across inputs hasn't changed since the cached link, the cache can
+/// skip re-resolving archives entirely.
+fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
+    use std::io::Write;
+
+    // Per-input view: command-line order, with archive-aware label.
+    struct InputView {
+        label: String,
+        is_archive_member: bool,
+        defines: Vec<Vec<u8>>,
+        undef_refs: Vec<Vec<u8>>,
+    }
+    let mut inputs: Vec<InputView> = Vec::new();
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(obj) = file else {
+                continue;
+            };
+            let data = obj.object.data;
+            if data.len() < 8 || &data[..4] != b"\0asm" {
+                continue;
+            }
+            let Ok(parsed) = parse_wasm_sections(data) else {
+                continue;
+            };
+            let host_basename = obj
+                .input
+                .file
+                .filename
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "?".into());
+            let (label, is_archive_member) = if let Some(entry) = obj.input.entry {
+                let member = std::path::Path::new(
+                    std::str::from_utf8(entry.identifier.as_slice()).unwrap_or("?"),
+                )
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "?".into());
+                (format!("{host_basename}({member})"), true)
+            } else {
+                (host_basename, false)
+            };
+
+            let mut defines: Vec<Vec<u8>> = Vec::new();
+            let mut undef_refs: Vec<Vec<u8>> = Vec::new();
+            for sym in &parsed.symbols {
+                let is_undef = (sym.flags & 0x10) != 0;
+                let is_absolute = (sym.flags & 0x200) != 0;
+                let name_bytes: Vec<u8> = if !sym.name.is_empty() {
+                    sym.name.clone()
+                } else {
+                    match sym.kind {
+                        0 => parsed
+                            .import_function_names
+                            .get(sym.index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                        2 => parsed
+                            .import_global_names
+                            .get(sym.index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    }
+                };
+                if name_bytes.is_empty() || is_absolute {
+                    continue;
+                }
+                if is_undef {
+                    undef_refs.push(name_bytes);
+                } else {
+                    defines.push(name_bytes);
+                }
+            }
+            inputs.push(InputView {
+                label,
+                is_archive_member,
+                defines,
+                undef_refs,
+            });
+        }
+    }
+
+    // For each archive entry, find the first earlier input that
+    // undef-references one of its definitions. lld's "reference"
+    // column. Symbols are walked in the entry's declaration order so
+    // ties (multiple defs satisfy multiple refs) pick the first.
+    let demangle_on = layout.symbol_db.args.common.demangle;
+    let display_name = |raw: &[u8]| -> String {
+        let s = String::from_utf8_lossy(raw);
+        if demangle_on {
+            symbolic_demangle::demangle(&s).to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for (i, view) in inputs.iter().enumerate() {
+        if !view.is_archive_member {
+            continue;
+        }
+        for sym in &view.defines {
+            // First earlier input in cmdline order with this name in
+            // its undef_refs wins.
+            let mut found = None;
+            for earlier in &inputs[..i] {
+                if earlier.undef_refs.iter().any(|r| r == sym) {
+                    found = Some(earlier.label.clone());
+                    break;
+                }
+            }
+            if let Some(reference) = found {
+                rows.push((reference, view.label.clone(), display_name(sym)));
+                break; // one row per extracted entry (first symbol that drove it)
+            }
+        }
+    }
+
+    // Output destination: `-` = stdout, anything else = file path.
+    // Always emit the header even when no rows (matches lld's
+    // why-extract.s CHECK1 arm).
+    let path = layout
+        .symbol_db
+        .args
+        .why_extract
+        .as_deref()
+        .unwrap_or("-");
+    let mut out: Box<dyn Write> = if path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        match std::fs::File::create(path) {
+            Ok(f) => Box::new(f),
+            Err(e) => crate::bail!("cannot open --why-extract file `{path}`: {e}"),
+        }
+    };
+    writeln!(out, "reference\textracted\tsymbol")
+        .map_err(|e| crate::error!("--why-extract write: {e}"))?;
+    for (r, e, s) in &rows {
+        writeln!(out, "{r}\t{e}\t{s}").map_err(|er| crate::error!("--why-extract write: {er}"))?;
+    }
+    Ok(())
+}
+
 fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule> {
     let entry_name = layout.symbol_db.args.entry_symbol_name(None);
     // Dedup set for unhandled-relocation diagnostics: warn once per type per link
