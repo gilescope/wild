@@ -1,0 +1,378 @@
+# wasm-link plan
+
+Roadmap for closing the remaining gap to lld byte-for-byte parity in
+wild's wasm linker. Snapshot date 2026-04-30 (updated post Phase 1).
+
+Current state (after Phase 1):
+
+- `lld_wasm_tests`: **125 passed** (was 122), 99 ignored, 0 failed.
+- `wasm_regression_tests`: 2 passed.
+- `--lld-compat` flag (mach-o `-ld64_compat` analog) enabled by the
+  test runner; off by default for production users who want speed
+  over byte equivalence.
+
+The remaining ignored tests sort into roughly 5 buckets by effort
+and risk. Phases run independently and can ship as separate commits.
+
+## Status (2026-04-30 post-session)
+
+- ✅ **Phase 1a — sig-mismatch trap stubs in exec mode**: shipped.
+  Unlocked `signature-mismatch-export.ll`. The `.s` variant's exec
+  arm passes too but its relocatable arm has a separate
+  `write_relocatable` symbol-ordering bug (UNDEF symbols resolved
+  by a later input drop their slot instead of reserving it; lld
+  preserves source-order). Left as follow-up.
+- ✅ **Phase 1b — `wasm-export-name` attribute**: shipped. Unlocked
+  `export-name.ll`.
+- ✅ **Phase 1c — `--wrap NAME` body rewrite**: shipped. Unlocked
+  `wrap_import.s`. The sibling `wrap.s` pairs `-wrap` with
+  `-emit-relocs` — a separate path, not unlocked.
+- ✅ **Phase 1d — fixture probe**: tried 6 candidates, none pass
+  incidentally. No additional wins from this bucket.
+- ⏸ **Phase 2 — Map file**: started args parsing; needs byte-level
+  format matching with lld's output that's hard to verify without
+  running lld locally. Reverted partial work.
+- ⏸ **Phase 3a — init/fini wrappers**: substantial — per-priority
+  `.Lcall_dtors.<P>` / `.Lregister_call_dtors.<P>` synthesis plus
+  `<func>.command_export` wrappers. Estimated >100 LOC, not the
+  ~90 in the original plan.
+- ⏸ **Phase 3b — PIE PIC-base imports**: probed. The minimal three-
+  line change (extend `is_shared` to `is_pic`) is necessary but not
+  sufficient — `weak-undefined-pic.s` PIE arm requires the GOT
+  pass-through to fire in input-order (per-object loop, not the PIC
+  block) AND lld's GlobalNames omits `__stack_pointer` based on
+  whether inputs reference it. The plan's "~60 LOC" is wildly
+  optimistic. Reverted.
+
+Net: +3 tests this session (122→125). Phase 1 essentially complete
+(within reach of what the plan promised). Phases 2/3/4 are each a
+multi-iteration commitment.
+
+---
+
+## Phase 1 — Cheap, contained wins
+
+Target: +5 tests, ~3 days. Each item self-bisecting. Order doesn't
+matter.
+
+### 1a. Sig-mismatch stub in exec mode
+
+**Tests unlocked:** `signature-mismatch.s`, `signature-mismatch-export.ll` (2)
+
+**Status:** wild already builds the data structure. `compute_sig_mismatch_stubs(layout)`
+runs at `wasm_writer.rs:186` in exec mode but only emits warnings
+(`emit_sig_mismatch_warnings`). The relocatable path at line 1379 has
+the actual stub-injection / name-renaming / reloc redirect logic.
+
+**Plan:** lift the stub-injection block out of `write_relocatable`
+into a helper, call it from both `write_relocatable` and exec-mode
+`merge_inputs`. Each input that pulls in a stub gets its symbol
+renamed to `signature_mismatch:<name>` (BINDING_LOCAL). The stub is
+an `unreachable; end` trap function reserving FUNCTION 0 (or 1 if
+`__wasm_call_ctors` is also synthesized).
+
+**Files:** `libwild/src/wasm_writer.rs`.
+
+**LOC:** ~80. **Risk:** low — algorithm is already proven.
+
+---
+
+### 1b. `wasm-export-name` attribute
+
+**Tests unlocked:** `export-name.ll` (1)
+
+**Status:** input `.o` files have an EXPORT section with custom names
+(e.g. `wasm-export-name="bar"` on the `foo` function makes the EXPORT
+say `bar`, not `foo`). Wild currently ignores the input EXPORT section.
+
+**Plan:**
+
+- Add `parsed.exports: Vec<InputExport>` to `parse_wasm_sections`.
+  Fields: `(name: Vec<u8>, kind: u8, index: u32)`.
+- During output EXPORT emit, when a function symbol carries
+  WASM_SYM_EXPORTED, look up the override name from
+  `parsed.exports` keyed by function index. Use the override name
+  in the output EXPORT entry instead of the symbol name.
+- Empty-string export names (`wasm-export-name=""`) pass through
+  unchanged — lld emits an export with an empty Name field.
+
+**Files:** `libwild/src/wasm_writer.rs`.
+
+**LOC:** ~40. **Risk:** low — read-only addition.
+
+---
+
+### 1c. `--wrap NAME` body rewrite
+
+**Tests unlocked:** `wrap_import.s` (1)
+
+**Status:** flag already parses into `args.wrap: Vec<String>`.
+Semantics not yet implemented.
+
+**Plan:**
+
+- Build `wrap_set` from `args.wrap`.
+- For each wrap-target name, add a synth `env.__wrap_<name>`
+  function import to `output_imports`.
+- Track `wrap_redirects: HashMap<(input_idx, sym_idx), import_idx>`.
+- During `symbol_to_output_func` population, redirect wrapped sym
+  indices to the wrap-import index (instead of the local-defined
+  function's index).
+- Refs to `__real_<name>` resolve to the original `<name>` (no rewrite
+  for these — the `__real_` symbol is already absent from
+  `function_name_map`, so look up the bare `<name>` and use that).
+
+**Files:** `libwild/src/wasm_writer.rs`, `libwild/src/args/wasm.rs`.
+
+**LOC:** ~60. **Risk:** medium — touches function-index bookkeeping.
+
+---
+
+### 1d. Test-runner fixture pulls
+
+**Tests unlocked:** ~1 (probabilistic)
+
+**Status:** several tests are skipped via broad content patterns
+(`comdat`, `--fatal-warnings`, `llvm-objdump`, `llvm-nm`). Some pass
+incidentally now after the `lld_compat`, mutable-globals, and trace-
+symbol work.
+
+**Plan:** quick probe — temporarily flip each broad pattern off, run
+the suite, record which previously-skipped tests pass. Add their
+stems to `KNOWN_PASSING`. Restore the broad patterns.
+
+**Files:** `wild/tests/lld_wasm_tests.rs`.
+
+**LOC:** ~10. **Risk:** zero — only enables tests.
+
+---
+
+## Phase 2 — Map file (high debug value)
+
+Target: +1 test, ~3 days. Pays off beyond its test count.
+
+### 2. `-M` / `-Map=PATH` / `-print-map`
+
+**Tests unlocked:** `map-file.s` (1)
+
+**Why it's worth more than 1 test:** pairs with `-y` and
+`--print-gc-sections` to make wild's wasm output as debuggable as
+lld's. Useful for "what's actually in this output and where?" — both
+for users and for our own diagnostic work.
+
+**Plan:**
+
+- Wrap `write_section` in a recording helper that captures
+  `(section_id, file_offset, size, name)`.
+- Per CODE function: track each body's offset within CODE (already
+  computed for relocs at `body_data_starts`).
+- Per data segment: track `(memory_offset, file_offset, size, name,
+  source_input_basename)`.
+- Format with fixed-width columns: `Addr=8 Off=8 Size=8 Out In Symbol`.
+  Use `-` for sections without a memory address.
+- Match lld's input-attribution syntax: `<basename>:(<funcname>)`
+  for code, `<basename>:(<section_name>)` for data.
+- Output destination: `--Map=PATH` writes to file, `-M` /
+  `-print-map` writes to stdout.
+
+**Files:** `libwild/src/wasm_writer.rs`, `libwild/src/args/wasm.rs`.
+
+**LOC:** ~120. **Risk:** low — output-only, no behavioural change.
+
+---
+
+## Phase 3 — Cluster B & PIE
+
+Target: +5 tests, ~5 days. Each commits independently.
+
+### 3a. Init/fini ctor/dtor wrappers
+
+**Tests unlocked:** `init-fini.ll`, `init-fini-no-gc.ll`, `command-exports.s` (3)
+
+**Status:** wild has `__wasm_call_ctors` synth. Missing: the dtor-
+registration wrappers and the command-export wrapper.
+
+**Plan (per recon agent's read of `lld/wasm/Writer.cpp::createCommandExportWrapper`):**
+
+- For each priority N in `llvm.global_dtors`, synth `.Lcall_dtors.N`
+  and `.Lregister_call_dtors.N` functions. Bodies call
+  `__cxa_atexit(<dtor>, …)`.
+- Synth `_start.command_export` wrapper:
+  `[locals=0] call __wasm_call_ctors; <user_start_args>; call _start;
+  call __wasm_call_dtors; end`.
+- Original `_start` gets VISIBILITY_HIDDEN; the wrapper takes its
+  EXPORT slot.
+- Detect `__cxa_atexit` presence as the gate for dtor synthesis.
+- Function-index bookkeeping: wrappers go after the `__wasm_call_ctors`
+  shift, before per-input defs. Recon estimated ~90 LOC; verify.
+
+**Files:** `libwild/src/wasm_writer.rs`.
+
+**LOC:** ~90. **Risk:** medium — function-idx shifts compound with
+the existing ctors-at-0 shift. Test in isolation, then verify all
+currently-passing tests against the shift bookkeeping.
+
+---
+
+### 3b. PIE PIC-base imports
+
+**Tests unlocked:** `pie.s`, `weak-undefined-pic.s` fully; partial
+progress on `shared-needed.s` and `dylink*` (unblocks but won't
+fully pass)
+
+**Status:** wild's `is_shared` path emits PIC-base imports
+(`__memory_base` / `__stack_pointer` / `__indirect_function_table` /
+`__table_base`). The `is_pic` (non-shared) path doesn't, even though
+PIE needs them. We already disabled GOT.func internalisation under
+`is_pic` (commit `c4fc1a3`), so the imports stay through Pass 4 —
+but the PIC-base imports themselves still need adding.
+
+**Plan:**
+
+- Extend the `if layout.symbol_db.args.is_shared` block at line 9145
+  to fire for `is_pic` too. Both modes need the same import set.
+- Skip the local memory section (line 442) under `is_pic` as well as
+  `is_shared` / `import_memory`.
+- Skip the local `__stack_pointer` synth global (line 6275) under
+  `is_pic` — it becomes an import.
+- Verify the `merged.is_static_pic` auto-detection still works (the
+  field gates wild's existing PIC-aware behaviour for inputs that use
+  PIC features without explicit `--experimental-pic`).
+
+**Files:** `libwild/src/wasm_writer.rs`.
+
+**LOC:** ~60. **Risk:** medium — memory section gating, GC interplay
+with the imported `__stack_pointer`. Several currently-passing
+tests touch the `is_shared` block; the extension to `is_pic` could
+inadvertently widen their scope.
+
+---
+
+## Phase 4 — Foundational refactors
+
+Target: +5–7 tests, ~10 days, but with high regression risk and
+diminishing test ratio. Defer until you actually need the byte
+parity.
+
+### 4a. Per-input EXPORT-emit-order tracking
+
+**Tests unlocked:** `weak-symbols.s`, `shared-weak-symbols.s`,
+`archive-export.test` (3); probably also fixes coincidental wins
+in currently-passing tests.
+
+**Why it's hard:** lld's EXPORT order varies per test. Three rules
+are mutually contradictory under any simple sort:
+
+- `stack-first.test`: by index, FUNC-first on tie.
+- `weak-symbols.s`: all FUNCTIONs (by idx), THEN all GLOBALs (by idx).
+- `visibility-hidden.ll`: GLOBAL-first when at lower idx.
+
+The actual rule is per-input encounter order with synth globals
+sorted by where they were synthesized (which differs across tests).
+
+**Plan:**
+
+- Refactor exports collection. Add `merged.export_order: Vec<EmitEntry>`
+  populated as symbols are walked, preserving the order each export
+  was decided.
+- Drop the post-collection `sort_by` (or limit it to memory/table
+  head pinning).
+- Migrate the `--lld-compat --export-all` bespoke order to live in
+  the same mechanism (currently uses a separate `lld_export_rank`
+  table).
+
+**Files:** `libwild/src/wasm_writer.rs`.
+
+**LOC:** substantial — refactors the existing 200-line emit.
+**Risk:** high — every currently-passing test with an EXPORT CHECK
+touches this. Bisect via the suite at every step.
+
+---
+
+### 4b. Shared library `.so` understanding
+
+**Tests unlocked:** `shared.s`, `shared-needed.s`, `stub-library*`
+(`-library`, `-archive`), `dylink*` (`-non-pie`, base), `static-error.s`,
+`no-shlib-sigcheck.s` (5–7); partial wins on `tls-export.s`.
+
+**Why it's hard:** new infrastructure. wild currently treats `.so`
+inputs as another `.o`, which produces invalid wasm output (the
+`out of order section type: 0` error from `no-shlib-sigcheck.s`).
+
+**Plan:**
+
+- Recognise `.so` inputs as dynamic libraries (check for `dylink.0`
+  custom section).
+- Parse the `.so`'s exported function table.
+- Resolve undef refs against the `.so`'s exports at link time;
+  emit imports for resolved names and a `Needed` entry in the
+  output's `dylink.0` section.
+- Don't extract code/data from the `.so` — only the export table
+  and the dependency chain.
+- Static-link error path: if main object has unresolved refs after
+  `.so` scan and `-static` is set, error like `static-error.s`
+  expects.
+
+**Files:** `libwild/src/wasm_writer.rs`, possibly `libwild/src/wasm.rs`
+for input recognition.
+
+**LOC:** ~300. **Risk:** high — new code path with dependencies on
+input loading, symbol resolution, error reporting.
+
+---
+
+## Phase 5 — Skip (low ROI / niche / unknown)
+
+- **Compact-imports proposal** (`compact-imports.s`): wasm extension
+  that reorders imports to share name strings. Niche; one test.
+  Unproven outside lld.
+- **`debuginfo.test`**: DWARF section integrity. Could be a one-line
+  fix or a multi-week DWARF rewrite — unknown until triage. Worth a
+  30-minute probe (run `llvm-dwarfdump` on wild's output, compare to
+  lld's, look for missing DIEs). Don't commit more without that.
+- **`-shared` arm of why-extract**: errors on unrelated grounds
+  (`/` is a directory, not openable for write). Would need shared-
+  library understanding (Phase 4b) AND the `cannot open` error
+  format polish.
+
+---
+
+## Recommended order
+
+1. **Phase 1** first — +5 tests in ~3 days, mostly contained risk,
+   each commit ships independently. Run the full suite after each.
+2. **Phase 2** if linker-debug tooling is on the wishlist; otherwise
+   defer. The map file pays back across every wasm bug for the next
+   year.
+3. **Phase 3** if PIE / init-fini are load-bearing for any actual
+   user (rust-wasm builds use init-fini for static initializers).
+4. **Phase 4** only if byte-for-byte shared-library parity is a
+   stated requirement. Otherwise, this is open-ended.
+5. **Phase 5**: leave alone unless a real user complaint surfaces.
+
+---
+
+## Test count projections
+
+Cumulative `lld_wasm_tests` passing if each phase ships:
+
+| After                | Passing | Ignored | Notes                          |
+| -------------------- | ------- | ------- | ------------------------------ |
+| (start)              | 122     | 102     | shipped 2026-04-30             |
+| Phase 1 (actual)     | 125     | 99      | 1a/1b/1c shipped, 1d 0 wins    |
+| Phase 2              | 126     | 98      | + map file                     |
+| Phase 3              | 131     | 93      | + ctor wrappers, PIE           |
+| Phase 4              | 136–139 | 85–88   | + exports order, .so handling  |
+| (lld parity ceiling) | ~143    | ~82     | minus the niche/unknown bucket |
+
+The tail (~80 ignored) is a mix of tests that exercise wasm features
+wild doesn't implement (multi-table reference types, custom-page-size
+imports outside the basic case, full LTO with the bitcode reader),
+tests that need the assembler/runtime tools we don't fully integrate
+(yaml2obj, llvm-readobj specific output formats), and tests for
+wasm proposals that aren't on wild's roadmap.
+
+Stretch byte parity beyond ~141 is diminishing returns — at that
+point most wasm-ld features wild needs for real users (Rust
+toolchain output, midnight-node-style host imports, basic shared
+libraries) are already covered.
