@@ -1330,6 +1330,32 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     let mut final_len = out.len();
     drop(out);
 
+    // `-M` / `-Map=PATH` / `-print-map`: walk the output bytes and
+    // emit a link map. Sections come first (one row per output
+    // section with its file offset and total length); CODE sub-rows
+    // give per-function offsets with input-file attribution; DATA
+    // sub-rows do the same for segments and the data symbols inside
+    // them. Format mirrors wasm-ld's `MapFile.cpp` — fixed 8-char
+    // hex columns plus indented label.
+    if let Some(map_target) = layout.symbol_db.args.map_file.clone() {
+        let map_text = generate_map_file(&sized_output.out[..final_len], &merged);
+        match map_target {
+            crate::args::wasm::MapFileTarget::Stdout => {
+                use std::io::Write;
+                let stdout = std::io::stdout();
+                let _ = stdout.lock().write_all(map_text.as_bytes());
+            }
+            crate::args::wasm::MapFileTarget::Path(p) => {
+                if let Err(e) = std::fs::write(&p, map_text.as_bytes()) {
+                    crate::bail!(
+                        "wild: error: cannot open map file {}: {e}",
+                        p.display()
+                    );
+                }
+            }
+        }
+    }
+
     // Post-link rewrites (wilt, LEB compression) operate on a
     // complete wasm module. Both the input (the bytes we just
     // wrote) and the output (the rewritten module) need their own
@@ -12397,6 +12423,175 @@ fn write_section<B: Buf>(out: &mut B, section_id: u8, payload: &[u8]) {
     out.push(section_id);
     write_leb128(out, payload.len() as u32);
     out.extend_from_slice(payload);
+}
+
+/// Generate a `-M`/`-Map=PATH` link map by re-parsing the linked
+/// output. Format mirrors wasm-ld's `MapFile.cpp`:
+///
+/// ```text
+///    Addr      Off     Size Out     In      Symbol
+///        -        8        e TYPE
+///        -       16        6 FUNCTION
+///        ...
+///        -       55       2d CODE
+///        -       56       10         <basename>:(<funcname>)
+///        -       56       10                 <funcname>
+///    10000       83        8 .data
+///    10000       8a        8         <basename>:(<segname>)
+///    10000       8a        8                 <symname>
+/// ```
+///
+/// Columns are 8-char hex, right-aligned. `Addr=-` for sections and
+/// code chunks; data segments and data symbols carry their memory
+/// address. Indent depth: 0 = section ("Out"), 8 spaces = input
+/// chunk ("In"), 16 spaces = symbol.
+fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
+    let mut out = String::new();
+    out.push_str("    Addr      Off     Size Out     In      Symbol\n");
+    if bytes.len() < 8 {
+        return out;
+    }
+
+    let section_label = |id: u8| -> String {
+        match id {
+            SECTION_TYPE => "TYPE".to_string(),
+            SECTION_IMPORT => "IMPORT".to_string(),
+            SECTION_FUNCTION => "FUNCTION".to_string(),
+            SECTION_TABLE => "TABLE".to_string(),
+            SECTION_MEMORY => "MEMORY".to_string(),
+            SECTION_GLOBAL => "GLOBAL".to_string(),
+            SECTION_EXPORT => "EXPORT".to_string(),
+            SECTION_START => "START".to_string(),
+            SECTION_ELEMENT => "ELEM".to_string(),
+            SECTION_CODE => "CODE".to_string(),
+            SECTION_DATA => "DATA".to_string(),
+            SECTION_DATACOUNT => "DATACOUNT".to_string(),
+            SECTION_TAG => "TAG".to_string(),
+            _ => format!("UNKNOWN({id})"),
+        }
+    };
+
+    let row = |out: &mut String, addr: Option<u64>, off: u64, size: u64, indent: usize, label: &str| {
+        let addr_s = match addr {
+            Some(a) => format!("{a:x}"),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:>8} {:>8x} {:>8x} {}{}\n",
+            addr_s,
+            off,
+            size,
+            " ".repeat(indent),
+            label
+        ));
+    };
+
+    // Build a quick `output_func_idx → name` map so per-function
+    // sub-entries can attribute themselves; ties go to the strong /
+    // alphabetically-first name (mirrors the name-section emit).
+    let mut func_idx_to_name: std::collections::HashMap<u32, &[u8]> = Default::default();
+    for (name, &idx) in &merged.function_name_map {
+        func_idx_to_name
+            .entry(idx)
+            .and_modify(|existing| {
+                if name.as_slice() < *existing {
+                    *existing = name.as_slice();
+                }
+            })
+            .or_insert(name.as_slice());
+    }
+
+    // Walk sections.
+    let mut pos = 8;
+    while pos < bytes.len() {
+        let section_start = pos;
+        let id = bytes[pos];
+        pos += 1;
+        let (size, c) = match read_leb128(&bytes[pos..]) {
+            Ok((v, c)) => (v as u64, c),
+            Err(_) => break,
+        };
+        pos += c;
+        let payload_start = pos;
+        let payload_end = payload_start + size as usize;
+        if payload_end > bytes.len() {
+            break;
+        }
+        let total_len = payload_end - section_start;
+        let label = if id == 0 {
+            // Custom section — name follows.
+            let payload = &bytes[payload_start..payload_end];
+            let (name_len, nc) = read_leb128(payload).unwrap_or((0, 0));
+            let name_bytes = &payload[nc..nc + name_len];
+            format!(
+                "CUSTOM({})",
+                std::str::from_utf8(name_bytes).unwrap_or("?")
+            )
+        } else {
+            section_label(id)
+        };
+        row(
+            &mut out,
+            None,
+            section_start as u64,
+            total_len as u64,
+            0,
+            &label,
+        );
+
+        // CODE: per-function sub-entries.
+        if id == SECTION_CODE {
+            let payload = &bytes[payload_start..payload_end];
+            let (num_funcs, nc) = read_leb128(payload).unwrap_or((0, 0));
+            let mut p = nc;
+            // First function's "Off" includes the section size LEB +
+            // num_funcs LEB attribution (lld convention — the leading
+            // metadata is folded into the first chunk's bookkeeping).
+            // Subsequent functions track their actual file offset.
+            let num_imports = merged.num_imported_functions;
+            for fi in 0..num_funcs {
+                let body_start = payload_start + p;
+                let (body_size, bc) = match read_leb128(&payload[p..]) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let body_total = bc + body_size;
+                p += body_total;
+                let func_idx = num_imports + fi as u32;
+                let name = func_idx_to_name
+                    .get(&func_idx)
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .unwrap_or_else(|| format!("function[{func_idx}]"));
+                let origin = merged
+                    .function_origin
+                    .get(name.as_bytes())
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_else(|| "?".to_string());
+                let (chunk_off, chunk_size) = if fi == 0 {
+                    // Folded: section size LEB + num_funcs LEB +
+                    // first body framing.
+                    (
+                        section_start as u64 + 1, // skip id only
+                        (body_total + 1 + nc) as u64,
+                    )
+                } else {
+                    (body_start as u64, body_total as u64)
+                };
+                row(
+                    &mut out,
+                    None,
+                    chunk_off,
+                    chunk_size,
+                    8,
+                    &format!("{origin}:({name})"),
+                );
+                row(&mut out, None, chunk_off, chunk_size, 16, &name);
+            }
+        }
+
+        pos = payload_end;
+    }
+    out
 }
 
 /// Number of bytes an unsigned LEB128 encoding of `value` would occupy.

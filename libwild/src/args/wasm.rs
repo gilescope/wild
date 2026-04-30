@@ -163,6 +163,22 @@ pub struct WasmArgs {
     /// error report introduced under default behaviour. Used by
     /// debug-undefined-fs.s.
     pub(crate) import_undefined: bool,
+    /// `-M` / `-print-map` / `--print-map` writes a link map to
+    /// stdout. `-Map=PATH` / `--Map=PATH` writes the same map to a
+    /// file. The map lists every output section's file offset and
+    /// size, plus per-function and per-data-segment chunks with
+    /// their input-file attribution — useful for debugging "what's
+    /// in this output and where?".
+    pub(crate) map_file: Option<MapFileTarget>,
+}
+
+/// Where a `-M` / `-Map=PATH` link map should be written.
+#[derive(Debug, Clone)]
+pub(crate) enum MapFileTarget {
+    /// `-M` / `-print-map` / `--print-map` — write the map to stdout.
+    Stdout,
+    /// `-Map=PATH` / `--Map=PATH` — write the map to PATH.
+    Path(std::path::PathBuf),
 }
 
 impl Default for WasmArgs {
@@ -215,6 +231,7 @@ impl Default for WasmArgs {
             why_extract: None,
             wrap: Vec::new(),
             import_undefined: false,
+            map_file: None,
         }
     }
 }
@@ -678,9 +695,24 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             "--compress-relocations" => args.compress_relocations = true,
             _ if arg.starts_with("--compress-relocations") => args.compress_relocations = true,
-            _ if arg.starts_with("-M") | arg.starts_with("--Map") => {
-                if arg == "-M" || arg == "--Map" {
-                    iter.next();
+            "-M" | "-print-map" | "--print-map" => {
+                args.map_file = Some(MapFileTarget::Stdout);
+            }
+            _ if arg.starts_with("-Map=") => {
+                args.map_file = Some(MapFileTarget::Path(
+                    std::path::PathBuf::from(&arg["-Map=".len()..]),
+                ));
+            }
+            _ if arg.starts_with("--Map=") => {
+                args.map_file = Some(MapFileTarget::Path(
+                    std::path::PathBuf::from(&arg["--Map=".len()..]),
+                ));
+            }
+            "-Map" | "--Map" => {
+                if let Some(p) = iter.next() {
+                    args.map_file = Some(MapFileTarget::Path(
+                        std::path::PathBuf::from(p.as_ref()),
+                    ));
                 }
             }
             "--emit-relocs" => args.emit_relocs = true,
