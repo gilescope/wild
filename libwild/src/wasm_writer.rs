@@ -5962,13 +5962,49 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
     };
 
     let mut rows: Vec<(String, String, String)> = Vec::new();
+    // Cmdline-injected references: `-u SYM` and `-e SYM` (or
+    // `--entry=SYM`). lld attributes the resulting archive load to
+    // `<internal>` and `--entry` respectively. Build a set of
+    // (sym_name, source_label) for these, processed BEFORE the
+    // input-driven references so they get first dibs.
+    let mut cmdline_refs: Vec<(Vec<u8>, &'static str)> = Vec::new();
+    for u in &layout.symbol_db.args.force_undefined {
+        cmdline_refs.push((u.as_bytes().to_vec(), "<internal>"));
+    }
+    if let Some(entry) = &layout.symbol_db.args.entry_symbol {
+        // Only treat the entry as a why-extract source when it's an
+        // archive load — i.e. some archive defines it. The
+        // entry_function_index gets resolved later, but for the row
+        // we just need name + source.
+        cmdline_refs.push((entry.clone(), "--entry"));
+    }
+    let mut consumed_archives: std::collections::HashSet<usize> = Default::default();
     for (i, view) in inputs.iter().enumerate() {
         if !view.is_archive_member {
             continue;
         }
+        // First check the cmdline-injected refs — they take
+        // precedence over input-driven refs because lld processes -u
+        // / -e symbols *before* walking input files.
+        let mut emitted = false;
         for sym in &view.defines {
-            // First earlier input in cmdline order with this name in
-            // its undef_refs wins.
+            if let Some((_, source)) = cmdline_refs.iter().find(|(n, _)| n == sym) {
+                rows.push((
+                    source.to_string(),
+                    view.label.clone(),
+                    display_name(sym),
+                ));
+                consumed_archives.insert(i);
+                emitted = true;
+                break;
+            }
+        }
+        if emitted {
+            continue;
+        }
+        // Otherwise: first earlier input in cmdline order with this
+        // name in its undef_refs wins.
+        for sym in &view.defines {
             let mut found = None;
             for earlier in &inputs[..i] {
                 if earlier.undef_refs.iter().any(|r| r == sym) {
@@ -5978,6 +6014,7 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
             }
             if let Some(reference) = found {
                 rows.push((reference, view.label.clone(), display_name(sym)));
+                consumed_archives.insert(i);
                 break; // one row per extracted entry (first symbol that drove it)
             }
         }
@@ -5997,7 +6034,10 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
     } else {
         match std::fs::File::create(path) {
             Ok(f) => Box::new(f),
-            Err(e) => crate::bail!("cannot open --why-extract file `{path}`: {e}"),
+            // Format matches lld's `cannot open --why-extract= file
+            // <path>: <reason>` so the why-extract.s ERR check passes
+            // verbatim.
+            Err(e) => crate::bail!("cannot open --why-extract= file {path}: {e}"),
         }
     };
     writeln!(out, "reference\textracted\tsymbol")
