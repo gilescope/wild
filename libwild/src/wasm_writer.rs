@@ -8221,6 +8221,17 @@ fn merge_inputs(
     }
     // Store deferred table relocs: (function_output_idx, offset_in_body, reloc_type, sym→func_idx)
     let mut deferred_table_relocs: Vec<(usize, usize, u8, u32)> = Vec::new();
+    // Same shape but for `R_WASM_TABLE_INDEX_I32` (and `_I64`) relocs
+    // sitting in a DATA segment — `.int32 funcsym` produces a 4-byte
+    // table-index value in the data initializer. Pass 2.5 records the
+    // (out_seg_idx, byte_off_in_seg, reloc_type, target_func_idx) so
+    // Pass 2.6 can write the resolved table index back into the
+    // segment bytes once the table is built. Function gets registered
+    // in `table_needed_order` at record time so the table actually
+    // contains the entry. Skipped under static-PIC / shared / PIC
+    // links — those modes have their own GOT-based addressing for
+    // function pointers in data and don't go through the table.
+    let mut deferred_data_table_relocs: Vec<(usize, usize, u8, u32)> = Vec::new();
 
     // Fix-ups for `R_WASM_FUNCTION_INDEX_LEB` relocs that resolved to
     // an *imported* function. Pass 4-5's shift loop below adds
@@ -8905,7 +8916,7 @@ fn merge_inputs(
                         let off_in_seg = reloc.offset - seg_start;
                         let mem_off = obj_seg_offsets[seg_i];
                         // Find the output segment that contains this memory offset.
-                        for out_seg in data_segments.iter_mut() {
+                        for (out_seg_idx, out_seg) in data_segments.iter_mut().enumerate() {
                             let seg_mem_start = out_seg.memory_offset;
                             let seg_mem_end = seg_mem_start + out_seg.data.len() as Addr;
                             let mem_off_a = mem_off as Addr;
@@ -8943,16 +8954,61 @@ fn merge_inputs(
                                         out_seg.data[buf_off..buf_off + 4]
                                             .copy_from_slice(&rel.to_le_bytes());
                                     }
+                                    19 if buf_off + 8 <= out_seg.data.len()
+                                        && !static_pic
+                                        && !layout.symbol_db.args.is_pic
+                                        && !layout.symbol_db.args.is_shared =>
+                                    {
+                                        // R_WASM_TABLE_INDEX_I64 — function
+                                        // index landing as an 8-byte LE value
+                                        // in a data initializer. Register the
+                                        // target function with the table and
+                                        // defer the byte patch until Pass 2.6
+                                        // assigns table indices.
+                                        let func_idx = value;
+                                        if table_needed_funcs.insert(func_idx) {
+                                            table_needed_order.push(func_idx);
+                                            table_needed_is_import.push(false);
+                                        }
+                                        deferred_data_table_relocs.push((
+                                            out_seg_idx,
+                                            buf_off,
+                                            19,
+                                            func_idx,
+                                        ));
+                                    }
                                     19 if buf_off + 8 <= out_seg.data.len() => {
-                                        // R_WASM_TABLE_INDEX_I64 — function index
-                                        // in a data initializer. No table-index
-                                        // mapping here (Pass 2.6 hasn't run), so
-                                        // emit the raw function index; callers
-                                        // either tolerate this or the value is
-                                        // patched via the deferred list above.
+                                        // R_WASM_TABLE_INDEX_I64 (static-PIC /
+                                        // shared / PIC fallback): keep the raw
+                                        // function-index payload — the GOT
+                                        // path resolves it at runtime.
                                         let v64 = value as u64;
                                         out_seg.data[buf_off..buf_off + 8]
                                             .copy_from_slice(&v64.to_le_bytes());
+                                    }
+                                    2 if buf_off + 4 <= out_seg.data.len()
+                                        && !static_pic
+                                        && !layout.symbol_db.args.is_pic
+                                        && !layout.symbol_db.args.is_shared =>
+                                    {
+                                        // R_WASM_TABLE_INDEX_I32 — function
+                                        // index landing as a 4-byte LE value
+                                        // in a data initializer. Same
+                                        // register-in-table + defer-patch
+                                        // pattern as the I64 case above.
+                                        // `.int32 funcsym` lowers to this in
+                                        // a non-PIC link.
+                                        let func_idx = value;
+                                        if table_needed_funcs.insert(func_idx) {
+                                            table_needed_order.push(func_idx);
+                                            table_needed_is_import.push(false);
+                                        }
+                                        deferred_data_table_relocs.push((
+                                            out_seg_idx,
+                                            buf_off,
+                                            2,
+                                            func_idx,
+                                        ));
                                     }
                                     other => {
                                         if warned_reloc_types.insert(other) {
@@ -9033,6 +9089,35 @@ fn merge_inputs(
                         // R_WASM_TABLE_INDEX_REL_SLEB64: same bias.
                         let v = table_idx as i64 - tbrel_bias;
                         write_padded_sleb128_i64(&mut func.body, *off_in_body, v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Apply deferred TABLE_INDEX patches in DATA segments. Same
+        // shape as the code-body patches above, but writes into the
+        // matching `data_segments[out_seg_idx]` byte buffer instead
+        // of `functions[..].body`. The function index has been
+        // registered with `table_needed_order` at record time so the
+        // table actually contains the entry by now.
+        for (out_seg_idx, buf_off, reloc_type, target_func_idx) in &deferred_data_table_relocs {
+            let table_idx = func_to_table_index
+                .get(target_func_idx)
+                .copied()
+                .unwrap_or(0);
+            if let Some(seg) = data_segments.get_mut(*out_seg_idx) {
+                match reloc_type {
+                    2 => {
+                        if *buf_off + 4 <= seg.data.len() {
+                            seg.data[*buf_off..*buf_off + 4]
+                                .copy_from_slice(&table_idx.to_le_bytes());
+                        }
+                    }
+                    19 => {
+                        if *buf_off + 8 <= seg.data.len() {
+                            seg.data[*buf_off..*buf_off + 8]
+                                .copy_from_slice(&(table_idx as u64).to_le_bytes());
+                        }
                     }
                     _ => {}
                 }
@@ -12586,6 +12671,110 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
                     &format!("{origin}:({name})"),
                 );
                 row(&mut out, None, chunk_off, chunk_size, 16, &name);
+            }
+        }
+
+        // GLOBAL: per-global sub-entries. lld uses Addr = global
+        // index, Off = 0, Size = 0 — the section is small and the
+        // rows are just for symbol attribution.
+        if id == SECTION_GLOBAL {
+            let num_imports = merged.num_imported_globals;
+            for (i, g) in merged.globals.iter().enumerate() {
+                let global_idx = num_imports + i as u32;
+                row(
+                    &mut out,
+                    Some(global_idx as u64),
+                    0,
+                    0,
+                    8,
+                    std::str::from_utf8(&g.name).unwrap_or("?"),
+                );
+            }
+        }
+
+        // DATA: per-segment + per-data-symbol sub-entries. Each
+        // segment row has Addr = memory offset, Off = file offset of
+        // the segment payload, Size = segment data length. Inner
+        // symbols get the same Addr+Off+Size unless we have finer
+        // per-symbol metadata.
+        if id == SECTION_DATA {
+            let payload = &bytes[payload_start..payload_end];
+            let (num_segs, nc) = read_leb128(payload).unwrap_or((0, 0));
+            let mut p = nc;
+            for si in 0..num_segs {
+                // Each segment: flags LEB, [memidx LEB if flags&2],
+                // init expr (until 0x0B), data size LEB, data bytes.
+                let seg_p_start = p;
+                let (flags, fc) = match read_leb128(&payload[p..]) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                p += fc;
+                if flags & 2 != 0 {
+                    let (_, c) = match read_leb128(&payload[p..]) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    p += c;
+                }
+                // Walk init expression bytes until end opcode 0x0B.
+                // Track the i32.const / i64.const value so the row
+                // can show the segment's memory offset.
+                let mut mem_off: Option<i64> = None;
+                if flags & 1 == 0 {
+                    if p < payload.len() {
+                        match payload[p] {
+                            0x41 => {
+                                // i32.const SLEB
+                                p += 1;
+                                if let Ok((v, c)) = read_sleb128(&payload[p..]) {
+                                    mem_off = Some(v as i64);
+                                    p += c;
+                                }
+                            }
+                            0x42 => {
+                                // i64.const SLEB
+                                p += 1;
+                                if let Ok((v, c)) = read_sleb128_i64_consumed(&payload[p..]) {
+                                    mem_off = Some(v);
+                                    p += c;
+                                }
+                            }
+                            _ => {
+                                while p < payload.len() && payload[p] != 0x0B {
+                                    p += 1;
+                                }
+                            }
+                        }
+                    }
+                    // Skip 0x0B end byte.
+                    if p < payload.len() && payload[p] == 0x0B {
+                        p += 1;
+                    }
+                }
+                let (data_len, dc) = match read_leb128(&payload[p..]) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let data_file_off = payload_start + p + dc;
+                p += dc + data_len;
+                let _ = seg_p_start;
+
+                // Per-segment name lookup: `merged.data_segments`
+                // doesn't carry the name today, so default to a
+                // generic `.data.N` placeholder. Lld emits `.data`
+                // and `.bss` here based on the segment's source
+                // section name; tracking that through merge_inputs
+                // is a follow-up.
+                let seg_name = format!(".data.{si}");
+                row(
+                    &mut out,
+                    mem_off.map(|v| v as u64),
+                    data_file_off as u64,
+                    data_len as u64,
+                    0,
+                    &seg_name,
+                );
             }
         }
 
