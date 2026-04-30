@@ -181,11 +181,17 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     // emit work — wasm-ld surfaces these as warnings to stderr in
     // both exec and -r modes (the resulting trap stub keeps the
     // module typecheckable; the warning lets the user know the link
-    // resolved a symbol non-trivially).
-    {
-        let pre = compute_sig_mismatch_stubs(layout);
-        emit_sig_mismatch_warnings(&pre.sig_mismatch_diagnostics, &pre.sig_mismatch_types);
-    }
+    // resolved a symbol non-trivially). The pre-pass result is also
+    // threaded into `merge_inputs` so the exec-mode emit synthesizes
+    // an `unreachable; end` trap stub at the lowest defined-function
+    // slot for each mismatched name; UNDEF function symbols matching
+    // those names route to the stub instead of the canonical def, so
+    // the importer's wrong-sig calls remain typecheckable.
+    let sig_mismatch_pre = compute_sig_mismatch_stubs(layout);
+    emit_sig_mismatch_warnings(
+        &sig_mismatch_pre.sig_mismatch_diagnostics,
+        &sig_mismatch_pre.sig_mismatch_types,
+    );
 
     // `--why-extract=PATH` (or via `--incremental-cache` for the same
     // dependency edges): emit a TSV of archive-resolution edges.
@@ -204,7 +210,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     }
 
     // Collect functions from all input objects.
-    let mut merged = merge_inputs(layout)?;
+    let mut merged = merge_inputs(layout, &sig_mismatch_pre)?;
 
     // Reorder synthesized functions to the front of `merged.functions`.
     // lld places synthetics (`__wasm_call_ctors`, `__wasm_init_memory`,
@@ -727,8 +733,21 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 .iter()
                 .find(|(_, idx)| **idx == func_idx)
             {
-                if !exports.iter().any(|(n, _, _)| n == name) {
-                    exports.push((name.clone(), EXPORT_FUNC, func_idx));
+                // `wasm-export-name="<custom>"` IR attribute pulls
+                // through here: the symbol name (e.g. `foo`) maps to
+                // a wasm export name (`bar`), captured during parse
+                // from the input EXPORT section. Empty `<custom>`
+                // ("") is preserved verbatim. The dedup check still
+                // uses the (possibly-overridden) export name — two
+                // overrides colliding on the same name would be a
+                // user-side error.
+                let export_name = merged
+                    .export_name_overrides
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+                if !exports.iter().any(|(n, _, _)| *n == export_name) {
+                    exports.push((export_name, EXPORT_FUNC, func_idx));
                 }
             }
         }
@@ -1389,9 +1408,18 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // imports. Used as a constant `num_func_imports` for symbol
     // index calculations so DEF symbols computed during the first
     // file's walk are correct even before later files' imports
-    // are added.
+    // are added. Uses `total_sig_mismatch_imports_elided` (the count
+    // of *imports* matching sig-mismatch names across all inputs)
+    // rather than `sig_mismatch_stubs.len()` (the count of *names*).
+    // The two diverge when several inputs import the same mismatched
+    // name — every one of those imports gets elided, but only one
+    // stub is synthesized per name. Without this, a 3-input case like
+    // signature-mismatch.s (main + ret32 + call all referencing
+    // `ret32`) emits a symbol table whose function indices point at
+    // the wrong slots and obj2yaml chokes with "invalid function
+    // symbol index".
     let num_func_imports_final: u32 =
-        total_input_func_imports.saturating_sub(sig_mismatch_stubs.len() as u32);
+        total_input_func_imports.saturating_sub(pre.total_sig_mismatch_imports_elided);
     // Map: sig-mismatched name → function index of its synthesized
     // stub. Stubs occupy the first M defined-function slots
     // (function indices `num_func_imports_final` .. `+M`), matching
@@ -4031,6 +4059,14 @@ struct MergedModule {
     /// Used by the `name` custom section's GlobalNames subsection
     /// so e.g. `g1` shows for an import whose field is `g`.
     import_global_names: Vec<Vec<u8>>,
+    /// Wasm-level export-name overrides. Keyed by the function's
+    /// LLVM symbol name (e.g. `foo`). The value is the wasm export
+    /// name to use instead (e.g. `bar`) — set by LLVM's
+    /// `wasm-export-name="<name>"` IR attribute, surfaced via the
+    /// input's EXPORT section. Empty value (`""`) is preserved
+    /// verbatim so `wasm-export-name=""` produces an export with an
+    /// empty Name field.
+    export_name_overrides: std::collections::HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl MergedModule {
@@ -6215,7 +6251,10 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
     Ok(())
 }
 
-fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule> {
+fn merge_inputs(
+    layout: &Layout<'_, Wasm>,
+    sig_mismatch_pre: &PrePassResult,
+) -> crate::error::Result<MergedModule> {
     let entry_name = layout.symbol_db.args.entry_symbol_name(None);
     // Dedup set for unhandled-relocation diagnostics: warn once per type per link
     // so silent fall-throughs in the reloc match arms are at least visible.
@@ -6241,6 +6280,12 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     let mut no_strip_indices: Vec<u32> = Vec::new();
     // Functions with WASM_SYM_EXPORTED flag (spec §4.2, flag 0x20).
     let mut exported_indices: Vec<u32> = Vec::new();
+    // `wasm-export-name="<custom>"` overrides keyed by the function's
+    // LLVM symbol name. Populated as inputs' EXPORT sections are
+    // consumed; consumed by the EXPORT emit pass to override the
+    // wasm-level name a function is exported under.
+    let mut export_name_overrides: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+        Default::default();
 
     // --- Pass 1: parse all objects, collect types and functions ---
     struct ObjectInfo {
@@ -6457,6 +6502,30 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                             entry_function_index = Some(output_idx);
                         }
                     }
+                }
+            }
+
+            // Capture `wasm-export-name="<custom>"` entries from the
+            // input's EXPORT section. Index in the input is the
+            // function's local position (imports + local defs); we
+            // resolve the function's LLVM symbol name through
+            // `parsed.function_names` (keyed by local-def index, so
+            // an import-targeted entry has no symbol-name match and
+            // is silently skipped — that case is rare). The override
+            // is keyed by the symbol name so it survives the
+            // post-shift index remap downstream.
+            for ovr in &parsed.export_overrides {
+                if ovr.kind != 0x00 {
+                    continue;
+                }
+                if ovr.index < parsed.num_function_imports {
+                    continue;
+                }
+                let local_def_idx = ovr.index - parsed.num_function_imports;
+                if let Some(name) = parsed.function_names.get(&local_def_idx) {
+                    export_name_overrides
+                        .entry(name.clone())
+                        .or_insert_with(|| ovr.name.clone());
                 }
             }
 
@@ -7813,6 +7882,77 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         total_functions += n_stubs;
     }
 
+    // --- Pass 1.86: synthesize sig-mismatch trap stubs (exec mode) ---
+    //
+    // Pre-pass already detected names that appear with mismatched
+    // function sigs across inputs (one file imports `foo` with sig X,
+    // another defines `foo` with sig Y). To keep the importer's
+    // wrong-sig calls typecheckable, we synthesize a trap stub
+    // (`unreachable; end`) carrying the import's sig and route the
+    // UNDEF function symbol → stub instead of the canonical def.
+    //
+    // Layout: stubs go right AFTER weak-undef stubs (and after ctors),
+    // so existing function_name_map values shift by `n_sig_mismatch`.
+    // The canonical def's name in function_name_map keeps pointing at
+    // the real def (just shifted) so `--export=<name>` still resolves
+    // correctly. The stubs land in `function_name_map` under the
+    // synthetic key `signature_mismatch:<name>` and are tagged
+    // BINDING_LOCAL so `--export-all` skips them.
+    //
+    // The bare-name → stub-idx redirect for the per-object UNDEF
+    // resolution lives in `sig_mismatch_redirect` and is consulted by
+    // Pass 2's symbol→func map construction (with priority over the
+    // canonical-def lookup) so the importer's call lands on the stub.
+    let n_sig_mismatch = sig_mismatch_pre.sig_mismatch_stubs.len() as u32;
+    let mut sig_mismatch_stub_specs: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut sig_mismatch_redirect: std::collections::HashMap<Vec<u8>, u32> = Default::default();
+    if n_sig_mismatch > 0 {
+        let pre_offset =
+            (if needs_ctors { 1 } else { 0 }) + weak_undef_stub_names.len() as u32;
+        for idx in function_name_map.values_mut() {
+            if *idx >= pre_offset {
+                *idx += n_sig_mismatch;
+            }
+        }
+        if let Some(ref mut idx) = entry_function_index
+            && *idx >= pre_offset
+        {
+            *idx += n_sig_mismatch;
+        }
+        for idx in exported_indices.iter_mut() {
+            if *idx >= pre_offset {
+                *idx += n_sig_mismatch;
+            }
+        }
+        for idx in no_strip_indices.iter_mut() {
+            if *idx >= pre_offset {
+                *idx += n_sig_mismatch;
+            }
+        }
+        // Resolve each stub's sig from the pre-pass's local types
+        // table into merge_inputs's `types` Vec via dedup, so the
+        // stub's TYPE matches the importer's expected signature.
+        for (i, (name, pre_sig_idx)) in sig_mismatch_pre.sig_mismatch_stubs.iter().enumerate() {
+            let Some(func_type) = sig_mismatch_pre.sig_mismatch_types.get(*pre_sig_idx as usize)
+            else {
+                continue;
+            };
+            let resolved_type_idx =
+                dedup_types_for_input(std::slice::from_ref(func_type), &mut types)[0];
+            let stub_idx = pre_offset + i as u32;
+            sig_mismatch_stub_specs.push((name.clone(), resolved_type_idx));
+            sig_mismatch_redirect.insert(name.clone(), stub_idx);
+            let mut prefixed = b"signature_mismatch:".to_vec();
+            prefixed.extend_from_slice(name);
+            // Insert under the prefixed key so `--export=<bare>` still
+            // resolves to the canonical def. Mark BINDING_LOCAL so
+            // `--export-all` and `--export-dynamic` skip the stub.
+            function_name_map.insert(prefixed.clone(), stub_idx);
+            function_is_local.insert(prefixed);
+        }
+        total_functions += n_sig_mismatch;
+    }
+
     // --- Pass 1.9: collect EH tags across all objects via symbol-name
     // resolution, mirroring the function-merge rules in Pass 1 (§9.2 and §7).
     //
@@ -8041,6 +8181,18 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             body: vec![0x00, 0x00, 0x0B],
         });
     }
+    // Sig-mismatch trap stubs land right after weak-undef stubs. Body
+    // is the same trap shape — `locals_count(0); unreachable; end`.
+    let sig_mismatch_stub_idx_set: std::collections::HashSet<u32> = sig_mismatch_redirect
+        .values()
+        .copied()
+        .collect();
+    for (_name, type_idx) in &sig_mismatch_stub_specs {
+        functions.push(MergedFunction {
+            type_index: *type_idx,
+            body: vec![0x00, 0x00, 0x0B],
+        });
+    }
     // Store deferred table relocs: (function_output_idx, offset_in_body, reloc_type, sym→func_idx)
     let mut deferred_table_relocs: Vec<(usize, usize, u8, u32)> = Vec::new();
 
@@ -8129,15 +8281,21 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                             .get(sym.index as usize)
                             .map(|v| v.as_slice())
                     };
-                    if let Some(name) = resolve_name
-                        && let Some(&def_idx) = function_name_map.get(name)
-                    {
-                        // Sub-case 1: resolved by a definition.
-                        symbol_to_output_func.insert(sym_idx as u32, def_idx);
+                    if let Some(name) = resolve_name {
+                        if let Some(&stub_idx) = sig_mismatch_redirect.get(name) {
+                            // Sub-case 1b: name has a sig-mismatch stub
+                            // — route the importer's call to the trap
+                            // stub instead of the canonical def, so the
+                            // wrong-sig call site stays typecheckable.
+                            symbol_to_output_func.insert(sym_idx as u32, stub_idx);
+                        } else if let Some(&def_idx) = function_name_map.get(name) {
+                            // Sub-case 1: resolved by a definition.
+                            symbol_to_output_func.insert(sym_idx as u32, def_idx);
+                        }
+                        // Sub-case 2 is handled by the post-shift fixup
+                        // (gathered in the body-reloc loop below using
+                        // `per_obj_func_imp_remap`).
                     }
-                    // Sub-case 2 is handled by the post-shift fixup
-                    // (gathered in the body-reloc loop below using
-                    // `per_obj_func_imp_remap`).
                 } else {
                     // Defined-out-of-range / synthetic / other edge cases
                     // — fall back to name resolution against defined
@@ -9809,6 +9967,7 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
             }
             v
         },
+        export_name_overrides,
     })
 }
 
@@ -9854,6 +10013,16 @@ struct PrePassResult {
     sig_mismatch_types: Vec<FuncType>,
     /// Total function imports across all input files BEFORE elision.
     total_input_func_imports: u32,
+    /// Total kind=0 imports across all inputs whose `field` matches a
+    /// sig-mismatch name — i.e. those that the relocatable emit will
+    /// elide in favour of the synthesized trap stub. Counted post-walk
+    /// (we need `sig_mismatch_stubs` to know which fields qualify), so
+    /// this triple-counts when multiple inputs import the same name.
+    /// Used by `write_relocatable` to size `num_func_imports_final`
+    /// correctly: the formula needs the count of *imports* elided, not
+    /// the count of *names* elided, because dedup later collapses
+    /// same-name imports but the stub already replaces all of them.
+    total_sig_mismatch_imports_elided: u32,
     /// Approximate total defined functions in output (sum of inputs'
     /// `parsed.functions.len()`). Sig-mismatch stubs and COMDAT skip
     /// adjustments aren't accounted for here, so the count LEB sized
@@ -10087,11 +10256,40 @@ fn compute_sig_mismatch_stubs(layout: &Layout<'_, Wasm>) -> PrePassResult {
         });
         sig_mismatch_stubs.push((name, isig));
     }
+
+    // Count imports across all inputs that match a sig-mismatch name.
+    // Reuses already-parsed inputs from the pre-pass loop above; this
+    // second walk is only over the imports list (cheap relative to the
+    // parse cost).
+    let sig_mismatch_name_set: std::collections::HashSet<&[u8]> =
+        sig_mismatch_stubs.iter().map(|(n, _)| n.as_slice()).collect();
+    let mut total_sig_mismatch_imports_elided = 0u32;
+    if !sig_mismatch_name_set.is_empty() {
+        for group in &layout.group_layouts {
+            for file in &group.files {
+                let FileLayout::Object(obj) = file else { continue };
+                let data = obj.object.data;
+                if data.len() < 8 || &data[..4] != b"\0asm" {
+                    continue;
+                }
+                let Ok(parsed) = parse_wasm_sections(data) else { continue };
+                for imp in &parsed.imports {
+                    if imp.kind == 0
+                        && sig_mismatch_name_set.contains(imp.field.as_slice())
+                    {
+                        total_sig_mismatch_imports_elided += 1;
+                    }
+                }
+            }
+        }
+    }
+
     PrePassResult {
         sig_mismatch_stubs,
         sig_mismatch_diagnostics,
         sig_mismatch_types: tmp_types,
         total_input_func_imports,
+        total_sig_mismatch_imports_elided,
         approx_total_funcs,
         approx_total_segs,
         max_table_reach,
@@ -10635,6 +10833,30 @@ struct ParsedInput {
     /// (SYMTAB_SECTION) symbols referenced by R_WASM_SECTION_OFFSET_I32.
     /// Only custom sections are populated; other section kinds are absent.
     section_index_to_name: std::collections::HashMap<u32, Vec<u8>>,
+    /// Entries from the input's EXPORT section. LLVM emits these for
+    /// functions carrying the `wasm-export-name="<custom>"` IR
+    /// attribute — the function still has its IR symbol name (e.g.
+    /// `foo`), but the export entry says the wasm export should be
+    /// `<custom>` (e.g. `bar`). Empty `<custom>` ("") is also
+    /// meaningful: wasm-ld preserves it verbatim, producing an export
+    /// with an empty Name field. Wild's EXPORT-emit pass keys these
+    /// off the input function index and substitutes the override
+    /// where one exists. Globals/memories/tables aren't relevant to
+    /// the current set of fixtures, so only the function entries are
+    /// recorded.
+    export_overrides: Vec<InputExport>,
+}
+
+/// One entry from an input's EXPORT section. Captured during parse
+/// and consumed by the EXPORT-emit pass to override the wasm-level
+/// name a function/global/memory/table is exported under.
+#[derive(Debug, Clone)]
+struct InputExport {
+    name: Vec<u8>,
+    kind: u8,
+    /// Local index in the input's namespace (e.g. function-index
+    /// space — imports + local defs).
+    index: u32,
 }
 
 struct ParsedFunction {
@@ -10672,6 +10894,7 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
     let mut data_section_index: Option<usize> = None;
     let mut elem_table_reach: u32 = 0;
     let mut element_segments: Vec<(u32, Vec<u32>)> = Vec::new();
+    let mut export_overrides: Vec<InputExport> = Vec::new();
     let mut section_counter = 0usize;
     // Track custom sections' position in the section stream so reloc.*
     // sections targeting a custom section by index can resolve to its name.
@@ -10820,6 +11043,38 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
             }
             SECTION_FUNCTION => {
                 func_type_indices = parse_function_section(payload)?;
+            }
+            SECTION_EXPORT => {
+                // Capture per-function/global/memory/table export
+                // overrides. LLVM emits these for functions tagged
+                // with `wasm-export-name="<custom>"`. The output
+                // export name then comes from the input's EXPORT
+                // entry, not from the symbol's IR name. Empty
+                // `<custom>` (`wasm-export-name=""`) is preserved
+                // verbatim — wasm-ld emits an export with an empty
+                // Name field for that function.
+                let (count, mut off) = read_leb128(payload)?;
+                for _ in 0..count {
+                    let (name_len, c) = read_leb128(&payload[off..])?;
+                    off += c;
+                    if off + name_len > payload.len() {
+                        break;
+                    }
+                    let name = payload[off..off + name_len].to_vec();
+                    off += name_len;
+                    if off >= payload.len() {
+                        break;
+                    }
+                    let kind = payload[off];
+                    off += 1;
+                    let (index, c) = read_leb128(&payload[off..])?;
+                    off += c;
+                    export_overrides.push(InputExport {
+                        name,
+                        kind,
+                        index: index as u32,
+                    });
+                }
             }
             SECTION_CODE => {
                 code_section_index = Some(section_counter);
@@ -11056,6 +11311,7 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
             .iter()
             .map(|(&idx, name)| (idx as u32, name.clone()))
             .collect(),
+        export_overrides,
     })
 }
 

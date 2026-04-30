@@ -275,6 +275,27 @@ const KNOWN_PASSING: &[&str] = &[
     // GC-aware strong-undef-symbol error reporting (so `not wasm-ld
     // main.o a_b.a` errors on undef `_Z1bv`).
     "why-extract",
+    // Sig-mismatch trap stub in exec mode (Phase 1a). When a name has
+    // an UNDEF function symbol with one sig in file A and a DEF with
+    // a different sig in file B, the merge synthesizes
+    // `signature_mismatch:<name>` (BINDING_LOCAL) at the lowest
+    // defined-function slot, with body `unreachable; end`. UNDEF
+    // function symbols matching that name route to the stub instead
+    // of the canonical def, so the importer's wrong-sig calls stay
+    // typecheckable. The canonical def keeps its name in
+    // function_name_map → `--export=<name>` and the EXPORT entry
+    // still resolve to the real def. Pre-pass already detected the
+    // mismatch and surfaced the warning. `signature-mismatch-export`
+    // exercises the exec-mode shape via an llc-emitted bitcode test
+    // — was on the per-stem skip list explicitly until Phase 1a
+    // landed. The sibling `signature-mismatch.s` exec arm passes too,
+    // but it also has a relocatable arm whose symbol-table ordering
+    // doesn't match wasm-ld's (when an UNDEF function symbol gets
+    // resolved by a later input, wild's `-r` walker drops the slot
+    // instead of reserving it; lld preserves the source-order slot).
+    // That's a separate issue in `write_relocatable` and stays a
+    // follow-up — keep `.s` skipped for now.
+    "signature-mismatch-export",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
@@ -342,8 +363,6 @@ fn should_skip(content: &str, path: &Path) -> bool {
         if matches!(
             stem,
             "init-fini-no-gc"
-                | "export-name"
-                | "signature-mismatch-export"
                 | "debuginfo"
                 // export-all now passes
                 | "debug-removed-fn"
