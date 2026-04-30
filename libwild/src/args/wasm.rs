@@ -148,6 +148,14 @@ pub struct WasmArgs {
     /// resolution invalidation, so the instrumentation is shared
     /// (gated on either flag being on).
     pub(crate) why_extract: Option<String>,
+    /// `-wrap NAME` / `--wrap NAME` / `--wrap=NAME`: rewrite every
+    /// reference to `NAME` so it targets `__wrap_NAME` instead, and
+    /// every reference to `__real_NAME` so it targets `NAME`. The
+    /// definition of `NAME` (if any) stays in place — typically the
+    /// wrapper sits in another input and calls `__real_NAME`. lld's
+    /// canonical use case: instrumenting a single function without
+    /// touching its callers.
+    pub(crate) wrap: Vec<String>,
 }
 
 impl Default for WasmArgs {
@@ -198,6 +206,7 @@ impl Default for WasmArgs {
             trace_symbols: Vec::new(),
             print_gc_sections: false,
             why_extract: None,
+            wrap: Vec::new(),
         }
     }
 }
@@ -624,9 +633,13 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                 args.trace_symbols
                     .push(arg["-trace-symbol=".len()..].to_string());
             }
-            _ if arg.starts_with("--wrap=") => {}
+            _ if arg.starts_with("--wrap=") => {
+                args.wrap.push(arg["--wrap=".len()..].to_string());
+            }
             "-wrap" | "--wrap" => {
-                iter.next();
+                if let Some(name) = iter.next() {
+                    args.wrap.push(name.as_ref().to_string());
+                }
             }
             _ if arg.starts_with("-rpath") => {
                 if arg == "-rpath" {

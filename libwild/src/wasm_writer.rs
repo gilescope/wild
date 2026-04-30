@@ -7229,13 +7229,49 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
         }
     }
     let mut got_func_globals: Vec<(u32, Vec<u8>)> = Vec::new();
-    if !layout.symbol_db.args.is_shared {
+    // Internalisation: only under non-shared, non-PIE links. Under
+    // `-pie` / `--experimental-pic` the dynamic linker is around and
+    // resolves GOT imports at load time (weak-undefined-pic.s third
+    // arm), so the imports stay as imports through Pass 4 instead of
+    // being substituted with locally-defined zero/table-slot globals.
+    if !layout.symbol_db.args.is_shared && !layout.symbol_db.args.is_pic {
         // wasm-ld emission convention for internalised GOT globals:
         //   `GOT.func.internal.<sym>` for GOT.func imports
         //   `GOT.data.internal.<sym>` for GOT.mem or GOT.data imports
         // and it orders them: all func GOTs first, then all data GOTs.
         let mut seen_got: std::collections::HashSet<(Vec<u8>, Vec<u8>)> = Default::default();
 
+        // Pre-collect weak-undef function names for the GOT-naming
+        // convention below. lld uses `GOT.func.internal.undefined_weak:foo`
+        // (not `GOT.func.internal.foo`) when the underlying symbol is a
+        // weak-undef stub. The `undefined_weak:` prefix matches lld's
+        // synthetic-stub naming and is what `weak-undefined-pic.s` /
+        // `undefined-weak-call.s` pin in their `GlobalNames`. Computed
+        // inline here because `weak_undef_stub_names` is built later
+        // in the pass.
+        let mut weak_undef_for_got: std::collections::HashSet<Vec<u8>> = Default::default();
+        for obj in &objects {
+            for sym in &obj.parsed.symbols {
+                if sym.kind != 0 {
+                    continue;
+                }
+                let undef = (sym.flags & 0x10) != 0;
+                let weak = (sym.flags & 0x01) != 0;
+                if !undef || !weak {
+                    continue;
+                }
+                let name: &[u8] = if !sym.name.is_empty() {
+                    sym.name.as_slice()
+                } else if (sym.index as usize) < obj.parsed.import_function_names.len() {
+                    obj.parsed.import_function_names[sym.index as usize].as_slice()
+                } else {
+                    continue;
+                };
+                if !function_name_map.contains_key(name) {
+                    weak_undef_for_got.insert(name.to_vec());
+                }
+            }
+        }
         // --- First sub-pass: GOT.func.* entries. ---
         for obj_info in &objects {
             for imp in &obj_info.parsed.imports {
@@ -7247,7 +7283,11 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
                     continue;
                 }
                 let func_name = imp.field.clone();
+                let is_weak_undef = weak_undef_for_got.contains(func_name.as_slice());
                 let mut got_name = b"GOT.func.internal.".to_vec();
+                if is_weak_undef {
+                    got_name.extend_from_slice(b"undefined_weak:");
+                }
                 got_name.extend_from_slice(&func_name);
                 let global_idx = globals.len() as u32;
                 global_name_map.insert(got_name.clone(), global_idx);
@@ -8672,7 +8712,23 @@ fn merge_inputs(layout: &Layout<'_, Wasm>) -> crate::error::Result<MergedModule>
     // table_needed_funcs has been consumed to build func_to_table_index,
     // which maps pre-import-shift func index → table slot. Under static
     // link, GOT.func globals hold that table slot at runtime.
+    let weak_undef_names: std::collections::HashSet<&[u8]> = weak_undef_stub_names
+        .iter()
+        .map(|(n, _)| n.as_slice())
+        .collect();
     for (global_idx, func_name) in &got_func_globals {
+        // Weak-undef GOT entries resolve to 0 — the runtime sees a
+        // null function pointer and can detect "not present." lld:
+        // even though wild synthesises a trapping stub for direct
+        // calls (so `call foo` is type-safe), the GOT slot is the
+        // address-taken view, and that one stays 0 so
+        // `if (foo) foo()` patterns work.
+        if weak_undef_names.contains(func_name.as_slice()) {
+            if let Some(g) = globals.get_mut(*global_idx as usize) {
+                g.init_value = 0;
+            }
+            continue;
+        }
         // First try defined funcs; then fall back to imported functions
         // whose output funcidx was precomputed as
         // `function_import_output_idx[name]`. func_to_table_index keys
