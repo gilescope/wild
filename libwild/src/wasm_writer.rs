@@ -235,6 +235,22 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     // body call operands.
     reorder_synth_functions_first(&mut merged);
 
+    // Synthesize `<entry>.command_export` wrapper when ctors exist —
+    // calls `__wasm_call_ctors`, forwards args, then calls the
+    // original entry. The wrapper takes the entry's export slot so
+    // the runtime sees ctor calls before any user code. Runs BEFORE
+    // GC so the wrapper's references to `__wasm_call_ctors` and the
+    // original entry function keep both alive through the GC pass.
+    // Pairs with the `prune_init_funcs` pass inside `merge_inputs`
+    // — together they implement command-style init/fini without
+    // dragging in archive members whose only path was through a
+    // dead reference. Skipped under `--export-all` (library-style,
+    // exports go direct without wrapper) and `--no-entry` (no entry
+    // function to wrap).
+    if !layout.symbol_db.args.export_all && !layout.symbol_db.args.no_entry {
+        synth_command_export_wrapper(&mut merged);
+    }
+
     // GC: remove unreferenced functions (spec §9.1).
     if layout.symbol_db.args.should_gc_sections() {
         let function_origin = std::mem::take(&mut merged.function_origin);
@@ -4224,6 +4240,112 @@ fn compute_custom_section_index_in_output(merged: &MergedModule, name: &[u8]) ->
 /// (lld assigns `__wasm_init_tls` before `__wasm_init_memory`
 /// in `Driver::createSyntheticSymbols` ordering — see
 /// `tls-init-symbols.s` which CHECKs that order.)
+/// Synthesize a `<entry>.command_export` wrapper when
+/// `__wasm_call_ctors` is in the module. The wrapper:
+///
+/// ```text
+/// locals_count(0)
+/// call __wasm_call_ctors
+/// local.get 0   ; per param
+/// local.get 1
+/// ...
+/// call <original>
+/// end
+/// ```
+///
+/// Reroutes `merged.entry_function_index` to the wrapper. The
+/// original entry stays in `merged.functions` (the wrapper's `call`
+/// keeps it alive through GC) and is still available for direct
+/// refs from other functions.
+///
+/// Skipped when no ctors exist (no `__wasm_call_ctors` in
+/// `function_name_map`) — lld only emits the wrapper for "command"
+/// linkage with active initializers, falling back to a direct
+/// export of the original entry otherwise.
+fn synth_command_export_wrapper(merged: &mut MergedModule) {
+    let Some(&ctors_idx) = merged
+        .function_name_map
+        .get(b"__wasm_call_ctors".as_slice())
+    else {
+        return;
+    };
+    let Some(entry_idx) = merged.entry_function_index else {
+        return;
+    };
+    if entry_idx == ctors_idx {
+        // Don't double-wrap `__wasm_call_ctors` itself.
+        return;
+    }
+    let entry_name: Vec<u8> = match merged
+        .function_name_map
+        .iter()
+        .find(|(_, i)| **i == entry_idx)
+        .map(|(n, _)| n.clone())
+    {
+        Some(n) => n,
+        None => return,
+    };
+    let num_imports = merged.num_imported_functions;
+    let entry_local = match entry_idx.checked_sub(num_imports) {
+        Some(n) if (n as usize) < merged.functions.len() => n as usize,
+        _ => return,
+    };
+    let type_idx = merged.functions[entry_local].type_index;
+    let type_sig = merged.types.get(type_idx as usize).cloned();
+
+    // Skip wrapping when the entry's body already calls
+    // `__wasm_call_ctors`. Inputs hand-written or transformed by
+    // the user (`ctor-return-value.s`'s `_start` literally has
+    // `call __wasm_call_ctors`) don't need an extra wrapper.
+    // Detect this by walking the entry body's funcidx operands.
+    let entry_calls_ctors = {
+        let body = &merged.functions[entry_local].body;
+        let mut found = false;
+        let _ = walk_funcidx_operands(body, |_, op| {
+            if op == ctors_idx {
+                found = true;
+            }
+        });
+        found
+    };
+    if entry_calls_ctors {
+        return;
+    }
+
+    // Build wrapper body.
+    let mut body = Vec::new();
+    body.push(0x00); // locals_count = 0
+    body.push(0x10); // call
+    write_leb128(&mut body, ctors_idx);
+    if let Some(sig) = type_sig {
+        for (i, _) in sig.params.iter().enumerate() {
+            body.push(0x20); // local.get
+            write_leb128(&mut body, i as u32);
+        }
+    }
+    body.push(0x10); // call
+    write_leb128(&mut body, entry_idx);
+    body.push(0x0B); // end
+
+    let wrapper_local = merged.functions.len();
+    let wrapper_unified = num_imports + wrapper_local as u32;
+    merged.functions.push(MergedFunction {
+        type_index: type_idx,
+        body,
+    });
+
+    let mut wrapper_name = entry_name;
+    wrapper_name.extend_from_slice(b".command_export");
+    merged
+        .function_name_map
+        .insert(wrapper_name, wrapper_unified);
+
+    // Reroute entry → wrapper. The original entry stays in
+    // `merged.functions` (the wrapper's `call` keeps it alive); the
+    // export emit picks up the wrapper via the rerouted entry idx.
+    merged.entry_function_index = Some(wrapper_unified);
+}
+
 fn reorder_synth_functions_first(merged: &mut MergedModule) {
     const SYNTH_NAMES: &[&[u8]] = &[
         b"__wasm_call_ctors",
@@ -6337,6 +6459,11 @@ fn merge_inputs(
         comdat_skip_data: std::collections::HashSet<u32>,
         /// Local tag indices from duplicate COMDAT groups (to skip).
         comdat_skip_tags: std::collections::HashSet<u32>,
+        /// File-name basename (matches `function_origin`'s value
+        /// side). Used by post-merge passes that need to attribute a
+        /// merged function back to its source object — the
+        /// `prune_init_funcs` pass keys aliveness off this.
+        basename: Vec<u8>,
     }
     let mut objects: Vec<ObjectInfo> = Vec::new();
     let mut total_functions = 0u32;
@@ -6569,6 +6696,32 @@ fn merge_inputs(
             }
 
             total_functions += parsed.functions.len() as u32;
+            // Identify each object uniquely. For archive members,
+            // include the entry name so different members of the
+            // same .a get distinct ids — `function_origin`'s
+            // basename collapses both into the archive path
+            // ("lib.a"), which would let an alive lib.o resurrect
+            // a dead ctor.o sibling through the prune pass.
+            let basename = if let Some(entry) = obj.input.entry.as_ref() {
+                let mut s = obj
+                    .input
+                    .file
+                    .filename
+                    .file_name()
+                    .map(|s| s.as_encoded_bytes().to_vec())
+                    .unwrap_or_default();
+                s.push(b'(');
+                s.extend_from_slice(entry.identifier.as_slice());
+                s.push(b')');
+                s
+            } else {
+                obj.input
+                    .file
+                    .filename
+                    .file_name()
+                    .map(|s| s.as_encoded_bytes().to_vec())
+                    .unwrap_or_default()
+            };
             objects.push(ObjectInfo {
                 parsed,
                 type_map,
@@ -6576,6 +6729,7 @@ fn merge_inputs(
                 comdat_skip_functions,
                 comdat_skip_data,
                 comdat_skip_tags,
+                basename,
             });
         }
     }
@@ -7692,8 +7846,16 @@ fn merge_inputs(
 
     // --- Pass 1.8: collect init functions and synthesize __wasm_call_ctors ---
     // This must happen BEFORE Pass 2 so relocs can resolve __wasm_call_ctors refs.
+    // `init_funcs_origin` runs in lockstep with `all_init_funcs` and
+    // records which input contributed each entry (basename matches
+    // `function_origin`'s value side). The post-merge `prune_init_funcs`
+    // pass uses this to drop init entries whose source object has no
+    // *other* live function — the dead-archive-path case (lld solves
+    // this with two-pass archive resolution).
     let mut all_init_funcs: Vec<(u32, u32)> = Vec::new(); // (priority, output_func_idx)
+    let mut init_funcs_origin: Vec<Vec<u8>> = Vec::new();
     for obj_info in &objects {
+        let obj_basename: &[u8] = &obj_info.basename;
         // From WASM_INIT_FUNCS (linking section §6).
         for init in &obj_info.parsed.init_functions {
             if let Some(sym) = obj_info.parsed.symbols.get(init.symbol_index as usize) {
@@ -7701,6 +7863,7 @@ fn merge_inputs(
                     let local_idx = sym.index - obj_info.parsed.num_function_imports;
                     let output_idx = obj_info.func_base + local_idx;
                     all_init_funcs.push((init.priority, output_idx));
+                    init_funcs_origin.push(obj_basename.to_vec());
                 }
             }
         }
@@ -7737,6 +7900,7 @@ fn merge_inputs(
                         };
                         if let Some(idx) = output_idx {
                             all_init_funcs.push((priority, idx));
+                            init_funcs_origin.push(obj_basename.to_vec());
                         }
                     }
                 }
@@ -7790,6 +7954,16 @@ fn merge_inputs(
         }
         for idx in no_strip_indices.iter_mut() {
             *idx += 1;
+        }
+        // Same shift for any defined-function entries already in
+        // `table_needed_order` (added by the static-PIC GOT.func
+        // pass at Pass 1.75 — those used pre-shift function_name_map
+        // values). Skip import entries; they live before the ctors
+        // insertion in the unified namespace and don't move.
+        for (i, idx) in table_needed_order.iter_mut().enumerate() {
+            if !table_needed_is_import.get(i).copied().unwrap_or(false) {
+                *idx += 1;
+            }
         }
 
         // Register __wasm_call_ctors at index 0.
@@ -9138,6 +9312,130 @@ fn merge_inputs(
         }
     }
 
+    // --- Pass 2.7: prune init funcs whose source object has no
+    // other live function (lld's two-pass archive resolution
+    // approximation).
+    //
+    // Wild's archive resolution is symbol-driven but doesn't
+    // re-evaluate object aliveness post-GC. When an archive member
+    // gets pulled in via a reference from a function that turns out
+    // to be dead, the member's `init_array` contributions stay in
+    // `all_init_funcs` even though no live code from that object
+    // survives. Without this, a `<entry>.command_export` wrapper
+    // (which keeps `__wasm_call_ctors` alive and propagates init
+    // funcs into the live set) would resurrect those init targets
+    // along with their entire transitive chain — regressing
+    // `ctor-gc-setup` while trying to fix `ctor-no-gc`.
+    //
+    // Strategy: iteratively compute reachability skipping
+    // `__wasm_call_ctors`'s outgoing edges. An init_func entry is
+    // kept iff its source object basename has at least one
+    // reachable function in the current iteration. New keeps
+    // expand the root set (the kept init's target becomes a root)
+    // which can pull in more functions and turn previously
+    // unreachable objects alive. Iterates to a fixed point —
+    // bounded by `all_init_funcs.len()` since each iteration only
+    // adds entries to the kept set, never removes.
+    if needs_ctors && !all_init_funcs.is_empty() {
+        let ctors_offset = 1u32;
+        // Per-function source basename in post-ctors-shifted space.
+        // Stubs (weak-undef, sig-mismatch) and ctors itself have no
+        // source basename and never contribute to `alive_basenames`.
+        let mut func_idx_to_basename: std::collections::HashMap<u32, &[u8]> =
+            Default::default();
+        for obj_info in &objects {
+            for local_idx in 0..obj_info.parsed.functions.len() as u32 {
+                let post_idx = ctors_offset + obj_info.func_base + local_idx;
+                func_idx_to_basename.insert(post_idx, obj_info.basename.as_slice());
+            }
+        }
+
+        let mut kept: Vec<bool> = vec![false; all_init_funcs.len()];
+        let total_funcs = ctors_offset as usize + functions.len();
+        loop {
+            // Build root set. Skip __wasm_call_ctors itself (idx 0)
+            // — its body hasn't been built yet, and following its
+            // edges would defeat the purpose of the pruning.
+            let mut reachable: Vec<bool> = vec![false; total_funcs];
+            let mut queue: Vec<u32> = Vec::new();
+            let mut push_root = |idx: u32, reachable: &mut [bool], queue: &mut Vec<u32>| {
+                let i = idx as usize;
+                if i < total_funcs && i != 0 && !reachable[i] {
+                    reachable[i] = true;
+                    queue.push(idx);
+                }
+            };
+            if let Some(idx) = entry_function_index {
+                push_root(idx, &mut reachable, &mut queue);
+            }
+            for &idx in &exported_indices {
+                push_root(idx, &mut reachable, &mut queue);
+            }
+            for &idx in &no_strip_indices {
+                push_root(idx, &mut reachable, &mut queue);
+            }
+            for &idx in &table_entries {
+                push_root(idx, &mut reachable, &mut queue);
+            }
+            for (i, &is_kept) in kept.iter().enumerate() {
+                if is_kept {
+                    let (_, pre_ctors_idx) = all_init_funcs[i];
+                    push_root(
+                        pre_ctors_idx + ctors_offset,
+                        &mut reachable,
+                        &mut queue,
+                    );
+                }
+            }
+            // BFS through bodies.
+            while let Some(idx) = queue.pop() {
+                let local = (idx - ctors_offset) as usize;
+                if local >= functions.len() {
+                    continue;
+                }
+                let body = &functions[local].body;
+                let _ = walk_funcidx_operands(body, |_, op| {
+                    let i = op as usize;
+                    if i < total_funcs && i != 0 && !reachable[i] {
+                        reachable[i] = true;
+                        queue.push(op);
+                    }
+                });
+            }
+            // Compute alive basenames.
+            let mut alive_basenames: std::collections::HashSet<&[u8]> =
+                Default::default();
+            for (idx, &is_reach) in reachable.iter().enumerate() {
+                if is_reach
+                    && let Some(&bn) = func_idx_to_basename.get(&(idx as u32))
+                {
+                    alive_basenames.insert(bn);
+                }
+            }
+            // Update kept mask.
+            let mut changed = false;
+            for (i, origin) in init_funcs_origin.iter().enumerate() {
+                let now_kept = alive_basenames.contains(origin.as_slice());
+                if now_kept && !kept[i] {
+                    kept[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Apply the mask: drop init_funcs whose source object never
+        // became alive.
+        let kept_init_funcs: Vec<_> = all_init_funcs
+            .iter()
+            .zip(kept.iter())
+            .filter(|(_, k)| **k)
+            .map(|(&entry, _)| entry)
+            .collect();
+        all_init_funcs = kept_init_funcs;
+    }
+
     // --- Pass 3: insert __wasm_call_ctors body ---
     // Init funcs collected and indices shifted in Pass 1.8.
     // Now create the body and insert the function.
@@ -9178,21 +9476,11 @@ fn merge_inputs(
         for fixup in &mut import_call_fixups {
             fixup.0 += 1;
         }
-        // Shift table entries for the ctor insertion — but skip entries
-        // whose funcidx is an already-post-shift import index (those were
-        // seeded by GOT.func references to undefined functions in
-        // Pass 1.75). Imports live at indices 0..num_imported_functions,
-        // unchanged by the ctor insertion.
-        for (i, idx) in table_entries.iter_mut().enumerate() {
-            if !table_needed_is_import.get(i).copied().unwrap_or(false) {
-                *idx += 1;
-            }
-        }
-        func_to_table_index = table_entries
-            .iter()
-            .enumerate()
-            .map(|(i, &func_idx)| (func_idx, (i + 1) as u32))
-            .collect();
+        // table_entries are already in post-ctors space: Pass 1.75
+        // entries were shifted in Pass 1.8 (alongside function_name_map
+        // and friends), and Pass 2+ entries pushed post-ctors values
+        // directly via the already-shifted function_name_map. No
+        // further shift here.
         // Note: call targets in function bodies are NOT shifted here because
         // Pass 2 already resolved them using post-shift function_name_map.
     }

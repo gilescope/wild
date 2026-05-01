@@ -310,6 +310,9 @@ const KNOWN_PASSING: &[&str] = &[
     "custom-section-align",
     "trace",
     "version.test",
+    "init-fini-no-gc",
+    "ctor-no-gc",
+    "command-exports-no-tors",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
@@ -376,8 +379,7 @@ fn should_skip(content: &str, path: &Path) -> bool {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
         if matches!(
             stem,
-            "init-fini-no-gc"
-                | "debuginfo"
+            "debuginfo"
                 // export-all now passes
                 | "debug-removed-fn"
                 | "local-symbols"
