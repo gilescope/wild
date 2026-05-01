@@ -250,6 +250,13 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     if !layout.symbol_db.args.export_all && !layout.symbol_db.args.no_entry {
         synth_command_export_wrapper(&mut merged);
     }
+    // Same wrappers for WASM_SYM_EXPORTED functions
+    // (`.export_name foo, foo` style) — `command-exports.s` style.
+    // Skipped under `--export-all` (library-style; bare exports go
+    // direct).
+    if !layout.symbol_db.args.export_all {
+        synth_command_export_wrappers_for_exported(&mut merged);
+    }
 
     // GC: remove unreferenced functions (spec §9.1).
     if layout.symbol_db.args.should_gc_sections() {
@@ -775,8 +782,19 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| name.clone());
+                // If a `<name>.command_export` wrapper was synth'd
+                // for this function, route the export through the
+                // wrapper. The original symbol stays in the module
+                // (the wrapper's `call` keeps it alive) but the
+                // export's idx points at the wrapper so the runtime
+                // sees ctor calls before the user's body runs.
+                let target_idx = merged
+                    .export_wrappers
+                    .get(&func_idx)
+                    .copied()
+                    .unwrap_or(func_idx);
                 if !exports.iter().any(|(n, _, _)| *n == export_name) {
-                    exports.push((export_name, EXPORT_FUNC, func_idx));
+                    exports.push((export_name, EXPORT_FUNC, target_idx));
                 }
             }
         }
@@ -4122,6 +4140,15 @@ struct MergedModule {
     /// verbatim so `wasm-export-name=""` produces an export with an
     /// empty Name field.
     export_name_overrides: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// `<original_idx> → <wrapper_idx>` map for command-export
+    /// wrappers. When the EXPORT emit walks
+    /// `merged.exported_indices` (or `entry_function_index`), it
+    /// looks each idx up here: a hit means "emit the original
+    /// symbol's name pointing at the wrapper instead of the
+    /// original function." Populated by
+    /// `synth_command_export_wrappers` for each wrapped
+    /// WASM_SYM_EXPORTED function and the entry.
+    export_wrappers: std::collections::HashMap<u32, u32>,
 }
 
 impl MergedModule {
@@ -4344,6 +4371,109 @@ fn synth_command_export_wrapper(merged: &mut MergedModule) {
     // `merged.functions` (the wrapper's `call` keeps it alive); the
     // export emit picks up the wrapper via the rerouted entry idx.
     merged.entry_function_index = Some(wrapper_unified);
+    merged.export_wrappers.insert(entry_idx, wrapper_unified);
+    // The wrapper isn't otherwise reachable from a GC root — the
+    // export emit consults `export_wrappers` but GC doesn't know
+    // about that map. Mark the wrapper as no-strip so GC keeps
+    // both the wrapper and the original (the wrapper's `call`
+    // keeps the original alive transitively).
+    merged.no_strip_indices.push(wrapper_unified);
+}
+
+/// Same shape as `synth_command_export_wrapper` but for every
+/// `WASM_SYM_EXPORTED` function — `command-exports.s`'s
+/// `.export_name foo_i32, foo_i32` style. lld emits one
+/// `<name>.command_export` wrapper per exported function and routes
+/// the export entry through the wrapper. Original function stays
+/// alive via the wrapper's `call`.
+fn synth_command_export_wrappers_for_exported(merged: &mut MergedModule) {
+    let Some(&ctors_idx) = merged
+        .function_name_map
+        .get(b"__wasm_call_ctors".as_slice())
+    else {
+        return;
+    };
+    let num_imports = merged.num_imported_functions;
+    // Snapshot the export list because we'll be mutating
+    // `merged.functions` and `merged.function_name_map` inside the
+    // loop. Use `function_name_map` to find the original name for
+    // each idx (alphabetically-first wins on aliases).
+    let to_wrap: Vec<(u32, Vec<u8>)> = merged
+        .exported_indices
+        .iter()
+        .filter_map(|&idx| {
+            // Don't wrap `__wasm_call_ctors` itself.
+            if idx == ctors_idx {
+                return None;
+            }
+            // Don't wrap if the exported function already calls
+            // ctors (matches the entry-wrapper skip rule).
+            let local = idx.checked_sub(num_imports)? as usize;
+            let body = &merged.functions.get(local)?.body;
+            let mut already_calls = false;
+            let _ = walk_funcidx_operands(body, |_, op| {
+                if op == ctors_idx {
+                    already_calls = true;
+                }
+            });
+            if already_calls {
+                return None;
+            }
+            // Find the original name. Pick the alphabetically-first
+            // matching name to stay deterministic (function_name_map
+            // is a HashMap).
+            let mut names: Vec<&[u8]> = merged
+                .function_name_map
+                .iter()
+                .filter(|(_, i)| **i == idx)
+                .map(|(n, _)| n.as_slice())
+                .collect();
+            names.sort();
+            let name = names.first()?.to_vec();
+            Some((idx, name))
+        })
+        .collect();
+
+    for (orig_idx, orig_name) in to_wrap {
+        let local = match orig_idx.checked_sub(num_imports) {
+            Some(n) if (n as usize) < merged.functions.len() => n as usize,
+            _ => continue,
+        };
+        let type_idx = merged.functions[local].type_index;
+        let type_sig = merged.types.get(type_idx as usize).cloned();
+
+        // Build wrapper body.
+        let mut body = Vec::new();
+        body.push(0x00); // locals_count = 0
+        body.push(0x10); // call
+        write_leb128(&mut body, ctors_idx);
+        if let Some(sig) = type_sig {
+            for (i, _) in sig.params.iter().enumerate() {
+                body.push(0x20); // local.get
+                write_leb128(&mut body, i as u32);
+            }
+        }
+        body.push(0x10); // call
+        write_leb128(&mut body, orig_idx);
+        body.push(0x0B); // end
+
+        let wrapper_local = merged.functions.len();
+        let wrapper_unified = num_imports + wrapper_local as u32;
+        merged.functions.push(MergedFunction {
+            type_index: type_idx,
+            body,
+        });
+
+        let mut wrapper_name = orig_name;
+        wrapper_name.extend_from_slice(b".command_export");
+        merged
+            .function_name_map
+            .insert(wrapper_name, wrapper_unified);
+        merged.export_wrappers.insert(orig_idx, wrapper_unified);
+        // The wrapper isn't otherwise reachable — see the entry-
+        // wrapper variant for the same reasoning.
+        merged.no_strip_indices.push(wrapper_unified);
+    }
 }
 
 fn reorder_synth_functions_first(merged: &mut MergedModule) {
@@ -10489,6 +10619,7 @@ fn merge_inputs(
             v
         },
         export_name_overrides,
+        export_wrappers: Default::default(),
     })
 }
 
