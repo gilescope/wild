@@ -381,6 +381,28 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         write_leb128(&mut dylink_payload, needed.len() as u32);
         dylink_payload.extend_from_slice(&needed);
 
+        // Subsection 4: WASM_DYLINK_IMPORT_INFO. One entry per weak-
+        // undef import: `(module, field, flags)`. Tells the dynamic
+        // linker which imports may legitimately have no resolver —
+        // a weak-undef call returns a trap-stub or null pointer
+        // rather than aborting instantiation. `shared-weak-undefined.s`
+        // pins this for the `weak_func` / `ret32` weak imports.
+        // (Per the wasm-tools dylink.0 ABI: subsection IDs are
+        // 1=MEM_INFO, 2=NEEDED, 3=EXPORT_INFO, 4=IMPORT_INFO,
+        // 5=RUNTIME_PATH.)
+        if !merged.dylink_import_info.is_empty() {
+            let mut info = Vec::new();
+            write_leb128(&mut info, merged.dylink_import_info.len() as u32);
+            for (module, field, flags) in &merged.dylink_import_info {
+                write_name(&mut info, module);
+                write_name(&mut info, field);
+                write_leb128(&mut info, *flags as u32);
+            }
+            dylink_payload.push(4);
+            write_leb128(&mut dylink_payload, info.len() as u32);
+            dylink_payload.extend_from_slice(&info);
+        }
+
         write_section(&mut out, 0, &dylink_payload);
     }
 
@@ -4208,6 +4230,12 @@ struct MergedModule {
     /// subsection so the dynamic linker knows which sibling modules
     /// to load before instantiating this one.
     dylink_needed: Vec<Vec<u8>>,
+    /// Per weak-undef import (`module`, `field`, `flags`). Emitted
+    /// as the `dylink.0` ImportInfo subsection (id 3) so the dynamic
+    /// linker knows which imports it can leave unresolved without
+    /// failing the link — a weak-undef call returns a trap-stub /
+    /// null pointer rather than aborting instantiation.
+    dylink_import_info: Vec<(Vec<u8>, Vec<u8>, u8)>,
     /// Indirect function table: maps table index → function index.
     /// Per spec §9.4: entries start at index 1 (0 = null/trap).
     table_entries: Vec<u32>,
@@ -8130,6 +8158,39 @@ fn merge_inputs(
         }
     }
     let mut got_func_globals: Vec<(u32, Vec<u8>)> = Vec::new();
+    // Under `-shared` / `-pie`: GOT.func.* imports stay as imports
+    // (the dynamic linker fills them at load time). But each one
+    // still needs a slot reserved in the indirect function table so
+    // the runtime allocator knows how much space to set aside —
+    // which is what `dylink.0`'s TableSize subsection field reports.
+    // `pie.s` / `shared.s` / `shared64.s` pin this: each
+    // GOT.func.<name> reference contributes one to TableSize.
+    if layout.symbol_db.args.is_shared || layout.symbol_db.args.is_pic {
+        let mut seen_got: std::collections::HashSet<Vec<u8>> = Default::default();
+        for obj_info in &objects {
+            for imp in &obj_info.parsed.imports {
+                if imp.kind != 3 || imp.module != b"GOT.func" {
+                    continue;
+                }
+                if !seen_got.insert(imp.field.clone()) {
+                    continue;
+                }
+                if let Some(&func_idx) = function_name_map.get(imp.field.as_slice())
+                    && table_needed_funcs.insert(func_idx)
+                {
+                    table_needed_order.push(func_idx);
+                    table_needed_is_import.push(false);
+                } else if let Some(&imp_idx) = function_import_output_idx.get(imp.field.as_slice())
+                {
+                    let key = u32::MAX - imp_idx;
+                    if table_needed_funcs.insert(key) {
+                        table_needed_order.push(imp_idx);
+                        table_needed_is_import.push(true);
+                    }
+                }
+            }
+        }
+    }
     // Internalisation: only under non-shared, non-PIE links. Under
     // `-pie` / `--experimental-pic` the dynamic linker is around and
     // resolves GOT imports at load time (weak-undefined-pic.s third
@@ -9607,7 +9668,20 @@ fn merge_inputs(
                                         // R_WASM_TABLE_INDEX_I64 (static-PIC /
                                         // shared / PIC fallback): keep the raw
                                         // function-index payload — the GOT
-                                        // path resolves it at runtime.
+                                        // path resolves it at runtime. Still
+                                        // register the function so the
+                                        // `dylink.0` TableSize reflects how
+                                        // many table slots the dynamic linker
+                                        // must reserve (`shared.s` / `pie.s`
+                                        // / `shared64.s` pin this).
+                                        let func_idx = value;
+                                        if (layout.symbol_db.args.is_shared
+                                            || layout.symbol_db.args.is_pic)
+                                            && table_needed_funcs.insert(func_idx)
+                                        {
+                                            table_needed_order.push(func_idx);
+                                            table_needed_is_import.push(false);
+                                        }
                                         let v64 = value as u64;
                                         out_seg.data[buf_off..buf_off + 8]
                                             .copy_from_slice(&v64.to_le_bytes());
@@ -9635,6 +9709,40 @@ fn merge_inputs(
                                             2,
                                             func_idx,
                                         ));
+                                    }
+                                    2 if buf_off + 4 <= out_seg.data.len()
+                                        && (layout.symbol_db.args.is_shared
+                                            || layout.symbol_db.args.is_pic) =>
+                                    {
+                                        // R_WASM_TABLE_INDEX_I32 in shared/PIE
+                                        // mode: the GOT.func.* path resolves
+                                        // the address at runtime, so the
+                                        // emitted bytes carry the unresolved
+                                        // sentinel rather than a table index.
+                                        // Still register the function in the
+                                        // table so the `dylink.0` TableSize
+                                        // reflects the slot count the dynamic
+                                        // linker must reserve. Skip imported
+                                        // targets — they're already accounted
+                                        // for by the per-input GOT.func walk
+                                        // (`shared.s` would otherwise count
+                                        // `func_external` twice: once via
+                                        // GOT.func.func_external and once via
+                                        // R_WASM_TABLE_INDEX_I32).
+                                        let func_idx = value;
+                                        // Function-import indices live in the
+                                        // low end of the index space (the
+                                        // dedup'd `function_import_output_idx`
+                                        // values). If `value` matches one of
+                                        // those, the GOT.func walk has it
+                                        // covered already.
+                                        let is_import = function_import_output_idx
+                                            .values()
+                                            .any(|&i| i == func_idx as u32);
+                                        if !is_import && table_needed_funcs.insert(func_idx) {
+                                            table_needed_order.push(func_idx);
+                                            table_needed_is_import.push(false);
+                                        }
                                     }
                                     other => {
                                         if warned_reloc_types.insert(other) {
@@ -10169,6 +10277,12 @@ fn merge_inputs(
     let mut output_imports: Vec<OutputImport> = Vec::new();
     let mut num_imported_functions = 0u32;
     let mut num_imported_globals = 0u32;
+    // dylink.0 ImportInfo subsection bookkeeping: per weak-undef
+    // import, `(module, field, flags)`. Emitted as subsection 3 of
+    // the output's `dylink.0` so the dynamic linker can tolerate a
+    // missing definition (returns null/trap rather than failing the
+    // link).
+    let mut dylink_import_info: Vec<(Vec<u8>, Vec<u8>, u8)> = Vec::new();
 
     // Wrap target set, used by Pass 4a (pre-allocate wrap imports)
     // and Pass 4b (rewrite body operands of calls to wrapped defs).
@@ -10274,10 +10388,15 @@ fn merge_inputs(
                     .iter()
                     .any(|imp| imp.kind == 3 && imp.module == b"GOT.func")
             });
-        // Memory minimum under -shared / -pie: lld uses the merged
-        // data size in pages (rounded up). Empty-data shared libs
-        // get Min=0x0; one byte of data still rounds to one page
-        // (64KiB). `shared-weak-symbols.s` pins the empty-data case.
+        // env.memory: lld imports it under -shared (the dynamic linker
+        // owns memory across all .so modules), but NOT under -pie (the
+        // PIE executable owns its own memory locally). pie.s pins the
+        // "no env.memory under -pie" case.
+        let want_memory_import = layout.symbol_db.args.is_shared;
+        // Memory minimum under -shared: lld uses the merged data size
+        // in pages (rounded up). Empty-data shared libs get Min=0x0;
+        // one byte still rounds to one page (64 KiB).
+        // `shared-weak-symbols.s` pins the empty-data case.
         let mem_min: u64 = {
             let page = layout.symbol_db.args.page_size.unwrap_or(65536);
             if data_size == 0 {
@@ -10287,34 +10406,39 @@ fn merge_inputs(
                 (bytes + page - 1) / page
             }
         };
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"memory".to_vec(),
-            kind: ImportKind::Memory {
-                min: mem_min,
-                max: None,
-                shared: false,
-                memory64: layout.symbol_db.args.memory64,
-                page_size: layout.symbol_db.args.page_size,
-            },
-        });
+        if want_memory_import {
+            output_imports.push(OutputImport {
+                module: b"env".to_vec(),
+                field: b"memory".to_vec(),
+                kind: ImportKind::Memory {
+                    min: mem_min,
+                    max: None,
+                    shared: false,
+                    memory64: layout.symbol_db.args.memory64,
+                    page_size: layout.symbol_db.args.page_size,
+                },
+            });
+        }
         let addr_vt_imp = if layout.symbol_db.args.memory64 {
             VALTYPE_I64
         } else {
             VALTYPE_I32
         };
-        let idx = num_imported_globals;
-        memory_base_global_idx = Some(idx);
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"__memory_base".to_vec(),
-            kind: ImportKind::Global {
-                valtype: addr_vt_imp,
-                mutable: false,
-            },
-        });
-        import_global_name_map.push((b"__memory_base".to_vec(), idx));
-        num_imported_globals += 1;
+        // Order under -shared / -pie matches lld:
+        //   [memory (only -shared)] →
+        //   [TABLE __indirect_function_table (only when used)] →
+        //   [GLOBAL __stack_pointer (only when referenced)] →
+        //   [GLOBAL __memory_base] →
+        //   [GLOBAL __table_base]
+        if any_input_uses_table {
+            output_imports.push(OutputImport {
+                module: b"env".to_vec(),
+                field: b"__indirect_function_table".to_vec(),
+                kind: ImportKind::Table {
+                    min: table_entries.len() as u32,
+                },
+            });
+        }
         if any_input_uses_stack_pointer {
             let sp_idx = num_imported_globals;
             output_imports.push(OutputImport {
@@ -10328,24 +10452,22 @@ fn merge_inputs(
             import_global_name_map.push((b"__stack_pointer".to_vec(), sp_idx));
             num_imported_globals += 1;
         }
-        // `__indirect_function_table`: only when the output table is
-        // non-empty (an indirect call / function-pointer reloc adds a
-        // table_entries slot, or a `GOT.func.*` import requires the
-        // dynamic linker to allocate one).
-        if any_input_uses_table {
-            output_imports.push(OutputImport {
-                module: b"env".to_vec(),
-                field: b"__indirect_function_table".to_vec(),
-                kind: ImportKind::Table { min: 0 },
-            });
-        }
+        let mb_idx = num_imported_globals;
+        memory_base_global_idx = Some(mb_idx);
+        output_imports.push(OutputImport {
+            module: b"env".to_vec(),
+            field: b"__memory_base".to_vec(),
+            kind: ImportKind::Global {
+                valtype: addr_vt_imp,
+                mutable: false,
+            },
+        });
+        import_global_name_map.push((b"__memory_base".to_vec(), mb_idx));
+        num_imported_globals += 1;
         // `__table_base`: lld emits this UNCONDITIONALLY under
         // `-shared` / `-pie` — even when the table is empty — because
         // any input could reference it via R_WASM_TABLE_INDEX_REL_*
-        // relocations resolved at instantiate time. Pairing it with
-        // `__indirect_function_table` (as we used to) breaks
-        // `shared-weak-symbols.s` which has no indirect calls but
-        // still expects `env.__table_base` in the IMPORT section.
+        // relocations resolved at instantiate time.
         let tb_idx = num_imported_globals;
         table_base_global_idx = Some(tb_idx);
         output_imports.push(OutputImport {
@@ -10427,7 +10549,7 @@ fn merge_inputs(
                     // local-after-imports index, so it can't supply
                     // import names — only the linking section can.
                     let import_wasm_idx = num_imported_functions;
-                    if let Some(name) = obj_info
+                    let undef_sym = obj_info
                         .parsed
                         .symbols
                         .iter()
@@ -10435,11 +10557,26 @@ fn merge_inputs(
                             s.kind == 0
                                 && (s.flags & 0x10) != 0
                                 && s.index == input_func_imp_idx
-                                && !s.name.is_empty()
-                        })
+                        });
+                    if let Some(name) = undef_sym
+                        .filter(|s| !s.name.is_empty())
                         .map(|s| s.name.clone())
                     {
                         import_function_name_map.push((name, import_wasm_idx));
+                    }
+                    // dylink.0 ImportInfo: track weak-undef function
+                    // imports so the dynamic linker knows to tolerate
+                    // missing definitions (call returns trap rather
+                    // than failing the link).
+                    if let Some(s) = undef_sym
+                        && (s.flags & 0x01) != 0
+                    {
+                        dylink_import_info.push((
+                            imp.module.clone(),
+                            imp.field.clone(),
+                            // BINDING_WEAK | UNDEFINED per linking §3
+                            0x01 | 0x10,
+                        ));
                     }
                     num_imported_functions += 1;
                     input_func_imp_idx += 1;
@@ -11013,6 +11150,7 @@ fn merge_inputs(
             max
         },
         dylink_needed,
+        dylink_import_info,
         imports: output_imports,
         num_imported_functions,
         num_imported_globals,
