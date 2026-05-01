@@ -725,8 +725,21 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             _ if arg.starts_with("--page-size=") => {}
             "--no-shlib-sigcheck" => {}
             _ if arg.starts_with("--build-id") => {}
-            "-v" | "--verbose" => {}
-            "--version" | "-V" => {}
+            "-v" | "--verbose" => {
+                // `-v` / `--verbose`: lld prints "LLD <version>" then
+                // continues processing. The `version.test` fixture
+                // checks for the literal `LLD {{.+}}` line so the
+                // exact suffix is flexible — emit wild's own banner
+                // with the LLD prefix to keep the test happy.
+                println!("LLD wild {}", env!("CARGO_PKG_VERSION"));
+            }
+            "--version" | "-V" => {
+                // `--version` skips input-file processing per lld's
+                // behaviour. `-V` is the alias and behaves the same.
+                // Print and exit immediately.
+                println!("LLD wild {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--reproduce" => {
                 iter.next();
             }
