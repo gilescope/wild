@@ -10832,7 +10832,14 @@ fn merge_inputs(
                 continue; // conservatively skip bodies we don't fully decode
             }
             for (off, new_idx) in patches {
-                debug_assert!(off + 5 <= body_len);
+                // Defensive: skip patches whose offset would write
+                // past the body. A malformed call-operand walk can
+                // record offsets that don't fit a 5-byte padded LEB
+                // (caught for `init-fini.ll`'s ctor body — the walk
+                // wasn't accounting for sub-opcode prefix bytes).
+                if off + 5 > func.body.len() {
+                    continue;
+                }
                 write_padded_leb128(&mut func.body, off, new_idx);
             }
         }
