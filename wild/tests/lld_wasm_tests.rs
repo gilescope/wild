@@ -319,6 +319,7 @@ const KNOWN_PASSING: &[&str] = &[
     "archive-export",
     "shared-needed",
     "no-shlib-sigcheck",
+    "shared-export-dynamic",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

@@ -113,6 +113,14 @@ and risk. Phases run independently and can ship as separate commits.
   Unlocks `shared-needed.s` (both the SO1 stand-alone-shared and
   the SO2 link-against-shared arms) and `no-shlib-sigcheck.s`.
 
+  Follow-up: dylink.0 emit gate widened from `is_shared` only to
+  `is_shared || (is_pic && !emit_relocs) || !dylink_needed.is_empty()`
+  — covers `-pie` outputs and plain `-Bdynamic` exec links against a
+  `.so`. The `--emit-relocs` arm of `-pie` is excluded because wild's
+  reloc.CODE / reloc.DATA section-index bookkeeping doesn't yet
+  account for the dylink.0 shift (`emit-relocs-fpic.s` pins the
+  historical "no dylink.0" layout there).
+
   Remaining Phase 4b work is symbol-resolution-level —
   `symbol_db.rs`'s duplicate-strong-def check fires for `.so`
   inputs whose exports match a defined symbol in another input

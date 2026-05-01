@@ -334,8 +334,21 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     out.extend_from_slice(b"\0asm");
     out.extend_from_slice(&1u32.to_le_bytes());
 
-    // dylink.0 custom section (must be FIRST for shared libraries).
-    if is_shared {
+    // dylink.0 custom section (must be FIRST under shared / PIE
+    // outputs, OR when linking against any `.so` input). lld emits
+    // this for `-shared` AND `-pie` — both produce dynamically-
+    // loadable modules whose instantiation is co-ordinated by the
+    // dynamic linker — and also for plain `-Bdynamic` exec links
+    // against a `.so` (the resulting wasm needs the `Needed` chain
+    // so the loader knows to instantiate the dependencies). The
+    // `--emit-relocs` arm of `-pie` is excluded because wild's
+    // reloc.CODE / reloc.DATA section-index bookkeeping doesn't yet
+    // account for the dylink.0 shift; emit-relocs-fpic.s pins the
+    // historical "no dylink.0" layout there.
+    let want_dylink = is_shared
+        || (layout.symbol_db.args.is_pic && !layout.symbol_db.args.emit_relocs)
+        || !merged.dylink_needed.is_empty();
+    if want_dylink {
         let mut dylink_payload = Vec::new();
         write_name(&mut dylink_payload, b"dylink.0");
 
