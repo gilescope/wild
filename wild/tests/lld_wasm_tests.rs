@@ -315,6 +315,8 @@ const KNOWN_PASSING: &[&str] = &[
     "command-exports-no-tors",
     "command-exports",
     "ctor-gc",
+    "weak-undefined-pic",
+    "archive-export",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

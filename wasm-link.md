@@ -87,6 +87,54 @@ and risk. Phases run independently and can ship as separate commits.
   need similar two-pass semantics, OR a narrower fix: prune
   `all_init_funcs` whose source object has no other live symbols
   before building the `__wasm_call_ctors` body.
+- 🟡 **Phase 4a — per-input EXPORT-emit-order**: partial. Three
+  pieces shipped that lay the groundwork for the full per-input
+  encounter walk:
+  1. `merge_inputs` collects file refs and stable-sorts under
+     `--lld-compat` so non-archive inputs come first. lld assigns
+     function indices in "main object first, archive members later"
+     order — without this, `archive-export.test`'s
+     `_start = 0, foo = 1, bar = 2, archive2_symbol = 3` allocation
+     doesn't match (wild's natural cmdline-order walk gives the
+     archive members the lowest function indices).
+  2. `function_cmdline_rank: Vec<u32>` tracks each function's source
+     object's pre-sort cmdline position. The `EXPORT` section sort
+     under `--lld-compat` uses it as the primary key for `EXPORT_FUNC`
+     entries — which moves `_start` to its correct lld position
+     (right after `__wasm_call_ctors`) regardless of its low merged
+     `func_idx`. The `+1` ctors shift mirrors into `function_cmdline_rank`
+     so the synth ctor stub gets rank 0.
+  3. `--export-dynamic` now synthesises an immutable defined GLOBAL
+     per non-hidden non-local data symbol whose init value is the
+     symbol's output address (`weak-symbols.s`-style `weakGlobal`).
+     A `global_export_pos` map carries the source's
+     `(cmdline_rank, sym_pos)` so the EXPORT sort can place
+     synth-from-data globals in the right per-input slot. The
+     GlobalNames subsection in the `name` custom section excludes
+     these (lld doesn't include them either — they're addressable
+     via EXPORT). Gated to `!is_shared && !is_pic && !static_pic
+     && !export_all && --export-dynamic`.
+
+  Unlocks `archive-export.test`. Pulled `weak-undefined-pic` (Phase
+  3b's win) into `KNOWN_PASSING` while we're here.
+
+  Still pending: per-input encounter sym-position tracking for the
+  EXPORT sort (`weak-symbols.s` needs `weakGlobal GLOBAL 1` to land
+  *between* `exportWeak1` and `exportWeak2` per-input — wild's
+  current sort lands it earlier). The straightforward approach
+  (track `function_sym_pos: Vec<u32>` indexed by `func_idx`) is
+  fragile because `__wasm_call_ctors`, sig-mismatch stubs, and
+  `__cxa_atexit` decl-stubs interleave into the merged function-
+  index space at points the parse pass doesn't see — keying by
+  name was attempted but breaks `mutable-global-exports.s` /
+  `weak-alias.s` / `export-name.s` (the `--export-dynamic` walk
+  picks up alias names not present in the per-defined-function
+  scan). Needs a more principled "merged-function metadata table
+  with synth tracking" refactor.
+  Also pending for `weak-symbols.s`: data-segment-name carry-
+  through (wild emits `.data.0`, lld emits `.data` for the merged
+  single-segment case).
+
 - ✅ **Phase 3b — PIE PIC-base imports**: shipped. Three pieces
   landed together:
   1. New Pass 4a.5 emits PIC-base imports (`env.memory`,
@@ -110,8 +158,10 @@ and risk. Phases run independently and can ship as separate commits.
   `static-error.s`) still fail on `dylink.0` custom-section content
   and `.so`/dynamic-needed handling — that's Phase 4b territory.
 
-Net: +7 tests across sessions (122→133). Phase 1 essentially complete,
-Phase 3b complete. Phases 2 and 4 are each a multi-iteration commitment.
+Net: +12 tests across sessions (122→134). Phases 1, 3a, 3b complete;
+Phase 2 (infra) and Phase 4a (partial — function-index reorder + synth
+GLOBAL for data symbols) shipped. Phase 4a's per-input sym-position
+key and Phase 4b (.so handling) remain.
 
 Targeted wins outside the plan structure:
 

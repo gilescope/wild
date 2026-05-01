@@ -5,6 +5,7 @@
 
 use crate::layout::FileLayout;
 use crate::layout::Layout;
+use crate::layout::ObjectLayout;
 use crate::platform::Arch;
 use crate::platform::Args as _;
 use crate::wasm::Wasm;
@@ -838,8 +839,32 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             // alphabetical order makes wild's output match lld's
             // (and incidentally is reproducible across runs since
             // function_name_map is a HashMap).
+            //
+            // Under `--lld-compat` use cmdline rank as the primary
+            // key so per-input encounter order drives the EXPORT
+            // section (lld walks inputs in command-line order; wild's
+            // by-`func_idx` sort doesn't match for cases like
+            // `archive-export.test` where the entry input sits after
+            // an archive on the command line — the entry function
+            // gets the lowest `func_idx` under our merge sort but
+            // should appear *last* among defined exports).
+            let lld_compat_export_order = layout.symbol_db.args.lld_compat;
+            let func_rank = |idx: u32| -> u32 {
+                merged
+                    .function_cmdline_rank
+                    .get(idx as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX)
+            };
             names.sort_by(|(a_name, a_idx), (b_name, b_idx)| {
-                a_idx.cmp(b_idx).then_with(|| a_name.cmp(b_name))
+                if lld_compat_export_order {
+                    func_rank(*a_idx)
+                        .cmp(&func_rank(*b_idx))
+                        .then_with(|| a_idx.cmp(b_idx))
+                        .then_with(|| a_name.cmp(b_name))
+                } else {
+                    a_idx.cmp(b_idx).then_with(|| a_name.cmp(b_name))
+                }
             });
             for (name, idx) in names {
                 if !exports.iter().any(|(n, _, _)| *n == name) {
@@ -943,6 +968,16 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                         // in group 2 — they sort by index as before
                         // and naturally end up before our ranked
                         // globals because their index space is small.
+                        //
+                        // Under `--lld-compat`, FUNCTIONs sort by
+                        // their source object's cmdline rank first,
+                        // then by index. This matches lld's per-input
+                        // encounter order — necessary for cases like
+                        // `archive-export.test` where the entry input
+                        // sits after an archive on the command line
+                        // and the entry function gets the lowest
+                        // index but should appear *last* among the
+                        // defined-function exports.
                         let rank = |k: u8, n: &[u8], idx: u32| -> (u32, u32) {
                             if lld_compat_export_all_emit && k == EXPORT_GLOBAL {
                                 if let Some(r) = lld_export_rank(n) {
@@ -951,6 +986,29 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                                     // and well under user-global ranges).
                                     return (200 + r, 0);
                                 }
+                            }
+                            if layout.symbol_db.args.lld_compat && k == EXPORT_FUNC {
+                                let cr = merged
+                                    .function_cmdline_rank
+                                    .get(idx as usize)
+                                    .copied()
+                                    .unwrap_or(u32::MAX);
+                                return (cr, idx);
+                            }
+                            if layout.symbol_db.args.lld_compat
+                                && k == EXPORT_GLOBAL
+                                && let Some(&(cr, sp)) = merged.global_export_pos.get(&idx)
+                            {
+                                // Synth-from-data globals carry their
+                                // source's (cmdline_rank, sym_pos);
+                                // other globals fall through to idx-
+                                // based ordering so existing fixtures
+                                // (`stack-first.test`,
+                                // `mutable-global-exports.s`,
+                                // `command-exports.s`) keep emitting
+                                // `__data_end` / `__stack_pointer` /
+                                // etc. at their existing positions.
+                                return (cr, sp);
                             }
                             (idx, 0)
                         };
@@ -1300,6 +1358,16 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         }
         if !is_shared && !layout.symbol_db.args.is_pic {
             for (i, g) in merged.globals.iter().enumerate() {
+                // Globals synthesised from a `--export-dynamic` data
+                // symbol are address-pointers under lld's model — lld
+                // skips their names from the `name` custom section's
+                // GlobalNames (they're addressable via the EXPORT
+                // section instead). `weak-symbols.s` pins this:
+                // GlobalNames lists only `__stack_pointer`, even
+                // though `weakGlobal` is a defined exported global.
+                if merged.global_export_pos.contains_key(&(i as u32)) {
+                    continue;
+                }
                 let abs_idx = merged.num_imported_globals + i as u32;
                 global_name_entries.push((abs_idx, g.name.as_slice()));
             }
@@ -4058,6 +4126,21 @@ struct MergedModule {
     entry_function_index: Option<u32>,
     /// Map from symbol name to output function index.
     function_name_map: std::collections::HashMap<Vec<u8>, u32>,
+    /// Per-function cmdline rank: each function's source object's
+    /// position in the original (pre-`--lld-compat`-sort) command-line
+    /// walk. Used as a secondary sort key in the EXPORT section emit
+    /// under `--lld-compat` so the export list emerges in lld's per-
+    /// input encounter order (e.g. archive members in archive symtab
+    /// order, then non-archive inputs, with the entry function
+    /// naturally falling last when its input came after the archive).
+    function_cmdline_rank: Vec<u32>,
+    /// Per-global synthetic-source bookkeeping for globals
+    /// synthesised from a `--export-dynamic` data symbol —
+    /// `(cmdline_rank, sym_pos)` of the source data symbol. Used as
+    /// a sort key in the EXPORT section under `--lld-compat`. Globals
+    /// not in the map (linker-synth bases, layout globals, etc.)
+    /// fall back to `(0, 0)` and sort ahead of input-derived globals.
+    global_export_pos: std::collections::HashMap<u32, (u32, u32)>,
     /// Function indices that are explicitly exported via --export/--export-if-defined.
     explicit_export_indices: Vec<u32>,
     /// Function names with VISIBILITY_HIDDEN (flag 0x04) — excluded from --export-dynamic.
@@ -6637,11 +6720,40 @@ fn merge_inputs(
     // COMDAT groups (spec §7): first definition wins, duplicates discarded.
     let mut seen_comdat_groups: std::collections::HashSet<Vec<u8>> = Default::default();
 
+    // Collect file refs so we can stable-sort them under `--lld-compat`.
+    // lld assigns function indices in "main object first, archive
+    // members later" order — when an archive sits to the LEFT of the
+    // entry-bearing input on the command line (e.g. `wasm-ld %t.a
+    // %t.o`), wild's natural cmdline-order walk would give the archive
+    // members the lowest function indices, which doesn't match lld's
+    // `_start = 0, foo = 1, bar = 2, archive2_symbol = 3` allocation
+    // in `archive-export.test`. Stable sort: ties retain group/file
+    // walking order.
+    //
+    // We also track each function's *cmdline rank* — its source
+    // object's position in the original (pre-sort) command-line walk
+    // order. The export-section emit uses this as a sort key under
+    // `--lld-compat` so the EXPORT list emerges in lld's per-input
+    // encounter order (archive members in archive symtab order, then
+    // non-archive inputs, with the entry function naturally falling
+    // last when its input came after the archive).
+    let mut cmdline_objects: Vec<&ObjectLayout<'_, Wasm>> = Vec::new();
     for group in &layout.group_layouts {
         for file in &group.files {
-            let FileLayout::Object(obj) = file else {
-                continue;
-            };
+            if let FileLayout::Object(obj) = file {
+                cmdline_objects.push(obj);
+            }
+        }
+    }
+    let mut sorted_indices: Vec<usize> = (0..cmdline_objects.len()).collect();
+    if layout.symbol_db.args.lld_compat {
+        sorted_indices.sort_by_key(|&i| cmdline_objects[i].input.entry.is_some());
+    }
+    let mut function_cmdline_rank: Vec<u32> = Vec::new();
+    for &__cmdline_idx in &sorted_indices {
+        let obj = cmdline_objects[__cmdline_idx];
+        let __obj_cmdline_rank = __cmdline_idx as u32;
+        {
             let data = obj.object.data;
             if data.len() < 8 || &data[..4] != b"\0asm" {
                 continue;
@@ -6862,6 +6974,9 @@ fn merge_inputs(
                 }
             }
 
+            for _ in 0..parsed.functions.len() {
+                function_cmdline_rank.push(__obj_cmdline_rank);
+            }
             total_functions += parsed.functions.len() as u32;
             // Identify each object uniquely. For archive members,
             // include the entry name so different members of the
@@ -7291,6 +7406,7 @@ fn merge_inputs(
 
     // --- Create linker-defined globals (spec §9.6) ---
     let mut globals: Vec<OutputGlobal> = Vec::new();
+    let mut global_export_pos: std::collections::HashMap<u32, (u32, u32)> = Default::default();
     let mut global_name_map: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     // Hoisted: TLS-shared-memory mode determines whether GOT.data
     // entries for TLS symbols become mutable globals fixed up by
@@ -7657,6 +7773,76 @@ fn merge_inputs(
                 init_value: addr as u64,
                 exported: true,
             });
+        }
+    }
+
+    // `--export-dynamic` for data symbols: lld synthesises an
+    // immutable wasm global per defined non-hidden non-local data
+    // symbol whose `init` is the symbol's output address. Lets
+    // dependent modules import the address at module-instantiate
+    // time. `weak-symbols.s` pins this: `weakGlobal` (a `.int32` in
+    // `.data.weakGlobal`) appears as `GLOBAL Index 1` (immutable,
+    // value = data segment offset) under `wasm-ld --export-dynamic`.
+    //
+    // Walk inputs in cmdline (pre-`--lld-compat`-sort) order so the
+    // synth-global ordering matches lld's per-input encounter walk.
+    // Skip names already covered by an existing global, the layout-
+    // synth set, or anything that doesn't have a recorded address —
+    // and dedup by name across multiple definers (a weak data symbol
+    // defined in two inputs gets one synth slot).
+    if !layout.symbol_db.args.is_shared
+        && !layout.symbol_db.args.is_pic
+        && !static_pic
+        && !layout.symbol_db.args.export_all
+        && layout.symbol_db.args.should_export_all_dynamic_symbols()
+    {
+        let skip_hidden = !layout.symbol_db.args.export_all;
+        let mut seen: std::collections::HashSet<Vec<u8>> = Default::default();
+        for &cmdline_idx in &sorted_indices {
+            // Map cmdline_idx → position in `objects` Vec (which is
+            // built in sorted order during the parse pass).
+            let sorted_pos = sorted_indices
+                .iter()
+                .position(|&i| i == cmdline_idx)
+                .unwrap_or(0);
+            let oi = match objects.get(sorted_pos) {
+                Some(oi) => oi,
+                None => continue,
+            };
+            for (sym_pos, sym) in oi.parsed.symbols.iter().enumerate() {
+                if sym.kind != 1
+                    || (sym.flags & 0x10) != 0
+                    || (sym.flags & 0x02) != 0
+                    || sym.name.is_empty()
+                {
+                    continue;
+                }
+                if skip_hidden && (sym.flags & 0x04) != 0 {
+                    continue;
+                }
+                if !seen.insert(sym.name.clone()) {
+                    continue;
+                }
+                if global_name_map.contains_key(sym.name.as_slice()) {
+                    continue;
+                }
+                if layout_synth_names.iter().any(|n| *n == sym.name.as_slice()) {
+                    continue;
+                }
+                let Some(&addr) = data_name_map.get(sym.name.as_slice()) else {
+                    continue;
+                };
+                let idx = globals.len() as u32;
+                global_name_map.insert(sym.name.clone(), idx);
+                globals.push(OutputGlobal {
+                    name: sym.name.clone(),
+                    valtype: addr_vt,
+                    mutable: false,
+                    init_value: addr as u64,
+                    exported: true,
+                });
+                global_export_pos.insert(idx, (cmdline_idx as u32, sym_pos as u32));
+            }
         }
     }
 
@@ -8141,6 +8327,13 @@ fn merge_inputs(
         if entry_name == ctors_name {
             entry_function_index = Some(0);
         }
+
+        // Mirror the +1 shift in `function_cmdline_rank` and reserve
+        // slot 0 for `__wasm_call_ctors`. The synth ctor stub has no
+        // source object — we tag it with rank 0 so it sorts ahead of
+        // any input-defined function under the cmdline-rank export
+        // sort (lld puts it right after `memory` in the EXPORT list).
+        function_cmdline_rank.insert(0, 0);
     }
 
     // --- Pass 1.85: identify weak-undefined function symbols ---
@@ -10674,6 +10867,8 @@ fn merge_inputs(
         functions,
         entry_function_index,
         function_name_map,
+        function_cmdline_rank,
+        global_export_pos,
         explicit_export_indices,
         hidden_functions: function_is_hidden,
         local_functions: function_is_local,
