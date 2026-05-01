@@ -43,7 +43,31 @@ and risk. Phases run independently and can ship as separate commits.
 - ⏸ **Phase 3a — init/fini wrappers**: substantial — per-priority
   `.Lcall_dtors.<P>` / `.Lregister_call_dtors.<P>` synthesis plus
   `<func>.command_export` wrappers. Estimated >100 LOC, not the
-  ~90 in the original plan.
+  ~90 in the original plan. Plus a deeper blocker:
+
+  **Archive-resolution dead-path issue.** Wild's archive resolution
+  IS lazy (`is_optional()` in `grouping.rs`), but loads members
+  based on any symbol reference, even from a function that's later
+  GC'd. Concretely for `ctor-gc-setup.test`:
+  - `setup.o` calls `lib_func` → `lib.o` loads.
+  - `lib.o`'s `unused_lib_func` calls `def` → `ctor.o` loads.
+  - `unused_lib_func` is unreachable from `_start` so it's GC'd.
+  - But `ctor.o` is already loaded — its `init_array` entry for
+    `test_ctor` ends up in `all_init_funcs`.
+
+  Wild's current default behaviour (no `<entry>.command_export`
+  wrapper) GCs `__wasm_call_ctors` because nothing references it,
+  so the dead `init_funcs` chain unravels and `test_ctor` drops
+  out — `ctor-gc-setup` happens to pass. But the moment a wrapper
+  keeps `__wasm_call_ctors` alive (Phase 3a's goal), the chain
+  re-roots and `test_ctor` survives, breaking the test.
+
+  lld solves this with two-pass archive resolution: load greedily,
+  GC, then re-evaluate object aliveness based on whether any of
+  the object's symbols are used by post-GC live code. Wild would
+  need similar two-pass semantics, OR a narrower fix: prune
+  `all_init_funcs` whose source object has no other live symbols
+  before building the `__wasm_call_ctors` body.
 - ⏸ **Phase 3b — PIE PIC-base imports**: probed. The minimal three-
   line change (extend `is_shared` to `is_pic`) is necessary but not
   sufficient — `weak-undefined-pic.s` PIE arm requires the GOT
