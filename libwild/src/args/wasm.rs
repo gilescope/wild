@@ -433,6 +433,17 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             // alias for --allow-multiple-definition for now; the
             // symbol_db doesn't emit per-input warnings yet.
             "--noinhibit-exec" => args.allow_multiple_definitions = true,
+            // `-Bsymbolic`: bind locally to defined symbols in shared
+            // libraries. Only meaningful with `-shared`; for an
+            // executable link lld emits a warning, then proceeds.
+            // `bsymbolic.s` checks for that exact warning text.
+            "-Bsymbolic" | "-Bsymbolic-functions" => {
+                if !args.is_shared {
+                    eprintln!(
+                        "warning: -Bsymbolic is only meaningful when combined with -shared"
+                    );
+                }
+            }
 
             // --- Exports (spec §9.2: export for each defined symbol with
             //     non-local linkage and non-hidden visibility) ---

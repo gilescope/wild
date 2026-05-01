@@ -1427,19 +1427,22 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             name_payload.extend_from_slice(&global_names);
         }
 
-        // Subsection 9: data segment names (spec §11.9).
+        // Subsection 9: data segment names (spec §11.9). Use the
+        // category-derived name (`.rodata` / `.tdata` / `.data` /
+        // `.bss`) tracked through `merge_inputs` so FileCheck
+        // fixtures like `data-segment-merging.ll` see the merged-
+        // segment name lld would emit.
         if !merged.data_segments.is_empty() {
             let mut seg_names = Vec::new();
-            // We don't track per-segment names yet — wasm-ld assigns
-            // `.rodata` / `.data` style names. For now emit the
-            // subsection header with a count but empty names so FileCheck
-            // tests that check for the subsection header pass.
             write_leb128(&mut seg_names, merged.data_segments.len() as u32);
-            for (i, _seg) in merged.data_segments.iter().enumerate() {
+            for (i, seg) in merged.data_segments.iter().enumerate() {
                 write_leb128(&mut seg_names, i as u32);
-                // Placeholder name; proper per-segment naming is follow-up.
-                let placeholder = format!(".data.{i}");
-                write_name(&mut seg_names, placeholder.as_bytes());
+                let name: &[u8] = if seg.name.is_empty() {
+                    b".data"
+                } else {
+                    seg.name.as_slice()
+                };
+                write_name(&mut seg_names, name);
             }
             name_payload.push(9);
             write_leb128(&mut name_payload, seg_names.len() as u32);
@@ -4088,6 +4091,11 @@ struct OutputDataSegment {
     memory_offset: Addr,
     /// Segment data.
     data: Vec<u8>,
+    /// Output segment name (e.g. `.rodata`, `.data`, `.bss`). Wild
+    /// emits this in the `name` custom section's DataSegmentNames
+    /// subsection (`data-segment-merging.ll` pins `.rodata` for the
+    /// merged read-only segment).
+    name: Vec<u8>,
 }
 
 /// An import in the output module (for unresolved symbols).
@@ -7399,9 +7407,17 @@ fn merge_inputs(
                     if group_i == 1 {
                         tls_segment_index = Some(segments.len() as u32);
                     }
+                    let name: &[u8] = match group_i {
+                        0 => b".rodata",
+                        1 => b".tdata",
+                        2 => b".data",
+                        3 => b".bss",
+                        _ => b".data",
+                    };
                     segments.push(OutputDataSegment {
                         memory_offset: s as Addr,
                         data,
+                        name: name.to_vec(),
                     });
                 }
             }
