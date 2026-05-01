@@ -163,6 +163,10 @@ pub struct WasmArgs {
     /// error report introduced under default behaviour. Used by
     /// debug-undefined-fs.s.
     pub(crate) import_undefined: bool,
+    /// `-t` / `--trace`: print one line per loaded input file, in
+    /// load order, to stderr. Same as ELF `ld --trace`. Useful for
+    /// debugging "what files actually got linked into this output."
+    pub(crate) trace_files: bool,
     /// `-M` / `-print-map` / `--print-map` writes a link map to
     /// stdout. `-Map=PATH` / `--Map=PATH` writes the same map to a
     /// file. The map lists every output section's file offset and
@@ -232,6 +236,7 @@ impl Default for WasmArgs {
             wrap: Vec::new(),
             import_undefined: false,
             map_file: None,
+            trace_files: false,
         }
     }
 }
@@ -637,7 +642,7 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             // the field doc on `WasmArgs::lld_compat`.
             "--lld-compat" | "-lld_compat" => args.lld_compat = true,
             "--no-lld-compat" | "-no_lld_compat" => args.lld_compat = false,
-            "-t" | "--trace" => {}
+            "-t" | "--trace" => args.trace_files = true,
             // `-y` and `--trace-symbol` accept a symbol either glued
             // (`-yfoo`, `--trace-symbol=foo`) or space-separated
             // (`-y foo`, `--trace-symbol foo` / `-trace-symbol foo`).

@@ -172,6 +172,19 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
 
     let is_shared = layout.symbol_db.args.is_shared;
 
+    // `-t` / `--trace`: print one line per loaded input file. lld
+    // emits the full path; FileCheck's `{{.*}}.foo.o` pattern in
+    // `trace.test` matches either form.
+    if layout.symbol_db.args.trace_files {
+        for group in &layout.group_layouts {
+            for file in &group.files {
+                if let FileLayout::Object(obj) = file {
+                    eprintln!("{}", obj.input.file.filename.display());
+                }
+            }
+        }
+    }
+
     // Relocatable output (-r): emit merged .o file without linking.
     if layout.symbol_db.args.is_relocatable {
         return write_relocatable::<A>(sized_output, layout);
