@@ -6613,6 +6613,13 @@ fn merge_inputs(
         /// merged function back to its source object — the
         /// `prune_init_funcs` pass keys aliveness off this.
         basename: Vec<u8>,
+        /// Object should be treated as unconditionally alive in the
+        /// `prune_init_funcs` walk. True for main objects (not
+        /// pulled in via lazy archive resolution) and for archive
+        /// members loaded under `--whole-archive`. Without this,
+        /// the prune drops legitimate init_funcs from
+        /// whole-archive members whose call chains are dead.
+        always_alive: bool,
     }
     let mut objects: Vec<ObjectInfo> = Vec::new();
     let mut total_functions = 0u32;
@@ -6871,6 +6878,8 @@ fn merge_inputs(
                     .map(|s| s.as_encoded_bytes().to_vec())
                     .unwrap_or_default()
             };
+            let always_alive = obj.input.file.modifiers.whole_archive
+                || obj.input.entry.is_none(); // main objects (non-archive) always alive
             objects.push(ObjectInfo {
                 parsed,
                 type_map,
@@ -6879,6 +6888,7 @@ fn merge_inputs(
                 comdat_skip_data,
                 comdat_skip_tags,
                 basename,
+                always_alive,
             });
         }
     }
@@ -9492,10 +9502,18 @@ fn merge_inputs(
         // source basename and never contribute to `alive_basenames`.
         let mut func_idx_to_basename: std::collections::HashMap<u32, &[u8]> =
             Default::default();
+        // Source objects that are unconditionally alive — main
+        // objects and `--whole-archive` archive members. Their
+        // init_funcs survive the prune regardless of reachability.
+        let mut always_alive_basenames: std::collections::HashSet<&[u8]> =
+            Default::default();
         for obj_info in &objects {
             for local_idx in 0..obj_info.parsed.functions.len() as u32 {
                 let post_idx = ctors_offset + obj_info.func_base + local_idx;
                 func_idx_to_basename.insert(post_idx, obj_info.basename.as_slice());
+            }
+            if obj_info.always_alive {
+                always_alive_basenames.insert(obj_info.basename.as_slice());
             }
         }
 
@@ -9561,10 +9579,13 @@ fn merge_inputs(
                     alive_basenames.insert(bn);
                 }
             }
-            // Update kept mask.
+            // Update kept mask. Always-alive objects (main inputs
+            // and `--whole-archive` members) keep their inits
+            // regardless of reachability.
             let mut changed = false;
             for (i, origin) in init_funcs_origin.iter().enumerate() {
-                let now_kept = alive_basenames.contains(origin.as_slice());
+                let now_kept = alive_basenames.contains(origin.as_slice())
+                    || always_alive_basenames.contains(origin.as_slice());
                 if now_kept && !kept[i] {
                     kept[i] = true;
                     changed = true;
