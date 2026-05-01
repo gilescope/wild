@@ -3,9 +3,9 @@
 Roadmap for closing the remaining gap to lld byte-for-byte parity in
 wild's wasm linker. Snapshot date 2026-04-30 (updated post Phase 1).
 
-Current state (after Phase 1 + targeted wins):
+Current state (after Phase 1 + Phase 3a + targeted wins):
 
-- `lld_wasm_tests`: **128 passed** (was 122), 96 ignored, 0 failed.
+- `lld_wasm_tests`: **132 passed** (was 122), 92 ignored, 0 failed.
 - `wasm_regression_tests`: 2 passed.
 - `--lld-compat` flag (mach-o `-ld64_compat` analog) enabled by the
   test runner; off by default for production users who want speed
