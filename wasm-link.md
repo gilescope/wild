@@ -3,9 +3,9 @@
 Roadmap for closing the remaining gap to lld byte-for-byte parity in
 wild's wasm linker. Snapshot date 2026-04-30 (updated post Phase 1).
 
-Current state (after Phase 1):
+Current state (after Phase 1 + targeted wins):
 
-- `lld_wasm_tests`: **125 passed** (was 122), 99 ignored, 0 failed.
+- `lld_wasm_tests`: **128 passed** (was 122), 96 ignored, 0 failed.
 - `wasm_regression_tests`: 2 passed.
 - `--lld-compat` flag (mach-o `-ld64_compat` analog) enabled by the
   test runner; off by default for production users who want speed
@@ -52,9 +52,20 @@ and risk. Phases run independently and can ship as separate commits.
   whether inputs reference it. The plan's "~60 LOC" is wildly
   optimistic. Reverted.
 
-Net: +3 tests this session (122→125). Phase 1 essentially complete
+Net: +6 tests across sessions (122→128). Phase 1 essentially complete
 (within reach of what the plan promised). Phases 2/3/4 are each a
 multi-iteration commitment.
+
+Targeted wins outside the plan structure:
+
+- ✅ **`__llvm_covfun` 8-byte alignment** (commit a5194fa): chunks
+  of `__llvm_covfun` custom section are now padded to 8-byte
+  alignment when concatenated across inputs. Unlocks
+  `custom-section-align.s`.
+- ✅ **`-t` / `--trace`** (commit 6dfd906): print loaded input file
+  paths. Unlocks `trace.test`.
+- ✅ **`-v` / `-V` / `--version`** (commit a46c700): print "LLD
+  <version>". Unlocks `version.test`.
 
 ---
 
