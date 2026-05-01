@@ -321,6 +321,7 @@ const KNOWN_PASSING: &[&str] = &[
     "no-shlib-sigcheck",
     "shared-export-dynamic",
     "static-error",
+    "load-undefined",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

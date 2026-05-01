@@ -10247,21 +10247,51 @@ fn merge_inputs(
     // walk that runs after.
     let is_pic_mode = layout.symbol_db.args.is_shared || layout.symbol_db.args.is_pic;
     if is_pic_mode {
-        let any_input_uses_stack_pointer = if layout.symbol_db.args.is_shared {
-            true
-        } else {
-            objects.iter().any(|obj| {
+        // Stack-pointer import: lld emits it under -shared / -pie ONLY
+        // when an input actually references it (no `global.get
+        // __stack_pointer` → no point importing). `shared-weak-symbols.s`
+        // and many other small `-shared` fixtures pin the
+        // "no inputs use stack pointer → no env.__stack_pointer"
+        // omission.
+        let any_input_uses_stack_pointer = objects.iter().any(|obj| {
+            obj.parsed
+                .imports
+                .iter()
+                .any(|imp| imp.kind == 3 && imp.field == b"__stack_pointer")
+        });
+        // Indirect-function-table import: lld emits it under -shared /
+        // -pie only when the output actually has a non-empty function
+        // table — either a `table_entries` slot synthesised for an
+        // indirect call / function pointer, or an input-side
+        // `GOT.func.*` reference (which the runtime resolves into a
+        // table slot). Empty-table shared libs (`shared-weak-symbols.s`)
+        // omit both `env.__indirect_function_table` and the
+        // `env.__table_base` global that pairs with it.
+        let any_input_uses_table = !table_entries.is_empty()
+            || objects.iter().any(|obj| {
                 obj.parsed
                     .imports
                     .iter()
-                    .any(|imp| imp.kind == 3 && imp.field == b"__stack_pointer")
-            })
+                    .any(|imp| imp.kind == 3 && imp.module == b"GOT.func")
+            });
+        // Memory minimum under -shared / -pie: lld uses the merged
+        // data size in pages (rounded up). Empty-data shared libs
+        // get Min=0x0; one byte of data still rounds to one page
+        // (64KiB). `shared-weak-symbols.s` pins the empty-data case.
+        let mem_min: u64 = {
+            let page = layout.symbol_db.args.page_size.unwrap_or(65536);
+            if data_size == 0 {
+                0
+            } else {
+                let bytes = data_size as u64;
+                (bytes + page - 1) / page
+            }
         };
         output_imports.push(OutputImport {
             module: b"env".to_vec(),
             field: b"memory".to_vec(),
             kind: ImportKind::Memory {
-                min: 1,
+                min: mem_min,
                 max: None,
                 shared: false,
                 memory64: layout.symbol_db.args.memory64,
@@ -10298,11 +10328,24 @@ fn merge_inputs(
             import_global_name_map.push((b"__stack_pointer".to_vec(), sp_idx));
             num_imported_globals += 1;
         }
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"__indirect_function_table".to_vec(),
-            kind: ImportKind::Table { min: 0 },
-        });
+        // `__indirect_function_table`: only when the output table is
+        // non-empty (an indirect call / function-pointer reloc adds a
+        // table_entries slot, or a `GOT.func.*` import requires the
+        // dynamic linker to allocate one).
+        if any_input_uses_table {
+            output_imports.push(OutputImport {
+                module: b"env".to_vec(),
+                field: b"__indirect_function_table".to_vec(),
+                kind: ImportKind::Table { min: 0 },
+            });
+        }
+        // `__table_base`: lld emits this UNCONDITIONALLY under
+        // `-shared` / `-pie` — even when the table is empty — because
+        // any input could reference it via R_WASM_TABLE_INDEX_REL_*
+        // relocations resolved at instantiate time. Pairing it with
+        // `__indirect_function_table` (as we used to) breaks
+        // `shared-weak-symbols.s` which has no indirect calls but
+        // still expects `env.__table_base` in the IMPORT section.
         let tb_idx = num_imported_globals;
         table_base_global_idx = Some(tb_idx);
         output_imports.push(OutputImport {
