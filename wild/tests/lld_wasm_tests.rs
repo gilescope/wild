@@ -322,6 +322,7 @@ const KNOWN_PASSING: &[&str] = &[
     "shared-export-dynamic",
     "static-error",
     "load-undefined",
+    "local-symbols",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

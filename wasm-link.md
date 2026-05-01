@@ -206,10 +206,16 @@ and risk. Phases run independently and can ship as separate commits.
   `static-error.s`) still fail on `dylink.0` custom-section content
   and `.so`/dynamic-needed handling — that's Phase 4b territory.
 
-Net: +14 tests across sessions (122→136). Phases 1, 3a, 3b complete;
+Net: +17 tests across sessions (122→139). Phases 1, 3a, 3b complete;
 Phase 2 (infra) and Phases 4a/4b (partial) shipped. Phase 4a's per-
-input sym-position key and Phase 4b's symbol-resolution-level
-duplicate-handling for `.so` inputs remain.
+input sym-position key remains; Phase 4b shipped enough to unlock
+shared-needed, no-shlib-sigcheck, shared-export-dynamic, static-
+error, load-undefined, local-symbols, plus the dylink.0 emit gate
+widened to PIE / Bdynamic-exec links and conditional shared/PIE
+imports (env.memory Min, env.__stack_pointer, env.__indirect_function_table).
+Remaining shared/dylink fixtures need ImportInfo dylink.0 subsection,
+__wasm_apply_data_relocs synth, weak-import-AND-export pattern, and
+TableSize tracking under PIE.
 
 Targeted wins outside the plan structure:
 
