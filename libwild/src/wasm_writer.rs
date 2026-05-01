@@ -432,10 +432,12 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     payload.push(0x00);
                     write_leb128(&mut payload, *type_idx);
                 }
-                ImportKind::Table { min } => {
+                ImportKind::Table { min, memory64 } => {
                     payload.push(0x01); // table
                     payload.push(0x70); // funcref
-                    payload.push(0x00); // no max
+                    // Limits flags: bit 0 = HAS_MAX, bit 2 = IS_64.
+                    let flags: u8 = if *memory64 { 0x04 } else { 0x00 };
+                    payload.push(flags);
                     write_leb128(&mut payload, *min);
                 }
                 ImportKind::Memory {
@@ -4134,6 +4136,9 @@ enum ImportKind {
     Function(u32), // type index
     Table {
         min: u32,
+        /// `true` under memory64 / `-mwasm64`: emit the IS_64 flag in
+        /// the table's limits header (`shared64.s` pins this).
+        memory64: bool,
     },
     Memory {
         min: u64,
@@ -9673,10 +9678,18 @@ fn merge_inputs(
                                         // `dylink.0` TableSize reflects how
                                         // many table slots the dynamic linker
                                         // must reserve (`shared.s` / `pie.s`
-                                        // / `shared64.s` pin this).
+                                        // / `shared64.s` pin this). Skip
+                                        // imported targets — they're already
+                                        // accounted for by the per-input
+                                        // GOT.func walk; double-counting
+                                        // breaks shared64.s's TableSize: 2.
                                         let func_idx = value;
+                                        let is_import = function_import_output_idx
+                                            .values()
+                                            .any(|&i| i == func_idx as u32);
                                         if (layout.symbol_db.args.is_shared
                                             || layout.symbol_db.args.is_pic)
+                                            && !is_import
                                             && table_needed_funcs.insert(func_idx)
                                         {
                                             table_needed_order.push(func_idx);
@@ -10436,6 +10449,7 @@ fn merge_inputs(
                 field: b"__indirect_function_table".to_vec(),
                 kind: ImportKind::Table {
                     min: table_entries.len() as u32,
+                    memory64: layout.symbol_db.args.memory64,
                 },
             });
         }
@@ -10467,14 +10481,16 @@ fn merge_inputs(
         // `__table_base`: lld emits this UNCONDITIONALLY under
         // `-shared` / `-pie` — even when the table is empty — because
         // any input could reference it via R_WASM_TABLE_INDEX_REL_*
-        // relocations resolved at instantiate time.
+        // relocations resolved at instantiate time. Widens to I64
+        // under memory64 (`shared64.s` pins this — the table base
+        // is an address, so its width follows the address width).
         let tb_idx = num_imported_globals;
         table_base_global_idx = Some(tb_idx);
         output_imports.push(OutputImport {
             module: b"env".to_vec(),
             field: b"__table_base".to_vec(),
             kind: ImportKind::Global {
-                valtype: VALTYPE_I32,
+                valtype: addr_vt_imp,
                 mutable: false,
             },
         });
@@ -10612,8 +10628,16 @@ fn merge_inputs(
                         input_global_imp_idx += 1;
                         continue;
                     }
-                    let valtype = (imp.type_index >> 1) as u8;
+                    let mut valtype = (imp.type_index >> 1) as u8;
                     let mutable = (imp.type_index & 1) != 0;
+                    // Memory64: GOT.* slots are address-pointers, so
+                    // widen to I64 to match the 64-bit address width
+                    // (`shared64.s` pins this — input `.o` carries
+                    // I32 GOT.mem.indirect_func even under -mwasm64,
+                    // and the linker is responsible for emitting I64).
+                    if layout.symbol_db.args.memory64 && imp.module.starts_with(b"GOT.") {
+                        valtype = VALTYPE_I64;
+                    }
                     output_imports.push(OutputImport {
                         module: imp.module.clone(),
                         field: imp.field.clone(),
@@ -10705,42 +10729,11 @@ fn merge_inputs(
         });
     }
 
-    // Under `-shared`: pass through GOT imports (`GOT.func.*` /
-    // `GOT.mem.*`) emitted by every input. These are mutable i32
-    // globals filled by the runtime. Under `-pie`, the per-object
-    // loop above already emitted these in input order — skip the
-    // redundant pass here so the import section keeps the same
-    // ordering as lld's PIE output (`GOT.func.foo` right after
-    // `env.foo`). The PIC-base globals (`memory`, `__memory_base`,
-    // `__indirect_function_table`, `__table_base`) were emitted in
-    // Pass 4a.5 above so they sit before any input-side imports.
-    if layout.symbol_db.args.is_shared {
-        let mut seen_got: std::collections::HashSet<(Vec<u8>, Vec<u8>)> = Default::default();
-        for obj_info in &objects {
-            for imp in &obj_info.parsed.imports {
-                if imp.kind != 3 {
-                    continue; // only global imports
-                }
-                let is_got = imp.module.starts_with(b"GOT.");
-                if !is_got {
-                    continue;
-                }
-                let key = (imp.module.clone(), imp.field.clone());
-                if !seen_got.insert(key) {
-                    continue; // dedup
-                }
-                output_imports.push(OutputImport {
-                    module: imp.module.clone(),
-                    field: imp.field.clone(),
-                    kind: ImportKind::Global {
-                        valtype: VALTYPE_I32,
-                        mutable: true,
-                    },
-                });
-                num_imported_globals += 1;
-            }
-        }
-    }
+    // (GOT.* import pass-through used to live here; redundant —
+    // the per-object loop above already emits them under both
+    // `-shared` and `-pie` with the type encoded by the input's
+    // own import descriptor. Deleting fixed `shared64.s`'s GOT.*
+    // duplicates.)
 
     // In shared mode: build global name → index for imported globals.
     if layout.symbol_db.args.is_shared {
@@ -10775,7 +10768,10 @@ fn merge_inputs(
         output_imports.push(OutputImport {
             module: b"env".to_vec(),
             field: b"__indirect_function_table".to_vec(),
-            kind: ImportKind::Table { min: table_size },
+            kind: ImportKind::Table {
+                min: table_size,
+                memory64: layout.symbol_db.args.memory64,
+            },
         });
     }
 
