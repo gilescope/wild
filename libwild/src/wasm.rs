@@ -402,6 +402,56 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let wasm_file = object::read::wasm::WasmFile::parse(input)?;
 
+        // Wasm shared-library detection. The wasm-ld dylink ABI puts
+        // a `dylink.0` custom section as the very first section of a
+        // `.so` (immediately after the 8-byte header). When present,
+        // every "defined" symbol in the file is really an *exported*
+        // symbol that the dynamic linker resolves at load time —
+        // wild's layout-level symbol_db must NOT see them as strong
+        // defs (otherwise a `_start` defined in the main `.o` and
+        // exported by a sibling `.so` collide as duplicates, e.g.
+        // `static-error.s`'s `-pie %t.o %t.so` arm).
+        //
+        // The wasm_writer's per-input merge (`is_shared_library`
+        // path) handles `.so`s separately — captures their basenames
+        // into the output's `dylink.0` `Needed` list and pulls their
+        // EXPORTs into `env.<name>` imports — so the symbols don't
+        // need to flow through the symbol_db at all. Returning an
+        // empty symbol list here lets the `.so` ride through input-
+        // loading without triggering the platform-shared duplicate-
+        // strong-def check.
+        // Local LEB128 reader — wasm_writer's helper isn't pub.
+        // Returns (value, bytes_consumed) or (0, 0) on parse failure.
+        fn quick_leb(data: &[u8]) -> (usize, usize) {
+            let mut value = 0usize;
+            let mut shift = 0;
+            for (i, &byte) in data.iter().enumerate() {
+                if shift >= 64 {
+                    return (0, 0);
+                }
+                value |= ((byte & 0x7f) as usize) << shift;
+                if byte & 0x80 == 0 {
+                    return (value, i + 1);
+                }
+                shift += 7;
+            }
+            (0, 0)
+        }
+        let is_shared_library = input.len() >= 22
+            && &input[..4] == b"\0asm"
+            && input[8] == 0
+            && {
+                // section_id=0 (custom), then size LEB, then name LEB,
+                // then the literal bytes "dylink.0".
+                let after_id = &input[9..];
+                let (_size, c1) = quick_leb(after_id);
+                let after_size = &after_id[c1..];
+                let (name_len, c2) = quick_leb(after_size);
+                name_len == 8
+                    && after_size.len() >= c2 + 8
+                    && &after_size[c2..c2 + 8] == b"dylink.0"
+            };
+
         // Parse COMDAT groups directly from raw WASM data (§7).
         // The object crate's WASM COMDAT is a stub, so we parse it ourselves.
         let comdat_symbol_names = parse_comdat_symbol_names(input);
@@ -430,6 +480,26 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut symbols = Vec::new();
         let mut symbol_names = Vec::new();
+
+        // Skip the entire symbol walk for `.so` inputs — the writer's
+        // wasm_writer::merge_inputs path captures their EXPORTs into
+        // `dylink_exports` directly from the wasm bytes, and the
+        // platform-shared symbol_db does NOT need to see them. If we
+        // *did* let them through, every `.so` symbol the writer also
+        // captures would race against the matching `.o` definition in
+        // symbol_db's strong/strong duplicate-def check (e.g.
+        // `static-error.s`'s `_start` defined in both arms).
+        if is_shared_library {
+            let _ = (&comdat_symbol_names, &section_index_map);
+            return Ok(File {
+                data: input,
+                sections,
+                section_data,
+                section_names,
+                symbols: vec![],
+                symbol_names: vec![],
+            });
+        }
 
         for sym in wasm_file.symbols() {
             let name = sym.name_bytes().unwrap_or(b"");
