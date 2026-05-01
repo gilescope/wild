@@ -317,6 +317,8 @@ const KNOWN_PASSING: &[&str] = &[
     "ctor-gc",
     "weak-undefined-pic",
     "archive-export",
+    "shared-needed",
+    "no-shlib-sigcheck",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

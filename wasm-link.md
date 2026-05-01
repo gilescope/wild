@@ -87,6 +87,46 @@ and risk. Phases run independently and can ship as separate commits.
   need similar two-pass semantics, OR a narrower fix: prune
   `all_init_funcs` whose source object has no other live symbols
   before building the `__wasm_call_ctors` body.
+- 🟡 **Phase 4b — shared library `.so` understanding**: partial.
+  Wild now recognises `.so` inputs (the wasm-ld dylink ABI marks
+  these by emitting `dylink.0` as the very first custom section)
+  and treats them as resolution-only contributions — exports become
+  `env.<name>` imports in the output, code/data/types do NOT enter
+  the merged module. The output's `dylink.0` `Needed` subsection
+  lists the basename of each `.so` the link resolved against, so
+  the dynamic linker knows which sibling modules to load before
+  instantiating this one.
+
+  Three pieces shipped together:
+  1. `parse_wasm_sections` sets `is_shared_library = true` when
+     section 0 is the `dylink.0` custom section.
+  2. `merge_inputs` short-circuits on shared-library inputs: it
+     captures their basenames into `dylink_needed` and their
+     EXPORT-section entries into `dylink_exports` (with the
+     function `FuncType` so the synth import gets the right
+     SigIndex), then `continue`s — skipping the parse-loop body
+     that would otherwise dump the .so's symbols / code / data /
+     custom sections into the merged output.
+  3. The `dylink.0` emit pass populates `Needed` from
+     `merged.dylink_needed` instead of always-empty.
+
+  Unlocks `shared-needed.s` (both the SO1 stand-alone-shared and
+  the SO2 link-against-shared arms) and `no-shlib-sigcheck.s`.
+
+  Remaining Phase 4b work is symbol-resolution-level —
+  `symbol_db.rs`'s duplicate-strong-def check fires for `.so`
+  inputs whose exports match a defined symbol in another input
+  (e.g. `static-error.s` defines `_start` in both the `.o` and
+  `.so`), and that path is platform-shared (elf/macho/wasm). A
+  proper fix needs the layout to know about wasm shared libraries,
+  which is a cross-cutting refactor. The other shared/dylink
+  fixtures (`shared.s`, `shared-weak-symbols.s`, `pie.s`,
+  `dylink*`, `stub-library*`) need additional pieces too:
+  per-input encounter export ordering (Phase 4a tail), TABLE
+  Limits widening for the indirect_function_table import
+  reflecting the actual merged table_entries count, and various
+  GOT routing details.
+
 - 🟡 **Phase 4a — per-input EXPORT-emit-order**: partial. Three
   pieces shipped that lay the groundwork for the full per-input
   encounter walk:
@@ -158,10 +198,10 @@ and risk. Phases run independently and can ship as separate commits.
   `static-error.s`) still fail on `dylink.0` custom-section content
   and `.so`/dynamic-needed handling — that's Phase 4b territory.
 
-Net: +12 tests across sessions (122→134). Phases 1, 3a, 3b complete;
-Phase 2 (infra) and Phase 4a (partial — function-index reorder + synth
-GLOBAL for data symbols) shipped. Phase 4a's per-input sym-position
-key and Phase 4b (.so handling) remain.
+Net: +14 tests across sessions (122→136). Phases 1, 3a, 3b complete;
+Phase 2 (infra) and Phases 4a/4b (partial) shipped. Phase 4a's per-
+input sym-position key and Phase 4b's symbol-resolution-level
+duplicate-handling for `.so` inputs remain.
 
 Targeted wins outside the plan structure:
 

@@ -356,8 +356,14 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         write_leb128(&mut dylink_payload, mem_info.len() as u32);
         dylink_payload.extend_from_slice(&mem_info);
 
-        // Subsection 2: WASM_DYLINK_NEEDED (empty for now)
-        let needed: Vec<u8> = vec![0]; // count=0
+        // Subsection 2: WASM_DYLINK_NEEDED. One length-prefixed name
+        // per `.so` input the link resolved against; the dynamic
+        // linker loads each before instantiating this module.
+        let mut needed = Vec::new();
+        write_leb128(&mut needed, merged.dylink_needed.len() as u32);
+        for n in &merged.dylink_needed {
+            write_name(&mut needed, n);
+        }
         dylink_payload.push(2);
         write_leb128(&mut dylink_payload, needed.len() as u32);
         dylink_payload.extend_from_slice(&needed);
@@ -4184,6 +4190,11 @@ struct MergedModule {
     stack_pointer_value: Addr,
     /// Max data segment alignment (for dylink.0 MemoryAlignment).
     max_data_alignment: u32,
+    /// Basenames of `.so` inputs the link resolved against. Wild
+    /// emits one entry per name in the output's `dylink.0` Needed
+    /// subsection so the dynamic linker knows which sibling modules
+    /// to load before instantiating this one.
+    dylink_needed: Vec<Vec<u8>>,
     /// Indirect function table: maps table index → function index.
     /// Per spec §9.4: entries start at index 1 (0 = null/trap).
     table_entries: Vec<u32>,
@@ -6716,6 +6727,13 @@ fn merge_inputs(
         always_alive: bool,
     }
     let mut objects: Vec<ObjectInfo> = Vec::new();
+    // Basenames of `.so` inputs encountered in cmdline order. Each
+    // becomes a `Needed` entry in the output's `dylink.0` section.
+    let mut dylink_needed: Vec<Vec<u8>> = Vec::new();
+    // Resolution targets contributed by `.so` inputs: `(name, kind,
+    // optional FuncType for kind=0)`. These resolve undef refs in
+    // other inputs into `env.<name>` imports in the output.
+    let mut dylink_exports: Vec<(Vec<u8>, u8, Option<FuncType>)> = Vec::new();
     let mut total_functions = 0u32;
     // COMDAT groups (spec §7): first definition wins, duplicates discarded.
     let mut seen_comdat_groups: std::collections::HashSet<Vec<u8>> = Default::default();
@@ -6766,6 +6784,51 @@ fn merge_inputs(
                     e.to_string()
                 )
             })?;
+
+            // Wasm shared library: collect its EXPORT-section symbols
+            // (so that other inputs' undef refs can resolve against
+            // them, becoming `env.<name>` imports in the output) and
+            // record its basename in the dylink_needed list. Skip the
+            // rest of the per-input merge — the .so's code/data/types
+            // do NOT enter the output module; they live in their own
+            // module that the dynamic linker resolves at load time.
+            if parsed.is_shared_library {
+                let basename = obj
+                    .input
+                    .file
+                    .filename
+                    .file_name()
+                    .map(|s| s.as_encoded_bytes().to_vec())
+                    .unwrap_or_default();
+                if !basename.is_empty() {
+                    dylink_needed.push(basename);
+                }
+                for ovr in &parsed.export_overrides {
+                    // EXPORT section entry: `name` is the wasm-level
+                    // export name, `kind` is the import kind in the
+                    // output (FUNCTION/GLOBAL/MEMORY/TABLE), `index`
+                    // is the source-internal index — the consumer
+                    // only needs (name, kind, type signature) so we
+                    // capture name+kind here. Functions also need
+                    // their type signature so the synth import can
+                    // get the right SigIndex; we resolve that by
+                    // looking up `parsed.functions[local_idx]` then
+                    // `parsed.types[type_index]`.
+                    if ovr.kind == 0 {
+                        let local_def = ovr.index as usize;
+                        let func = parsed.functions.get(local_def);
+                        let sig = func.and_then(|f| {
+                            parsed.types.get(f.type_index as usize).cloned()
+                        });
+                        if let Some(sig) = sig {
+                            dylink_exports.push((ovr.name.clone(), 0u8, Some(sig)));
+                        }
+                    } else {
+                        dylink_exports.push((ovr.name.clone(), ovr.kind, None));
+                    }
+                }
+                continue;
+            }
 
             // `-y SYM` / `--trace-symbol=SYM` diagnostics. Per file,
             // walk the symbol table and emit one line per matching
@@ -10893,6 +10956,7 @@ fn merge_inputs(
             }
             max
         },
+        dylink_needed,
         imports: output_imports,
         num_imported_functions,
         num_imported_globals,
@@ -11797,6 +11861,14 @@ struct ParsedInput {
     /// the current set of fixtures, so only the function entries are
     /// recorded.
     export_overrides: Vec<InputExport>,
+    /// True when this input is a wasm shared library (ABI-defined
+    /// `dylink.0` custom section as the FIRST section after the
+    /// header). Shared libraries contribute their exports to undef
+    /// resolution but their code/data/types are NOT linked into the
+    /// output — they live in their own module that the output
+    /// references via a `Needed` entry in `dylink.0`. lld treats
+    /// `.so` inputs this way; wild's `merge_inputs` follows suit.
+    is_shared_library: bool,
 }
 
 /// One entry from an input's EXPORT section. Captured during parse
@@ -11860,6 +11932,11 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
     // limits 0x04 flag. Forwarded to layout so it can reject a mix of mem64
     // inputs with `--features=+memory64` absent.
     let mut is_memory64 = false;
+    // True when this input is a wasm shared library — its first
+    // section is the `dylink.0` custom section. Set when that custom
+    // section is parsed; merge_inputs uses this to skip linking the
+    // .so's content while still pulling its exports for resolution.
+    let mut is_shared_library = false;
 
     let mut pos = 8; // skip header
     while pos < data.len() {
@@ -12105,6 +12182,15 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
                     .map_err(|e| crate::error!("custom section name_len: {}", e.to_string()))?;
                 let name = &payload[c..c + name_len];
                 let custom_data = &payload[c + name_len..];
+                if name == b"dylink.0" && section_counter == 0 {
+                    // Wasm shared-library marker per the dylink.0 ABI:
+                    // the section MUST be first (immediately after the
+                    // header). When present, this input is a `.so`
+                    // and merge_inputs treats it as a resolution-only
+                    // contribution (exports become imports in the
+                    // output, code/data are not merged).
+                    is_shared_library = true;
+                }
                 if name == b"linking" {
                     let linking = parse_linking_data(custom_data, num_imports);
                     symbols = linking.symbols;
@@ -12248,6 +12334,7 @@ fn parse_wasm_sections(data: &[u8]) -> crate::error::Result<ParsedInput> {
         num_tag_imports,
         import_tag_names,
         is_memory64,
+        is_shared_library,
         custom_relocations: {
             // Resolve deferred reloc.* sections whose target is a custom
             // section, using the position→name map built during the parse
