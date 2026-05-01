@@ -62,6 +62,10 @@ pub struct WasmArgs {
     pub(crate) initial_heap: Option<u64>,
     /// Allow multiple definitions (--allow-multiple-definition).
     pub(crate) allow_multiple_definitions: bool,
+    /// `-rpath` / `--rpath` entries — runtime library search paths
+    /// emitted as the dylink.0 RuntimePath subsection (id 5).
+    /// `rpath.s` pins this for the wasm dynamic-linker convention.
+    pub(crate) rpath: Vec<String>,
     /// Symbols to force undefined (-u/--undefined).
     pub(crate) force_undefined: Vec<String>,
     /// `--unresolved-symbols=ignore-all` / `--warn-unresolved-symbols`:
@@ -212,6 +216,7 @@ impl Default for WasmArgs {
             global_base: None,
             initial_heap: None,
             allow_multiple_definitions: false,
+            rpath: Vec::new(),
             force_undefined: Vec::new(),
             stub_unresolved_functions: false,
             shared_memory: false,
@@ -709,13 +714,23 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             _ if arg.starts_with("-rpath") => {
                 if arg == "-rpath" {
-                    iter.next();
+                    if let Some(p) = iter.next() {
+                        args.rpath.push(p.as_ref().to_string());
+                    }
+                } else if let Some(rest) = arg.strip_prefix("-rpath=") {
+                    args.rpath.push(rest.to_string());
                 }
             }
-            _ if arg.starts_with("--rpath=") => {}
+            _ if arg.starts_with("--rpath=") => {
+                if let Some(rest) = arg.strip_prefix("--rpath=") {
+                    args.rpath.push(rest.to_string());
+                }
+            }
             _ if arg.starts_with("--rpath") => {
-                if arg == "--rpath" {
-                    iter.next();
+                if arg == "--rpath"
+                    && let Some(p) = iter.next()
+                {
+                    args.rpath.push(p.as_ref().to_string());
                 }
             }
             "--print-gc-sections" => args.print_gc_sections = true,

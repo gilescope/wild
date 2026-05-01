@@ -324,6 +324,7 @@ const KNOWN_PASSING: &[&str] = &[
     "load-undefined",
     "local-symbols",
     "shared-weak-undefined",
+    "rpath",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.

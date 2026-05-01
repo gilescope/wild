@@ -381,6 +381,21 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         write_leb128(&mut dylink_payload, needed.len() as u32);
         dylink_payload.extend_from_slice(&needed);
 
+        // Subsection 5: WASM_DYLINK_RUNTIME_PATH. One length-prefixed
+        // path per `-rpath` / `--rpath` argument. The dynamic linker
+        // searches these for `.so` dependencies before falling back
+        // to system paths. `rpath.s` pins this.
+        if !layout.symbol_db.args.rpath.is_empty() {
+            let mut rp = Vec::new();
+            write_leb128(&mut rp, layout.symbol_db.args.rpath.len() as u32);
+            for path in &layout.symbol_db.args.rpath {
+                write_name(&mut rp, path.as_bytes());
+            }
+            dylink_payload.push(5);
+            write_leb128(&mut dylink_payload, rp.len() as u32);
+            dylink_payload.extend_from_slice(&rp);
+        }
+
         // Subsection 4: WASM_DYLINK_IMPORT_INFO. One entry per weak-
         // undef import: `(module, field, flags)`. Tells the dynamic
         // linker which imports may legitimately have no resolver —
