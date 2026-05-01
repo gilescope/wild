@@ -40,10 +40,29 @@ and risk. Phases run independently and can ship as separate commits.
   parity (function body sizes, `.data`/`.bss` segment naming, per-
   data-symbol sub-rows, name-section size), but the infra is in
   for users who want a debug map.
-- ⏸ **Phase 3a — init/fini wrappers**: substantial — per-priority
-  `.Lcall_dtors.<P>` / `.Lregister_call_dtors.<P>` synthesis plus
-  `<func>.command_export` wrappers. Estimated >100 LOC, not the
-  ~90 in the original plan. Plus a deeper blocker:
+- ✅ **Phase 3a — init/fini wrappers**: shipped (commits 34001f1,
+  c87e804, 85d2a80). `.Lcall_dtors.<P>` /
+  `.Lregister_call_dtors.<P>` synthesis is a no-op for wild —
+  LLVM lowers `llvm.global_dtors` at compile time so they appear
+  as ordinary input functions. What wild adds: an
+  `<entry>.command_export` wrapper, a sibling
+  `<exported>.command_export` wrapper for every
+  `WASM_SYM_EXPORTED` function (`.export_name foo, foo` style),
+  and a Pass 2.7 init-func source-object pruner that approximates
+  lld's two-pass archive resolution. Plus an existing-bug fix in
+  the Pass 3 `table_entries` ctor-offset shift (was
+  double-shifting Pass 2 entries).
+
+  Unlocks `init-fini-no-gc.ll`, `ctor-no-gc.test`,
+  `command-exports.s`, `command-exports-no-tors.s`. The sibling
+  `init-fini.ll` needs BINDING_LOCAL multi-def handling for
+  repeated `.Lcall_dtors.<P>` across inputs;
+  `ctor-gc.test`'s WHOLEARCHIVE arm needs `--whole-archive`-aware
+  prune (all members unconditionally alive); `weak-symbols.s` /
+  `archive-export.test` need Phase 4a per-input EXPORT-emit-order
+  tracking.
+
+  Original analysis (kept for reference):
 
   **Archive-resolution dead-path issue.** Wild's archive resolution
   IS lazy (`is_optional()` in `grouping.rs`), but loads members
