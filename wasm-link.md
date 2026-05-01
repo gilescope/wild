@@ -206,19 +206,23 @@ and risk. Phases run independently and can ship as separate commits.
   `static-error.s`) still fail on `dylink.0` custom-section content
   and `.so`/dynamic-needed handling — that's Phase 4b territory.
 
-Net: +18 tests across sessions (122→140). Phases 1, 3a, 3b complete;
+Net: +19 tests across sessions (122→141). Phases 1, 3a, 3b complete;
 Phase 2 (infra) and Phases 4a/4b (partial) shipped. Phase 4b
-infrastructure is now substantial: dylink.0 ImportInfo subsection
-(for weak-undef imports), table-slot tracking under shared/PIE
-(R_WASM_TABLE_INDEX_I32/I64 + GOT.func.*), conditional shared/PIE
-import gating, IMPORT-section ordering matching lld, memory64-aware
-type widening for env.__table_base / env.__indirect_function_table /
-GOT.*, and `.so` symbol skip at the platform-shared symbol_db.
-Phase 4a's per-input sym-position key still remains; the remaining
-shared/dylink fixtures need __wasm_apply_data_relocs +
+infrastructure is now substantial: dylink.0 ImportInfo (for weak-
+undef imports) and RuntimePath (for `-rpath`) subsections, table-
+slot tracking under shared/PIE (R_WASM_TABLE_INDEX_I32/I64 +
+GOT.func.*), conditional shared/PIE import gating, IMPORT-section
+ordering matching lld, memory64-aware type widening for env.
+__table_base / env.__indirect_function_table / GOT.*, `.so` symbol
+skip at the platform-shared symbol_db, segment-name carry-through
+(.rodata / .tdata / .data / .bss), and additional flag acceptance
+(`--unresolved-symbols=import-dynamic`, `--noinhibit-exec`,
+`-Bsymbolic`). Phase 4a's per-input sym-position key still remains;
+the remaining shared/dylink fixtures need __wasm_apply_data_relocs +
 __wasm_apply_global_relocs synth, __wasm_init_memory synth (shared
 memory), weak-import-AND-export pattern (-shared weakdef), START
-section synth in PIE, and per-input GOT-import discovery ordering.
+section synth in PIE, per-input GOT-import discovery ordering, and
+demangle support.
 
 Targeted wins outside the plan structure:
 
