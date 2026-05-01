@@ -427,6 +427,12 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             "--allow-multiple-definition" => args.allow_multiple_definitions = true,
             "--no-allow-multiple-definition" => args.allow_multiple_definitions = false,
+            // `--noinhibit-exec`: lld convention for "let the link
+            // succeed even with errors, downgrade fatal duplicate-
+            // symbol errors to warnings". Wild treats this as an
+            // alias for --allow-multiple-definition for now; the
+            // symbol_db doesn't emit per-input warnings yet.
+            "--noinhibit-exec" => args.allow_multiple_definitions = true,
 
             // --- Exports (spec §9.2: export for each defined symbol with
             //     non-local linkage and non-hidden visibility) ---
@@ -601,7 +607,22 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                         args.stub_unresolved_functions = true;
                     }
                     "report-all" => {} // default
-                    "import-dynamic" => {} // not yet implemented
+                    "import-dynamic" => {
+                        // Treat unresolved symbols as imports — same
+                        // behaviour as `ignore-all` for now (allow-
+                        // undefined + stub-unresolved-functions),
+                        // since wild's writer already routes any
+                        // surviving undef into an env.<name> import
+                        // under shared/PIE / Bdynamic. lld emits a
+                        // diagnostic warning that the feature is
+                        // experimental (`unresolved-symbols-dynamic.s`
+                        // checks for this exact string).
+                        args.allow_undefined = true;
+                        args.stub_unresolved_functions = true;
+                        eprintln!(
+                            "wasm-ld: warning: dynamic imports are not yet stable (--unresolved-symbols=import-dynamic)"
+                        );
+                    }
                     "ignore-in-shared-libs" => {}
                     "ignore-in-object-files" => {}
                     _ => {}
