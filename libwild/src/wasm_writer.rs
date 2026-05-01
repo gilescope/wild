@@ -4303,6 +4303,25 @@ fn synth_command_export_wrapper(merged: &mut MergedModule) {
         // Don't double-wrap `__wasm_call_ctors` itself.
         return;
     }
+    // If __wasm_call_ctors is empty (no init funcs survived the
+    // prune pass), skip the wrapper — there's nothing for it to do
+    // and the wrapper would just keep an empty ctors body alive.
+    // `ctor-gc.test` exercises this: archive resolution pulls in
+    // `ctor.o` because of `unused_lib_func`'s reference to `def`,
+    // but the prune pass drops the resulting `test_ctor` init,
+    // leaving an empty body.
+    let ctors_local = ctors_idx.checked_sub(merged.num_imported_functions);
+    if let Some(local) = ctors_local
+        && let Some(func) = merged.functions.get(local as usize)
+    {
+        let mut has_calls = false;
+        let _ = walk_funcidx_operands(&func.body, |_, _| {
+            has_calls = true;
+        });
+        if !has_calls {
+            return;
+        }
+    }
     let entry_name: Vec<u8> = match merged
         .function_name_map
         .iter()
