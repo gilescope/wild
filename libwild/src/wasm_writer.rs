@@ -10107,6 +10107,16 @@ fn merge_inputs(
                 }
             }
             if let Some(&idx) = custom_section_index.get(&cs.name) {
+                // `__llvm_covfun` chunks are 8-byte aligned per
+                // wasm-ld convention (LLVM coverage records embed
+                // 64-bit fields). Pad with zeros to the alignment
+                // boundary before appending. Other custom sections
+                // concatenate flat — wasm spec allows it.
+                if cs.name == b"__llvm_covfun" {
+                    let cur_len = merged_custom_sections[idx].data.len();
+                    let pad = (8 - (cur_len & 7)) & 7;
+                    merged_custom_sections[idx].data.resize(cur_len + pad, 0);
+                }
                 merged_custom_sections[idx].data.extend_from_slice(&patched);
             } else {
                 custom_section_index.insert(cs.name.clone(), merged_custom_sections.len());

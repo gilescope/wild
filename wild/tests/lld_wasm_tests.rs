@@ -307,6 +307,7 @@ const KNOWN_PASSING: &[&str] = &[
     // `__wrap_foo`); was previously caught by the broad `-wrap` /
     // `--wrap` content skip.
     "wrap_import",
+    "custom-section-align",
 ];
 
 /// Tests in lto/ subdirectory known to pass despite matching skip patterns.
