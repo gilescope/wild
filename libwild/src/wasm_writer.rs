@@ -499,7 +499,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     // from `env.memory` rather than defined locally. Substrate runtimes
     // rely on this — the host supplies the memory instance.
     let args = layout.symbol_db.args;
-    if !is_shared && !args.import_memory {
+    if !is_shared && !args.import_memory && !args.is_pic {
         // Page size: default 64 KiB (wasm spec); `--page-size=N`
         // (custom-page-sizes proposal) overrides. Page counts are
         // computed in those page-size units; the MEMORY limits flag
@@ -573,8 +573,10 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
     }
 
     // Global section (spec §9.1): linker-defined globals.
-    // In shared mode, skip defining globals (they're imported).
-    if !merged.globals.is_empty() && !is_shared {
+    // In shared / PIE mode, skip defining globals (they're imported
+    // from the dynamic linker via the env.{__memory_base,
+    // __stack_pointer, __table_base} triad).
+    if !merged.globals.is_empty() && !is_shared && !args.is_pic {
         let mut payload = Vec::new();
         write_leb128(&mut payload, merged.globals.len() as u32);
         for global in &merged.globals {
@@ -686,17 +688,26 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             } else {
                 true
             };
-            for (i, global) in merged.globals.iter().enumerate() {
-                let synth_mutable_blocked = global.mutable
-                    && !global.exported
-                    && global.name.starts_with(b"__")
-                    && mutable_export_gate_active
-                    && !synth_mutable_gate;
-                let do_export = global.exported || ((export_all || export_dynamic) && !synth_mutable_blocked);
-                if do_export {
-                    let global_idx = merged.num_imported_globals + i as u32;
-                    if !exports.iter().any(|(n, _, _)| *n == global.name) {
-                        exports.push((global.name.clone(), EXPORT_GLOBAL, global_idx));
+            // Under PIE / shared, defined globals aren't actually
+            // emitted (the GLOBAL section is skipped above) — base
+            // globals come in as imports from the dynamic linker.
+            // Skip exporting them here too; the exported indices
+            // would point at non-existent slots and obj2yaml would
+            // reject the module.
+            if !is_shared && !layout.symbol_db.args.is_pic {
+                for (i, global) in merged.globals.iter().enumerate() {
+                    let synth_mutable_blocked = global.mutable
+                        && !global.exported
+                        && global.name.starts_with(b"__")
+                        && mutable_export_gate_active
+                        && !synth_mutable_gate;
+                    let do_export = global.exported
+                        || ((export_all || export_dynamic) && !synth_mutable_blocked);
+                    if do_export {
+                        let global_idx = merged.num_imported_globals + i as u32;
+                        if !exports.iter().any(|(n, _, _)| *n == global.name) {
+                            exports.push((global.name.clone(), EXPORT_GLOBAL, global_idx));
+                        }
                     }
                 }
             }
@@ -1287,7 +1298,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 global_name_entries.push((i as u32, name.as_slice()));
             }
         }
-        if !is_shared {
+        if !is_shared && !layout.symbol_db.args.is_pic {
             for (i, g) in merged.globals.iter().enumerate() {
                 let abs_idx = merged.num_imported_globals + i as u32;
                 global_name_entries.push((abs_idx, g.name.as_slice()));
@@ -9953,6 +9964,90 @@ fn merge_inputs(
         wrap_redirect.insert(wrap_name.clone(), wrap_unified_idx);
     }
 
+    // --- Pass 4a.5: PIC-base imports go BEFORE input imports.
+    //
+    // lld emits the PIC base globals (`__memory_base`,
+    // `__table_base`, optionally `__stack_pointer`) plus
+    // `env.memory` and `env.__indirect_function_table` *before* the
+    // input's function/global imports under `-shared` and `-pie`.
+    // This pins the PIC bases at the lowest GLOBAL indices (so
+    // `weak-undefined-pic.s`'s `GlobalNames: [0=__memory_base,
+    // 1=__table_base, 2=foo]` chain matches), while still letting
+    // input-side `GOT.func.foo` immediately follow `env.foo` in
+    // the IMPORT section because both come from the per-object
+    // walk that runs after.
+    let is_pic_mode = layout.symbol_db.args.is_shared || layout.symbol_db.args.is_pic;
+    if is_pic_mode {
+        let any_input_uses_stack_pointer = if layout.symbol_db.args.is_shared {
+            true
+        } else {
+            objects.iter().any(|obj| {
+                obj.parsed
+                    .imports
+                    .iter()
+                    .any(|imp| imp.kind == 3 && imp.field == b"__stack_pointer")
+            })
+        };
+        output_imports.push(OutputImport {
+            module: b"env".to_vec(),
+            field: b"memory".to_vec(),
+            kind: ImportKind::Memory {
+                min: 1,
+                max: None,
+                shared: false,
+                memory64: layout.symbol_db.args.memory64,
+                page_size: layout.symbol_db.args.page_size,
+            },
+        });
+        let addr_vt_imp = if layout.symbol_db.args.memory64 {
+            VALTYPE_I64
+        } else {
+            VALTYPE_I32
+        };
+        let idx = num_imported_globals;
+        memory_base_global_idx = Some(idx);
+        output_imports.push(OutputImport {
+            module: b"env".to_vec(),
+            field: b"__memory_base".to_vec(),
+            kind: ImportKind::Global {
+                valtype: addr_vt_imp,
+                mutable: false,
+            },
+        });
+        import_global_name_map.push((b"__memory_base".to_vec(), idx));
+        num_imported_globals += 1;
+        if any_input_uses_stack_pointer {
+            let sp_idx = num_imported_globals;
+            output_imports.push(OutputImport {
+                module: b"env".to_vec(),
+                field: b"__stack_pointer".to_vec(),
+                kind: ImportKind::Global {
+                    valtype: addr_vt_imp,
+                    mutable: true,
+                },
+            });
+            import_global_name_map.push((b"__stack_pointer".to_vec(), sp_idx));
+            num_imported_globals += 1;
+        }
+        output_imports.push(OutputImport {
+            module: b"env".to_vec(),
+            field: b"__indirect_function_table".to_vec(),
+            kind: ImportKind::Table { min: 0 },
+        });
+        let tb_idx = num_imported_globals;
+        table_base_global_idx = Some(tb_idx);
+        output_imports.push(OutputImport {
+            module: b"env".to_vec(),
+            field: b"__table_base".to_vec(),
+            kind: ImportKind::Global {
+                valtype: VALTYPE_I32,
+                mutable: false,
+            },
+        });
+        import_global_name_map.push((b"__table_base".to_vec(), tb_idx));
+        num_imported_globals += 1;
+    }
+
     for obj_info in &objects {
         // Position of each kind=0 import within this object's imports
         // list — equals the input-side function index for that import,
@@ -10039,12 +10134,20 @@ fn merge_inputs(
                 }
                 3 => {
                     // Pass 1.75 internalises GOT.* imports whenever the
-                    // output is not shared — skip them here to avoid
-                    // duplicates. The base-global imports
+                    // output is not shared / PIE — skip them here to
+                    // avoid duplicates. The base-global imports
                     // (`__memory_base` / `__table_base` / `__tls_base`)
                     // are only internalised under static-PIC, so gate
-                    // those separately.
+                    // those separately. Under `-shared` and `-pie`,
+                    // GOT.* imports stay through to the dynamic linker
+                    // — let the per-object walk emit them in input
+                    // order so they appear right after their target's
+                    // function/data import (matches lld's IMPORT
+                    // layout, which `weak-undefined-pic.s` checks via
+                    // `IMPORT-NEXT: - Module: GOT.func` immediately
+                    // after the env.foo import).
                     if !layout.symbol_db.args.is_shared
+                        && !layout.symbol_db.args.is_pic
                         && (imp.module == b"GOT.func"
                             || imp.module == b"GOT.mem"
                             || imp.module == b"GOT.data")
@@ -10072,8 +10175,17 @@ fn merge_inputs(
                     // (kind=2) carry the local name (e.g. `g1`) while
                     // the import field carries the wasm import name
                     // (e.g. `g`).
+                    //
+                    // PIC GOT imports (`GOT.func.<sym>` /
+                    // `GOT.mem.<sym>`) typically have NO matching
+                    // kind=2 symbol — llvm-mc emits the import on the
+                    // strength of a `@GOT` reloc alone. lld names the
+                    // resulting global by the import's field (which
+                    // *is* the underlying symbol name). Fall back to
+                    // that here so `weak-undefined-pic.s`'s
+                    // `GlobalNames: [..., 2=foo]` entry surfaces.
                     let import_wasm_idx = num_imported_globals;
-                    if let Some(name) = obj_info
+                    let sym_name = obj_info
                         .parsed
                         .symbols
                         .iter()
@@ -10083,9 +10195,15 @@ fn merge_inputs(
                                 && s.index == input_global_imp_idx
                                 && !s.name.is_empty()
                         })
-                        .map(|s| s.name.clone())
-                    {
+                        .map(|s| s.name.clone());
+                    if let Some(name) = sym_name {
                         import_global_name_map.push((name, import_wasm_idx));
+                    } else if (imp.module == b"GOT.func"
+                        || imp.module == b"GOT.mem"
+                        || imp.module == b"GOT.data")
+                        && !imp.field.is_empty()
+                    {
+                        import_global_name_map.push((imp.field.clone(), import_wasm_idx));
                     }
                     num_imported_globals += 1;
                     input_global_imp_idx += 1;
@@ -10138,69 +10256,16 @@ fn merge_inputs(
         });
     }
 
-    // Shared/PIC mode: import __memory_base and __stack_pointer.
-    // (Declarations are hoisted near Pass 1.72 so the static-PIC synthesis
-    // can populate them too.)
+    // Under `-shared`: pass through GOT imports (`GOT.func.*` /
+    // `GOT.mem.*`) emitted by every input. These are mutable i32
+    // globals filled by the runtime. Under `-pie`, the per-object
+    // loop above already emitted these in input order — skip the
+    // redundant pass here so the import section keeps the same
+    // ordering as lld's PIE output (`GOT.func.foo` right after
+    // `env.foo`). The PIC-base globals (`memory`, `__memory_base`,
+    // `__indirect_function_table`, `__table_base`) were emitted in
+    // Pass 4a.5 above so they sit before any input-side imports.
     if layout.symbol_db.args.is_shared {
-        // Import memory.
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"memory".to_vec(),
-            kind: ImportKind::Memory {
-                min: 1,
-                max: None,
-                shared: false,
-                memory64: layout.symbol_db.args.memory64,
-                page_size: layout.symbol_db.args.page_size,
-            },
-        });
-        let addr_vt_imp = if layout.symbol_db.args.memory64 {
-            VALTYPE_I64
-        } else {
-            VALTYPE_I32
-        };
-        // Import __memory_base (immutable, i32 or i64 under memory64).
-        let idx = num_imported_globals;
-        memory_base_global_idx = Some(idx);
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"__memory_base".to_vec(),
-            kind: ImportKind::Global {
-                valtype: addr_vt_imp,
-                mutable: false,
-            },
-        });
-        num_imported_globals += 1;
-        // Import __stack_pointer (mutable, i32 or i64 under memory64).
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"__stack_pointer".to_vec(),
-            kind: ImportKind::Global {
-                valtype: addr_vt_imp,
-                mutable: true,
-            },
-        });
-        num_imported_globals += 1;
-        // Import __indirect_function_table.
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"__indirect_function_table".to_vec(),
-            kind: ImportKind::Table { min: 0 },
-        });
-        // Import __table_base (immutable i32).
-        table_base_global_idx = Some(num_imported_globals);
-        output_imports.push(OutputImport {
-            module: b"env".to_vec(),
-            field: b"__table_base".to_vec(),
-            kind: ImportKind::Global {
-                valtype: VALTYPE_I32,
-                mutable: false,
-            },
-        });
-        num_imported_globals += 1;
-
-        // Pass through GOT imports (GOT.func.* and GOT.mem.*).
-        // These are mutable i32 globals filled by the runtime.
         let mut seen_got: std::collections::HashSet<(Vec<u8>, Vec<u8>)> = Default::default();
         for obj_info in &objects {
             for imp in &obj_info.parsed.imports {

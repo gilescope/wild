@@ -87,17 +87,31 @@ and risk. Phases run independently and can ship as separate commits.
   need similar two-pass semantics, OR a narrower fix: prune
   `all_init_funcs` whose source object has no other live symbols
   before building the `__wasm_call_ctors` body.
-- ⏸ **Phase 3b — PIE PIC-base imports**: probed. The minimal three-
-  line change (extend `is_shared` to `is_pic`) is necessary but not
-  sufficient — `weak-undefined-pic.s` PIE arm requires the GOT
-  pass-through to fire in input-order (per-object loop, not the PIC
-  block) AND lld's GlobalNames omits `__stack_pointer` based on
-  whether inputs reference it. The plan's "~60 LOC" is wildly
-  optimistic. Reverted.
+- ✅ **Phase 3b — PIE PIC-base imports**: shipped. Three pieces
+  landed together:
+  1. New Pass 4a.5 emits PIC-base imports (`env.memory`,
+     `env.__memory_base`, `env.__indirect_function_table`,
+     `env.__table_base`, plus optional `env.__stack_pointer`)
+     *before* the per-object input-import loop, matching lld's PIE
+     section ordering (`weak-undefined-pic.s`'s
+     `IMPORT-NEXT: env.foo → IMPORT-NEXT: GOT.func.foo` chain only
+     matches when those bases sit at the lowest GLOBAL indices).
+  2. `__stack_pointer` import is gated on whether any input
+     actually references it under `-pie` (`-shared` always emits
+     it).
+  3. GlobalNames subsection now records the four PIC bases and
+     falls back to using a PIC import's `field` (e.g. `foo` for
+     `GOT.func.foo`) when the input has no matching kind=2
+     symbol — llvm-mc emits these GOT imports on a `@GOT` reloc
+     alone, with no kind=2 row to attach a name to.
 
-Net: +6 tests across sessions (122→128). Phase 1 essentially complete
-(within reach of what the plan promised). Phases 2/3/4 are each a
-multi-iteration commitment.
+  Unlocks `weak-undefined-pic.s`. Other PIE/`-shared` fixtures
+  (`pie.s`, `shared.s`, `shared-needed.s`, `shared-weak-symbols.s`,
+  `static-error.s`) still fail on `dylink.0` custom-section content
+  and `.so`/dynamic-needed handling — that's Phase 4b territory.
+
+Net: +7 tests across sessions (122→133). Phase 1 essentially complete,
+Phase 3b complete. Phases 2 and 4 are each a multi-iteration commitment.
 
 Targeted wins outside the plan structure:
 
