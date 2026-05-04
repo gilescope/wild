@@ -4210,6 +4210,19 @@ struct MergedModule {
     /// not in the map (linker-synth bases, layout globals, etc.)
     /// fall back to `(0, 0)` and sort ahead of input-derived globals.
     global_export_pos: std::collections::HashMap<u32, (u32, u32)>,
+    /// Per-function-name `(cmdline_rank, sym_pos)` of the input that
+    /// defined the symbol. Populated by the parse pass — both for the
+    /// canonical name and for aliases (`.set foo, bar` puts both
+    /// names here, each with the position the symbol-table entry sat
+    /// at in its source). Reserved as scaffolding for the full Phase
+    /// 4a refactor (`weak-symbols.s`, `weak-alias.s`,
+    /// `signature-mismatch.s` -r arm). Not yet consulted by the
+    /// EXPORT sort because keying by name alone breaks tests where
+    /// synth functions like `__wasm_call_ctors` collide with input-
+    /// defined exports at `(0, 0)` — a principled merged-function
+    /// metadata table with synth tracking is the proper fix.
+    #[allow(dead_code)]
+    function_export_pos: std::collections::HashMap<Vec<u8>, (u32, u32)>,
     /// Function indices that are explicitly exported via --export/--export-if-defined.
     explicit_export_indices: Vec<u32>,
     /// Function names with VISIBILITY_HIDDEN (flag 0x04) — excluded from --export-dynamic.
@@ -6837,6 +6850,13 @@ fn merge_inputs(
         sorted_indices.sort_by_key(|&i| cmdline_objects[i].input.entry.is_some());
     }
     let mut function_cmdline_rank: Vec<u32> = Vec::new();
+    // (cmdline_rank, sym_pos) per export name. Populated below as we
+    // walk each input's linking-section symbol table; consulted by
+    // the `--lld-compat` EXPORT-section sort. Aliases (`.set foo, bar`)
+    // get their own entries — each name keys to the alias's own
+    // position, which is what lld emits with.
+    let mut function_export_pos: std::collections::HashMap<Vec<u8>, (u32, u32)> =
+        Default::default();
     for &__cmdline_idx in &sorted_indices {
         let obj = cmdline_objects[__cmdline_idx];
         let __obj_cmdline_rank = __cmdline_idx as u32;
@@ -7000,6 +7020,18 @@ fn merge_inputs(
                 }
                 if let Some(name) = parsed.function_names.get(&(i as u32)) {
                     let output_idx = func_base + i as u32;
+                    // Find the symbol-table position of this function's
+                    // defining symbol — used as the secondary export-
+                    // sort key under `--lld-compat`. Walks the same
+                    // symbol-table iteration the flag check below
+                    // does, so cost is amortised.
+                    let sym_pos = parsed
+                        .symbols
+                        .iter()
+                        .position(|sym| {
+                            sym.kind == 0 && !sym.name.is_empty() && sym.name == *name
+                        })
+                        .map(|p| p as u32);
                     // Check symbol flags for this function.
                     let sym_flags = parsed
                         .symbols
@@ -7020,6 +7052,10 @@ fn merge_inputs(
                     if should_insert {
                         function_name_map.insert(name.clone(), output_idx);
                         function_is_weak.insert(name.clone(), is_weak);
+                        if let Some(sp) = sym_pos {
+                            function_export_pos
+                                .insert(name.clone(), (__obj_cmdline_rank, sp));
+                        }
                         if is_hidden {
                             function_is_hidden.insert(name.clone());
                         } else {
@@ -7051,7 +7087,7 @@ fn merge_inputs(
             // function whose canonical name is already in
             // `function_name_map` should also be reachable under the
             // alias name (covers `.set <alias>, <target>`).
-            for sym in &parsed.symbols {
+            for (sym_pos, sym) in parsed.symbols.iter().enumerate() {
                 if sym.kind == 0
                     && (sym.flags & 0x10) == 0
                     && sym.index >= parsed.num_function_imports
@@ -7065,6 +7101,14 @@ fn merge_inputs(
                     }
                     if !sym.name.is_empty() && !function_name_map.contains_key(&sym.name) {
                         function_name_map.insert(sym.name.clone(), output_idx);
+                        // Alias gets its OWN sym_pos in the source's
+                        // symbol table — `.set start_alias, _start`
+                        // makes `start_alias` appear at a different
+                        // sym_pos than `_start`, and lld emits each
+                        // export at its own per-input position.
+                        function_export_pos
+                            .entry(sym.name.clone())
+                            .or_insert((__obj_cmdline_rank, sym_pos as u32));
                         // Aliases carry their own weak/hidden flags from
                         // the symbol-table entry — `BINDING_WEAK` (0x01)
                         // here marks an alias like `alias_fn = direct_fn`
@@ -8507,6 +8551,9 @@ fn merge_inputs(
         // any input-defined function under the cmdline-rank export
         // sort (lld puts it right after `memory` in the EXPORT list).
         function_cmdline_rank.insert(0, 0);
+        // And the same (0, 0) for the per-name export-pos map so the
+        // ctor stub sorts first when EXPORTs are walked by name.
+        function_export_pos.insert(b"__wasm_call_ctors".to_vec(), (0, 0));
     }
 
     // --- Pass 1.85: identify weak-undefined function symbols ---
@@ -11159,6 +11206,7 @@ fn merge_inputs(
         function_name_map,
         function_cmdline_rank,
         global_export_pos,
+        function_export_pos,
         explicit_export_indices,
         hidden_functions: function_is_hidden,
         local_functions: function_is_local,
