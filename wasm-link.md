@@ -14,6 +14,55 @@ Current state (after Phase 1 + Phase 3a + targeted wins):
 The remaining ignored tests sort into roughly 5 buckets by effort
 and risk. Phases run independently and can ship as separate commits.
 
+## Status (2026-05-04 — Phase 4a investigation)
+
+- 🟡 **Phase 4a metadata-table scaffolding** (commit `5082397`):
+  added `MergedModule.function_export_pos: HashMap<name, (cmdline_rank,
+  sym_pos)>`, populated during the parse pass for both canonical
+  function names and aliases. Reserved `#[allow(dead_code)]` because
+  wiring it into the EXPORT sort regressed two tests. Two findings
+  worth recording for the follow-up:
+
+  1. **Synth function collision at `(0, 0)`.** `__wasm_call_ctors`
+     gets registered at `(rank=0, sym_pos=0)`; main-object `_start`
+     gets `(rank=0, sym_pos=0)` too (it's typically the first sym).
+     The kind tiebreak then orders FUNC before GLOBAL, pushing
+     `_start` ahead of `__stack_pointer` (GLOBAL idx 0 → fallback
+     `(0, 0)`). lld's actual order is `__wasm_call_ctors` →
+     `__stack_pointer` → `_start` — there's some lld-internal
+     synthesis-order key for synth FUNC vs synth GLOBAL that
+     doesn't surface as a (rank, pos) tuple. mutable-global-exports.s
+     pinned this regression.
+
+  2. **Alias precedence at same output idx.** weak-alias.s's
+     aux input has `direct_fn` at sym_pos 0 and BINDING_WEAK alias
+     `alias_fn` at sym_pos 2 (both → output FUNC 1). With (rank,
+     sym_pos) keying, `direct_fn` sorts before `alias_fn`. lld
+     emits `alias_fn` first — possibly alphabetical name tiebreak,
+     possibly an alias-first rule. sym_pos alone isn't the key.
+
+  The right next step is a merged-function metadata table indexed
+  by output func idx with explicit synth-source tagging, plus an
+  alias relation, plus a per-emit-pass walker that interleaves
+  FUNC/GLOBAL exports by lld's actual order rather than trying to
+  compress everything into one sort key. Bigger than a single
+  session.
+
+- 🟡 **BINDING_LOCAL multi-def for `init-fini.ll`**: investigated.
+  The bug: in `symbol_to_output_func`, `function_name_map.get(name)`
+  resolves cross-input even for BINDING_LOCAL symbols, collapsing
+  the second input's local `.Lcall_dtors.101` (output idx 17) onto
+  the first input's (idx 9). Tried gating the lookup on `!is_local`
+  to use `local_output_idx` instead — broke `init-fini-no-gc.ll` /
+  `command-exports.s` because `local_output_idx` is the
+  pre-synth-shift index, while `function_name_map` values get
+  shifted +1 on `__wasm_call_ctors` insertion. The fix needs to
+  apply the same shift to local indices (or skip name registration
+  for BINDING_LOCAL entirely so the lookup returns
+  `local_output_idx` AS-IF post-shift). Left as follow-up — the
+  shift bookkeeping is intricate enough that I'd want a small
+  unit test before committing.
+
 ## Status (2026-04-30 post-session)
 
 - ✅ **Phase 1a — sig-mismatch trap stubs in exec mode**: shipped.
