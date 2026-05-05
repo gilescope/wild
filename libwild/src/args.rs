@@ -91,6 +91,17 @@ pub struct CommonArgs {
     /// or one of the legacy `WILD_INCREMENTAL_*` env vars.
     pub(crate) incremental_cache: IncrementalCacheMode,
 
+    /// When `Some`, after each link wild writes a text file describing
+    /// every byte range that differs between the previous output (from
+    /// the layout-snapshot's mmap) and the freshly-written output. Empty
+    /// file (with header only) on a cold link or when the outputs are
+    /// byte-identical. Designed as input to a debugger-driven AOT
+    /// edit-and-continue patcher (BugStalker on Linux; equivalent on
+    /// macOS): take each entry, ptrace-write the bytes into the running
+    /// process at the same file offset relative to its `__TEXT` base.
+    /// File format: see `emit_patch_file` in `lib.rs`.
+    pub(crate) emit_patch: Option<std::path::PathBuf>,
+
     /// Warnings that we encountered either during argument parsing, or during subsequent linker
     /// execution based on those arguments.
     #[debug(skip)]
@@ -297,6 +308,7 @@ impl Default for CommonArgs {
             sym_info: None,
             time_phase_options: None,
             incremental_cache: IncrementalCacheMode::default(),
+            emit_patch: None,
             warning_callback: Box::new(default_warning_callback),
             version: std::borrow::Cow::Borrowed("unknown version"),
         }

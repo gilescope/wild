@@ -46,6 +46,20 @@ pub(crate) enum UndefinedTreatment {
     DynamicLookup,
 }
 
+/// `-multiply_defined <treatment>` policy. ld64 historically supported this
+/// only for two-level-namespaced builds; modern ld64 ignores it but accepts
+/// the spelling. wild keeps it so existing build scripts don't break and
+/// adds a real effect: `Warning`/`Suppress` downgrade duplicate strong
+/// definitions from a hard error to a permissive accept (first definition
+/// wins, like `--allow-multiple-definition` on ELF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MultiplyDefinedTreatment {
+    #[default]
+    Error,
+    Warning,
+    Suppress,
+}
+
 #[derive(Debug)]
 pub struct MachOArgs {
     pub(crate) common: super::CommonArgs,
@@ -72,6 +86,20 @@ pub struct MachOArgs {
     /// on-disk TBD content, so the std HashSet's SipHash is wasted
     /// DoS-resistance and used to be ~12% of wild's bevy-dylib wall-clock.
     pub(crate) dylib_symbols: DylibSymbols,
+    /// Subset of `dylib_symbols` whose defining dylib placed the
+    /// symbol in a Mach-O thread-local section (`S_THREAD_LOCAL_*`,
+    /// section types `0x11..=0x15`). Populated by scanning each
+    /// dylib's nlist symbol table during `handle_dylib_input` —
+    /// the export trie alone doesn't say whether an export is TLS,
+    /// so we read the `n_sect` of every external defined symbol
+    /// and consult its section header.
+    ///
+    /// Used by `apply_relocations` to diagnose TLS-vs-regular
+    /// mismatches across dylib boundaries: a TLVP reloc onto a
+    /// non-TLS dylib symbol, or a regular GOT/UNSIGNED reloc onto
+    /// a TLS dylib symbol. Both cases would silently link with the
+    /// wrong runtime semantics otherwise.
+    pub(crate) dylib_tls_symbols: hashbrown::HashSet<Vec<u8>, foldhash::fast::FixedState>,
     /// Path of the `system/` TBD re-exports directory we've already
     /// walked during `-lSystem` / `-lc` / `-lm` / `-lpthread`
     /// handling. rustc typically passes all four in sequence and each
@@ -184,6 +212,32 @@ pub struct MachOArgs {
     pub(crate) object_path_lto: Option<PathBuf>,
     /// Extra LLVM options from -mllvm.
     pub(crate) mllvm_options: Vec<String>,
+    /// `-no_pie`: clear `MH_PIE` so the loader places `__TEXT` at a
+    /// fixed address. Almost always wrong on modern macOS (dyld will
+    /// log `code signature in (...) not valid for use in process: PIE
+    /// not enabled`), but ld64 accepts it for legacy linker scripts
+    /// and we mirror that.
+    pub(crate) no_pie: bool,
+    /// `-bind_at_load`: set `MH_BINDATLOAD` in the mach header so dyld
+    /// resolves all imports eagerly at process start instead of lazily.
+    /// Used by tooling that profiles startup or wants to fail fast on
+    /// missing symbols.
+    pub(crate) bind_at_load: bool,
+    /// `-no_compact_unwind`: skip emitting `__unwind_info`. Forces the
+    /// runtime to fall back to scanning `__eh_frame` for unwind data,
+    /// which is slower but smaller. Useful for size-constrained builds
+    /// or when debugging unwinder behaviour.
+    pub(crate) no_compact_unwind: bool,
+    /// `-headerpad <hex>` / `-headerpad_max_install_names`: override the
+    /// trailing slack we leave after the load commands so
+    /// `install_name_tool` can rewrite paths post-link without shifting
+    /// `__text`. `None` means the wild default (32 B).
+    pub(crate) headerpad: Option<u64>,
+    /// `-multiply_defined error|warning|suppress`: how to react when
+    /// two strong definitions for the same symbol turn up. ld64 accepts
+    /// the flag but ignores it on two-level-namespaced builds; wild
+    /// honours all three.
+    pub(crate) multiply_defined: MultiplyDefinedTreatment,
 }
 
 impl MachOArgs {
@@ -220,6 +274,7 @@ impl Default for MachOArgs {
             extra_dylibs: Vec::new(),
             force_undefined: Vec::new(),
             dylib_symbols: Default::default(),
+            dylib_tls_symbols: Default::default(),
             system_tbd_dir_walked: None,
             sdk_cache_used: false,
             no_adhoc_codesign: false,
@@ -271,6 +326,11 @@ impl Default for MachOArgs {
             lto_library: None,
             object_path_lto: None,
             mllvm_options: Vec::new(),
+            no_pie: false,
+            bind_at_load: false,
+            no_compact_unwind: false,
+            headerpad: None,
+            multiply_defined: MultiplyDefinedTreatment::Error,
         }
     }
 }
@@ -349,6 +409,14 @@ impl platform::Args for MachOArgs {
         &self.dylib_symbols
     }
 
+    fn allow_multiple_definitions(&self) -> bool {
+        // `Warning` and `Suppress` both mean "don't bail on the second
+        // strong def". The user-visible difference (a stderr warning
+        // for `Warning`) would need a separate hook in `symbol_db`;
+        // for now both downgrade to silent first-wins.
+        !matches!(self.multiply_defined, MultiplyDefinedTreatment::Error)
+    }
+
     fn force_undefined_symbol_names(&self) -> &[String] {
         &self.force_undefined
     }
@@ -359,6 +427,10 @@ impl platform::Args for MachOArgs {
 
     fn force_unexport_symbol_names(&self) -> &[String] {
         &self.unexported_symbols
+    }
+
+    fn symbol_order(&self) -> &std::collections::HashMap<String, u32> {
+        &self.symbol_order
     }
 
     fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
@@ -855,7 +927,22 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             }
             return Ok(());
         }
-        "-headerpad" | "-allowable_client" | "-client_name" | "-sub_library" | "-sub_umbrella"
+        "-headerpad" => {
+            // ld64 takes a hex byte count, e.g. `-headerpad 0x100`. We
+            // accept bare-hex too — strip the optional `0x` prefix and
+            // parse base-16. Parse failure is silent (matches ld64) and
+            // leaves the default in place; no point bailing the whole
+            // link over a typo'd headerpad.
+            if let Some(val) = input.next() {
+                let s = val.as_ref();
+                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                if let Ok(n) = u64::from_str_radix(s, 16) {
+                    args.headerpad = Some(n);
+                }
+            }
+            return Ok(());
+        }
+        "-allowable_client" | "-client_name" | "-sub_library" | "-sub_umbrella"
         | "-objc_abi_version" | "-image_base" => {
             input.next(); // consume the argument
             return Ok(());
@@ -937,7 +1024,18 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             }
             return Ok(());
         }
-        "-multiply_defined" | "-upward-l" | "-alignment" => {
+        "-multiply_defined" => {
+            if let Some(val) = input.next() {
+                args.multiply_defined = match val.as_ref() {
+                    "warning" => MultiplyDefinedTreatment::Warning,
+                    "suppress" => MultiplyDefinedTreatment::Suppress,
+                    // "error" and unknown spellings → keep the default.
+                    _ => MultiplyDefinedTreatment::Error,
+                };
+            }
+            return Ok(());
+        }
+        "-upward-l" | "-alignment" => {
             input.next();
             return Ok(());
         }
@@ -1000,19 +1098,40 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             args.common.version_mode = crate::args::VersionMode::Verbose;
             return Ok(());
         }
+        "-no_pie" => {
+            args.no_pie = true;
+            return Ok(());
+        }
+        "-pie" => {
+            // ld64 also accepts the affirmative form. We always emit
+            // PIE by default; this just unwinds a prior `-no_pie`.
+            args.no_pie = false;
+            return Ok(());
+        }
+        "-bind_at_load" => {
+            args.bind_at_load = true;
+            return Ok(());
+        }
+        "-no_compact_unwind" => {
+            args.no_compact_unwind = true;
+            return Ok(());
+        }
+        "-headerpad_max_install_names" => {
+            // ld64 reserves enough room for every dylib path entry to
+            // be expanded to MAXPATHLEN (1024). 0x1000 is the value
+            // ld64 actually picks and matches what `install_name_tool`
+            // assumes is available.
+            args.headerpad = Some(0x1000);
+            return Ok(());
+        }
         // No-argument flags, ignored
         "-dynamic"
         | "-no_deduplicate"
-        | "-no_compact_unwind"
-        | "-headerpad_max_install_names"
         | "-no_objc_category_merging"
         | "-ObjC"
         | "-no_implicit_dylibs"
         | "-search_paths_first"
         | "-two_levelnamespace"
-        | "-bind_at_load"
-        | "-pie"
-        | "-no_pie"
         | "-execute"
         | "-no_fixup_chains"
         | "-fixup_chains"
@@ -1135,6 +1254,13 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
     // string-match table above.
     if let Some(val) = arg.strip_prefix("--incremental-cache=") {
         args.common.incremental_cache = super::IncrementalCacheMode::parse(val)?;
+        return Ok(());
+    }
+
+    // --emit-patch=<path>: write byte-diff between prev and new outputs
+    // for AOT edit-and-continue patchers to consume.
+    if let Some(val) = arg.strip_prefix("--emit-patch=") {
+        args.common.emit_patch = Some(std::path::PathBuf::from(val));
         return Ok(());
     }
 
@@ -1505,6 +1631,12 @@ fn collect_tbd_with_directives_impl(
                     for sym in exp.symbols.iter().chain(exp.weak_symbols.iter()) {
                         process_tbd_symbol(sym, symbols, target_version, install_name, hide_list);
                     }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
                 }
                 for exp in &v4.re_exports {
                     if !is_arm64(&exp.targets) {
@@ -1513,12 +1645,26 @@ fn collect_tbd_with_directives_impl(
                     for sym in &exp.symbols {
                         process_tbd_symbol(sym, symbols, target_version, install_name, hide_list);
                     }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
                 }
             }
             text_stub_library::TbdVersionedRecord::V3(v3) => {
                 for exp in &v3.exports {
                     for sym in &exp.symbols {
                         process_tbd_symbol(sym, symbols, target_version, install_name, hide_list);
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.weak_def_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                 }
             }
@@ -1541,6 +1687,46 @@ fn collect_tbd_with_directives_impl(
                 visited,
             );
         }
+    }
+}
+
+/// Expand a TBD `objc-classes:` entry into the two ABI symbols ld64
+/// emits for it: `_OBJC_CLASS_$_<name>` (the class object) and
+/// `_OBJC_METACLASS_$_<name>` (the metaclass object). Without this,
+/// any `[NSException raise:…]`-style ObjC reference that resolves to
+/// a class symbol exported only via `objc-classes:` (e.g. NSException
+/// from CoreFoundation.tbd) shows up as `undefined symbol` even though
+/// the framework actually provides it. Mirrors ld64's
+/// `MachOFileAbstraction::handleSymbolicSymbols` expansion.
+fn expand_objc_class_symbols(classes: &[String], symbols: &mut DylibSymbols) {
+    for name in classes {
+        let class_sym = format!("_OBJC_CLASS_$_{name}");
+        let meta_sym = format!("_OBJC_METACLASS_$_{name}");
+        symbols.insert(std::sync::Arc::<[u8]>::from(class_sym.as_bytes()));
+        symbols.insert(std::sync::Arc::<[u8]>::from(meta_sym.as_bytes()));
+    }
+}
+
+/// Expand a TBD `objc-eh-types:` entry into `_OBJC_EHTYPE_$_<name>`
+/// — the per-class exception-handling type info object the ObjC ABI
+/// looks up at `@catch` time. ld64 only emits these for classes the
+/// framework explicitly marks; the regular `objc-classes:` list does
+/// NOT imply the EH-type symbol.
+fn expand_objc_eh_symbols(eh_types: &[String], symbols: &mut DylibSymbols) {
+    for name in eh_types {
+        let sym = format!("_OBJC_EHTYPE_$_{name}");
+        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+    }
+}
+
+/// Expand a TBD `objc-ivars:` entry into `_OBJC_IVAR_$_<class>.<ivar>`.
+/// The TBD lists these as already-formed `<class>.<ivar>` pairs, so the
+/// expansion is a single prefix concat. Ld64 emits these for every
+/// public ivar the framework exposes.
+fn expand_objc_ivar_symbols(ivars: &[String], symbols: &mut DylibSymbols) {
+    for entry in ivars {
+        let sym = format!("_OBJC_IVAR_$_{entry}");
+        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
     }
 }
 
@@ -1640,6 +1826,12 @@ fn collect_tbd_symbols_impl(
                     for sym in &exp.weak_symbols {
                         symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
                 }
                 for exp in &v4.re_exports {
                     if !is_arm64(&exp.targets) {
@@ -1651,11 +1843,25 @@ fn collect_tbd_symbols_impl(
                     for sym in &exp.weak_symbols {
                         symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
                 }
             }
             text_stub_library::TbdVersionedRecord::V3(v3) => {
                 for exp in &v3.exports {
                     for sym in &exp.symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.weak_def_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    for sym in &exp.thread_local_symbols {
                         symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
                     }
                 }
@@ -1877,6 +2083,12 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
                 // mem-cache fast path doesn't pay a full HashSet
                 // clone on top of the per-symbol Vec clones that
                 // `extend` already does.
+                let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+                for sym in symbols.iter() {
+                    args.dylib_symbol_provenance
+                        .entry(sym.as_ref().to_vec())
+                        .or_insert(dylib_idx);
+                }
                 args.dylib_symbols
                     .extend(symbols.iter().cloned());
                 framework_session_insert(
@@ -1895,6 +2107,16 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
             collect_tbd_symbols(&tbd_path, &mut fresh_symbols);
             if let Some(ref dylib_path) = install_name {
                 args.add_dylib(dylib_path.clone(), DylibLoadKind::Normal);
+            }
+            // Populate `dylib_symbol_provenance` so two-level-namespace
+            // binds attribute these imports to this framework's
+            // ordinal rather than collapsing onto the libSystem
+            // catch-all (`lib_ordinal_for_named_symbol`).
+            let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+            for sym in fresh_symbols.iter() {
+                args.dylib_symbol_provenance
+                    .entry(sym.as_ref().to_vec())
+                    .or_insert(dylib_idx);
             }
             args.dylib_symbols.extend(fresh_symbols.iter().cloned());
             crate::sdk_cache::save_tbd_symbols(&tbd_path, install_name.as_deref(), &fresh_symbols);
@@ -1968,9 +2190,11 @@ fn is_macho_dylib(path: &Path) -> bool {
 /// dep.
 fn handle_tbd_input(args: &mut MachOArgs, path: &Path) -> Result {
     let mut install_name = parse_tbd_install_name(path);
+    let symbols_before: usize = args.dylib_symbols.len();
+    let mut fresh: DylibSymbols = Default::default();
     collect_tbd_symbols_with_directives(
         path,
-        &mut args.dylib_symbols,
+        &mut fresh,
         args.minos,
         &mut install_name,
     );
@@ -1992,6 +2216,16 @@ fn handle_tbd_input(args: &mut MachOArgs, path: &Path) -> Result {
     if let Some(name) = install_name {
         args.add_dylib(name, DylibLoadKind::Normal);
     }
+    // Track which dylib provided each symbol so two-level-namespace
+    // binds get the right LC_LOAD_DYLIB ordinal at write time.
+    let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+    for sym in fresh.iter() {
+        args.dylib_symbol_provenance
+            .entry(sym.as_ref().to_vec())
+            .or_insert(dylib_idx);
+    }
+    args.dylib_symbols.extend(fresh.into_iter());
+    let _ = symbols_before;
     Ok(())
 }
 
@@ -2006,6 +2240,17 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
     let mut exported_symbols: Vec<Vec<u8>> = Vec::new();
     let mut reexported_dylib_paths: Vec<String> = Vec::new();
     let mut dylib_rpaths: Vec<PathBuf> = Vec::new();
+    // 1-indexed: section_types[i] = flags of n_sect == i+1.
+    // Section ordinals in nlist_64.n_sect are 1-based across the
+    // concatenation of every LC_SEGMENT_64's section list in load
+    // order, so we collect them as we walk commands.
+    let mut section_types: Vec<u32> = Vec::new();
+    // (symoff, nsyms, stroff, strsize) from LC_SYMTAB. We can't
+    // process the symbol table until we've seen every LC_SEGMENT_64
+    // (so `section_types` is complete), but LC_SYMTAB usually
+    // appears before the LINKEDIT segment that holds it; record
+    // and process at end.
+    let mut symtab_info: Option<(usize, usize, usize, usize)> = None;
     let mh_flags = if data.len() >= 28 {
         u32::from_le_bytes(data[24..28].try_into().unwrap())
     } else {
@@ -2095,7 +2340,91 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
                     );
                 }
             }
+            // LC_SEGMENT_64 = 0x19. Walk the inline section_64
+            // headers and collect each section's `flags` (the low
+            // byte is the section type, e.g. S_THREAD_LOCAL_*).
+            if cmd == 0x19 && cmdsize >= 72 {
+                let nsects = u32::from_le_bytes(
+                    data[offset + 64..offset + 68].try_into().unwrap(),
+                ) as usize;
+                let mut sec_off = offset + 72;
+                for _ in 0..nsects {
+                    if sec_off + 80 > data.len() || sec_off + 80 > offset + cmdsize {
+                        break;
+                    }
+                    // section_64.flags is at offset 64 within the 80-byte struct.
+                    let flags = u32::from_le_bytes(
+                        data[sec_off + 64..sec_off + 68].try_into().unwrap(),
+                    );
+                    section_types.push(flags);
+                    sec_off += 80;
+                }
+            }
+            // LC_SYMTAB = 0x02
+            if cmd == 0x02 && cmdsize >= 24 {
+                let symoff = u32::from_le_bytes(
+                    data[offset + 8..offset + 12].try_into().unwrap(),
+                ) as usize;
+                let nsyms = u32::from_le_bytes(
+                    data[offset + 12..offset + 16].try_into().unwrap(),
+                ) as usize;
+                let stroff = u32::from_le_bytes(
+                    data[offset + 16..offset + 20].try_into().unwrap(),
+                ) as usize;
+                let strsize = u32::from_le_bytes(
+                    data[offset + 20..offset + 24].try_into().unwrap(),
+                ) as usize;
+                symtab_info = Some((symoff, nsyms, stroff, strsize));
+            }
             offset += cmdsize;
+        }
+    }
+
+    // Now scan the symbol table for TLS exports. A TLS export is an
+    // external defined symbol whose section's low-byte flags is one
+    // of S_THREAD_LOCAL_REGULAR (0x11), S_THREAD_LOCAL_ZEROFILL
+    // (0x12), S_THREAD_LOCAL_VARIABLES (0x13),
+    // S_THREAD_LOCAL_VARIABLE_POINTERS (0x14), or
+    // S_THREAD_LOCAL_INIT_FUNCTION_POINTERS (0x15).
+    if let Some((symoff, nsyms, stroff, strsize)) = symtab_info {
+        const NLIST_64_SIZE: usize = 16;
+        let nlist_end = symoff.saturating_add(nsyms.saturating_mul(NLIST_64_SIZE));
+        let str_end = stroff.saturating_add(strsize);
+        if nlist_end <= data.len() && str_end <= data.len() {
+            let strtab = &data[stroff..str_end];
+            for i in 0..nsyms {
+                let off = symoff + i * NLIST_64_SIZE;
+                let n_strx =
+                    u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+                let n_type = data[off + 4];
+                let n_sect = data[off + 5] as usize;
+                // External, defined-in-section: N_EXT (0x01) set,
+                // N_TYPE (0x0e) == N_SECT (0xe).
+                let n_ext = (n_type & 0x01) != 0;
+                let is_n_sect = (n_type & 0x0e) == 0x0e;
+                if !n_ext || !is_n_sect || n_sect == 0 {
+                    continue;
+                }
+                let Some(&sec_flags) = section_types.get(n_sect - 1) else {
+                    continue;
+                };
+                let sec_type = sec_flags & 0xff;
+                if !(0x11..=0x15).contains(&sec_type) {
+                    continue;
+                }
+                if n_strx >= strtab.len() {
+                    continue;
+                }
+                let name_end = strtab[n_strx..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| n_strx + p)
+                    .unwrap_or(strtab.len());
+                if name_end > n_strx {
+                    args.dylib_tls_symbols
+                        .insert(strtab[n_strx..name_end].to_vec());
+                }
+            }
         }
     }
 

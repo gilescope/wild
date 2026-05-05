@@ -1007,6 +1007,26 @@ impl Linker {
             }
         }
 
+        // --emit-patch=<path>: write a byte-level diff between the
+        // previous output and the freshly-written one so a debugger
+        // (BugStalker on Linux; mach_vm_write equivalent on macOS) can
+        // splice the changed bytes into a still-running process for
+        // AOT edit-and-continue. Wild already has prev_output_mmap; we
+        // re-mmap the new output and walk the two in parallel,
+        // coalescing adjacent differing bytes into runs.
+        if let (Some(patch_path), Some(prev_bytes)) =
+            (args.common().emit_patch.as_ref(), prev_output_mmap)
+        {
+            let new_mmap = std::fs::File::open(args.output())
+                .ok()
+                .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok());
+            if let Some(new_mmap) = new_mmap {
+                if let Err(e) = emit_patch_file(prev_bytes, &new_mmap, patch_path) {
+                    eprintln!("wild --emit-patch failed: {e}");
+                }
+            }
+        }
+
         diff::maybe_diff()?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
@@ -1314,4 +1334,75 @@ pub fn should_fork(args: &Args) -> bool {
 
 pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> {
     args.common_mut().activate_thread_pool()
+}
+
+/// Write a wild-patch text file describing every byte run that differs
+/// between `prev` (the previous link's output) and `new` (this link's
+/// output). Adjacent differing bytes are coalesced into a single run.
+/// Designed to be consumed by an external patcher (e.g. BugStalker) that
+/// ptrace-writes each run into a still-running process.
+///
+/// File format:
+/// ```text
+/// # wild-patch v1
+/// # old-size: <N>
+/// # new-size: <M>
+/// # entries: <K>
+/// <hex-offset> <length> <hex-bytes>
+/// <hex-offset> <length> <hex-bytes>
+/// ...
+/// ```
+///
+/// `<hex-offset>` is the file offset (== virtual offset within the
+/// `__TEXT` segment for typical Mach-O / `.text` for typical ELF)
+/// where the run starts. `<length>` is its byte count. `<hex-bytes>`
+/// is the new content; the old content is whatever was there before.
+///
+/// On a cold link (`prev.is_empty()` or sizes mismatch wildly) the
+/// file still gets written but with a single entry covering the
+/// whole new output — callers should detect the wholesale-rewrite
+/// case via the size headers and respond appropriately (typically:
+/// restart the program rather than try to splice).
+fn emit_patch_file(
+    prev: &[u8],
+    new: &[u8],
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let common = prev.len().min(new.len());
+    let mut i = 0;
+    while i < common {
+        if prev[i] != new[i] {
+            let start = i;
+            while i < common && prev[i] != new[i] {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        } else {
+            i += 1;
+        }
+    }
+    // Tail: bytes appended/removed at the end. tier-4 padding is
+    // designed to keep this empty in practice but we record it for
+    // callers that want full coverage.
+    if new.len() > prev.len() {
+        runs.push((prev.len(), new.len() - prev.len()));
+    }
+
+    let mut out = String::new();
+    writeln!(out, "# wild-patch v1").unwrap();
+    writeln!(out, "# old-size: {}", prev.len()).unwrap();
+    writeln!(out, "# new-size: {}", new.len()).unwrap();
+    writeln!(out, "# entries: {}", runs.len()).unwrap();
+    for &(offset, length) in &runs {
+        write!(out, "{offset:x} {length} ").unwrap();
+        for b in &new[offset..offset + length] {
+            write!(out, "{b:02x}").unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
+    std::fs::write(path, out)
 }
