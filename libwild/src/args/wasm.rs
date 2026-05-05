@@ -591,16 +591,31 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             }
             "-l" => {
                 if let Some(name) = iter.next() {
+                    let s = name.as_ref();
+                    let spec = if let Some(rest) = s.strip_prefix(':') {
+                        // `-l:filename` (binutils convention): search
+                        // for the literal filename — no `lib` prefix
+                        // or extension auto-attached.
+                        InputSpec::Search(rest.into())
+                    } else {
+                        InputSpec::Lib(s.into())
+                    };
                     inputs.push(Input {
-                        spec: InputSpec::Lib(name.as_ref().into()),
+                        spec,
                         search_first: None,
                         modifiers,
                     });
                 }
             }
             _ if arg.starts_with("-l") => {
+                let s = &arg[2..];
+                let spec = if let Some(rest) = s.strip_prefix(':') {
+                    InputSpec::Search(rest.into())
+                } else {
+                    InputSpec::Lib(s.into())
+                };
                 inputs.push(Input {
-                    spec: InputSpec::Lib(arg[2..].into()),
+                    spec,
                     search_first: None,
                     modifiers,
                 });

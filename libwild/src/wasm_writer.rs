@@ -8600,6 +8600,15 @@ fn merge_inputs(
         if entry_name == ctors_name {
             entry_function_index = Some(0);
         }
+        // Lld treats `__wasm_call_ctors` as a hidden synth: it stays
+        // in the module (so input calls to it resolve), but
+        // `--export-dynamic` skips it. `--export=__wasm_call_ctors`
+        // (explicit) still works because the explicit-export pass
+        // bypasses the hidden filter. Without this gate, `comdats.ll`
+        // and other --export-dynamic fixtures see a phantom
+        // `__wasm_call_ctors` export between `_start` and the user's
+        // exported defs.
+        function_is_hidden.insert(b"__wasm_call_ctors".to_vec());
 
         // Mirror the +1 shift in `function_cmdline_rank` and reserve
         // slot 0 for `__wasm_call_ctors`. The synth ctor stub has no
