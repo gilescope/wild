@@ -7118,15 +7118,19 @@ fn merge_inputs(
                         } else {
                             function_is_local.remove(name);
                         }
-                        // Source-of-origin for `--print-gc-sections`.
+                        // Source-of-origin for `--print-gc-sections`
+                        // and the `-M` / `-Map=` link map. Stored as
+                        // the full input file path — lld's map row is
+                        // `<full-path>:(<sym>)` and the GC line is
+                        // `removing unused section <full-path>:(<sym>)`.
                         function_origin.insert(
                             name.clone(),
                             obj.input
                                 .file
                                 .filename
-                                .file_name()
-                                .map(|s| s.to_string_lossy().as_bytes().to_vec())
-                                .unwrap_or_else(|| b"?".to_vec()),
+                                .to_string_lossy()
+                                .as_bytes()
+                                .to_vec(),
                         );
                         if name == entry_name {
                             entry_function_index = Some(output_idx);
@@ -13802,17 +13806,24 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
         );
 
         // CODE: per-function sub-entries.
+        //
+        // lld's per-function map row uses a *virtual* layout, not raw
+        // file offsets:
+        //   - First function: Off = section_start + 1 (just past the
+        //     section id byte), Size = body_total (size leb + body).
+        //     The section size leb + num_funcs leb bytes are absorbed
+        //     into this offset (Off + Size doesn't equal the next
+        //     function's actual file offset, but the map just stacks
+        //     them: next.Off = prev.Off + prev.Size).
+        //   - Subsequent functions: Off = prev.Off + prev.Size,
+        //     Size = body_total.
         if id == SECTION_CODE {
             let payload = &bytes[payload_start..payload_end];
             let (num_funcs, nc) = read_leb128(payload).unwrap_or((0, 0));
             let mut p = nc;
-            // First function's "Off" includes the section size LEB +
-            // num_funcs LEB attribution (lld convention — the leading
-            // metadata is folded into the first chunk's bookkeeping).
-            // Subsequent functions track their actual file offset.
             let num_imports = merged.num_imported_functions;
+            let mut next_chunk_off: u64 = section_start as u64 + 1;
             for fi in 0..num_funcs {
-                let body_start = payload_start + p;
                 let (body_size, bc) = match read_leb128(&payload[p..]) {
                     Ok(v) => v,
                     Err(_) => break,
@@ -13829,16 +13840,9 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
                     .get(name.as_bytes())
                     .map(|b| String::from_utf8_lossy(b).into_owned())
                     .unwrap_or_else(|| "?".to_string());
-                let (chunk_off, chunk_size) = if fi == 0 {
-                    // Folded: section size LEB + num_funcs LEB +
-                    // first body framing.
-                    (
-                        section_start as u64 + 1, // skip id only
-                        (body_total + 1 + nc) as u64,
-                    )
-                } else {
-                    (body_start as u64, body_total as u64)
-                };
+                let chunk_off = next_chunk_off;
+                let chunk_size = body_total as u64;
+                next_chunk_off = chunk_off + chunk_size;
                 row(
                     &mut out,
                     None,
@@ -13869,15 +13873,19 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
             }
         }
 
-        // DATA: per-segment + per-data-symbol sub-entries. Each
-        // segment row has Addr = memory offset, Off = file offset of
-        // the segment payload, Size = segment data length. Inner
-        // symbols get the same Addr+Off+Size unless we have finer
-        // per-symbol metadata.
+        // DATA: per-segment + per-data-symbol sub-entries. Same
+        // virtual-offset convention lld uses for CODE rows — the
+        // first segment's Off = section_start + 1 (just past the
+        // section id byte), with subsequent segments stacking by
+        // size. The framing bytes (section size leb, segment count
+        // leb, per-segment flags / offset expr / size leb) are
+        // absorbed into the leading offset, so Off + Size doesn't
+        // equal the next segment's actual file offset.
         if id == SECTION_DATA {
             let payload = &bytes[payload_start..payload_end];
             let (num_segs, nc) = read_leb128(payload).unwrap_or((0, 0));
             let mut p = nc;
+            let mut next_seg_off: u64 = section_start as u64 + 1;
             for si in 0..num_segs {
                 // Each segment: flags LEB, [memidx LEB if flags&2],
                 // init expr (until 0x0B), data size LEB, data bytes.
@@ -13933,21 +13941,25 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
                     Ok(v) => v,
                     Err(_) => break,
                 };
-                let data_file_off = payload_start + p + dc;
                 p += dc + data_len;
                 let _ = seg_p_start;
 
-                // Per-segment name lookup: `merged.data_segments`
-                // doesn't carry the name today, so default to a
-                // generic `.data.N` placeholder. Lld emits `.data`
-                // and `.bss` here based on the segment's source
-                // section name; tracking that through merge_inputs
-                // is a follow-up.
-                let seg_name = format!(".data.{si}");
+                // Use the merged-output segment name (`.rodata`,
+                // `.tdata`, `.data`, `.bss`) tracked through
+                // merge_inputs. Falls back to `.data.N` only if the
+                // emitted DATA section count outruns the merged-name
+                // table, which shouldn't happen in practice.
+                let seg_name = merged
+                    .data_segments
+                    .get(si as usize)
+                    .map(|s| String::from_utf8_lossy(&s.name).into_owned())
+                    .unwrap_or_else(|| format!(".data.{si}"));
+                let chunk_off = next_seg_off;
+                next_seg_off = chunk_off + data_len as u64;
                 row(
                     &mut out,
                     mem_off.map(|v| v as u64),
-                    data_file_off as u64,
+                    chunk_off,
                     data_len as u64,
                     0,
                     &seg_name,
