@@ -1076,34 +1076,52 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     }
                 })
                 .then_with(|| {
-                    // Kind tiebreak. Default order is GLOBAL before
-                    // FUNCTION (matches `visibility-hidden.ll`'s
-                    // expected layout: GLOBAL `__stack_pointer` at idx
-                    // 0 precedes FUNCTION `objectDefault` at idx 1).
-                    // Under `--lld-compat --export-all`, lld flips it
-                    // — `__wasm_call_ctors` (FUNC 0) precedes
-                    // `__stack_pointer` (GLOBAL 0) in
-                    // mutable-global-exports.s's CHECK-ALL.
-                    let tb = if lld_compat_export_all_emit {
-                        |k: u8| -> u32 {
-                            match k {
-                                EXPORT_FUNC => 0,
-                                EXPORT_GLOBAL => 1,
-                                EXPORT_TAG => 2,
-                                _ => 3,
+                    // Kind tiebreak. Three GLOBAL classes:
+                    //   - synth/layout (no `global_export_pos`)
+                    //   - data-as-global (`global_export_pos` entry,
+                    //     from `--export-dynamic` walk over data syms)
+                    //
+                    // Default ordering at same (rank, pos):
+                    //   synth GLOBAL → FUNC → data-as-global GLOBAL
+                    //
+                    // Pinned by:
+                    //   - visibility-hidden.ll: `__stack_pointer`
+                    //     (synth, no entry, output idx 0) precedes
+                    //     the function exports.
+                    //   - mutable-global-exports.s CHECK-SP:
+                    //     `__stack_pointer` (synth) at output GLOBAL
+                    //     idx 0 ties (0, 0) with `_start` (FUNC at
+                    //     output idx 0); test wants synth-first.
+                    //   - weak-symbols.s: `weakGlobal` (data-as-global,
+                    //     sym_pos=2, has entry) shares (1, 2) with
+                    //     FUNC `exportWeak1` and emits AFTER it.
+                    //
+                    // Under `--lld-compat --export-all` (the CHECK-ALL
+                    // arm of mutable-global-exports.s), the order
+                    // flips for synth GLOBALs: `__wasm_call_ctors`
+                    // (FUNC 0) precedes `__stack_pointer` (synth
+                    // GLOBAL 0) — so synth GLOBAL goes AFTER FUNC at
+                    // the same (rank, pos) tie. Layout-bucket synth
+                    // GLOBALs are routed via `lld_export_rank` and
+                    // come last regardless.
+                    let synth_global_before_func = !lld_compat_export_all_emit;
+                    let tb = |k: u8, idx: u32| -> u32 {
+                        match k {
+                            EXPORT_GLOBAL => {
+                                if merged.global_export_pos.contains_key(&idx) {
+                                    2 // data-as-global, after FUNCs
+                                } else if synth_global_before_func {
+                                    0 // synth/layout, before FUNCs
+                                } else {
+                                    2 // synth, after FUNCs (compat-export-all)
+                                }
                             }
-                        }
-                    } else {
-                        |k: u8| -> u32 {
-                            match k {
-                                EXPORT_GLOBAL => 0,
-                                EXPORT_FUNC => 1,
-                                EXPORT_TAG => 2,
-                                _ => 3,
-                            }
+                            EXPORT_FUNC => 1,
+                            EXPORT_TAG => 3,
+                            _ => 4,
                         }
                     };
-                    tb(a.1).cmp(&tb(b.1))
+                    tb(a.1, a.2).cmp(&tb(b.1, b.2))
                 })
                 .then_with(|| a.0.cmp(&b.0))
         });

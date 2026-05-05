@@ -183,6 +183,14 @@ const KNOWN_PASSING: &[&str] = &[
     // from `Inputs/weak-alias.s`. Already worked — it was just
     // hidden by the broad "weak-alias" content skip.
     "weak-alias-overide",
+    // `weak-symbols.s` exercises a `.data.weakGlobal` data symbol
+    // synthesised as an EXPORT GLOBAL under `--export-dynamic`. The
+    // EXPORT-section three-bucket kind tiebreak (synth GLOBAL → FUNC
+    // → data-as-global GLOBAL) lets `weakGlobal` land between
+    // `exportWeak1` (FUNC) and `exportWeak2` (FUNC) per lld's
+    // per-input encounter order, at the same (cmdline_rank=1, pos=2)
+    // sort key as `exportWeak1`.
+    "weak-symbols",
     // `func-attr` (already passing) emits a custom section with
     // `<sym>@FUNCINDEX` payloads. `func-attr-tombstone` tests the
     // GC'd-symbol tombstone case: when a symbol's function got
