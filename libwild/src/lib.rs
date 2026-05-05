@@ -1342,27 +1342,33 @@ pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> 
 /// Designed to be consumed by an external patcher (e.g. BugStalker) that
 /// ptrace-writes each run into a still-running process.
 ///
-/// File format:
+/// File format (v2):
 /// ```text
-/// # wild-patch v1
+/// # wild-patch v2
 /// # old-size: <N>
 /// # new-size: <M>
 /// # entries: <K>
-/// <hex-offset> <length> <hex-bytes>
-/// <hex-offset> <length> <hex-bytes>
+/// <hex-offset> <length> <hex-old-bytes> <hex-new-bytes>
 /// ...
 /// ```
 ///
+/// Each data line carries BOTH the bytes that were at that offset in the
+/// previous link and the bytes that are there in this link. The patcher
+/// verifies the old bytes against the running process before writing —
+/// if the running process has drifted (someone else patched it, an
+/// earlier patch failed, the binary on disk is different from what's
+/// running), the patcher reports a clear diagnostic instead of silently
+/// corrupting the program.
+///
 /// `<hex-offset>` is the file offset (== virtual offset within the
 /// `__TEXT` segment for typical Mach-O / `.text` for typical ELF)
-/// where the run starts. `<length>` is its byte count. `<hex-bytes>`
-/// is the new content; the old content is whatever was there before.
+/// where the run starts. `<length>` is its byte count. Both byte
+/// strings are exactly `length * 2` hex chars.
 ///
-/// On a cold link (`prev.is_empty()` or sizes mismatch wildly) the
-/// file still gets written but with a single entry covering the
-/// whole new output — callers should detect the wholesale-rewrite
-/// case via the size headers and respond appropriately (typically:
-/// restart the program rather than try to splice).
+/// On a tail entry (when `new.len() > prev.len()`), the old bytes that
+/// extend beyond `prev.len()` are emitted as zeros — a fresh tail page
+/// in a live process will read as zeros too, so the verification still
+/// works in the typical case.
 fn emit_patch_file(
     prev: &[u8],
     new: &[u8],
@@ -1384,20 +1390,24 @@ fn emit_patch_file(
             i += 1;
         }
     }
-    // Tail: bytes appended/removed at the end. tier-4 padding is
-    // designed to keep this empty in practice but we record it for
-    // callers that want full coverage.
     if new.len() > prev.len() {
         runs.push((prev.len(), new.len() - prev.len()));
     }
 
     let mut out = String::new();
-    writeln!(out, "# wild-patch v1").unwrap();
+    writeln!(out, "# wild-patch v2").unwrap();
     writeln!(out, "# old-size: {}", prev.len()).unwrap();
     writeln!(out, "# new-size: {}", new.len()).unwrap();
     writeln!(out, "# entries: {}", runs.len()).unwrap();
     for &(offset, length) in &runs {
         write!(out, "{offset:x} {length} ").unwrap();
+        // old bytes (zero-padded for any tail beyond prev.len())
+        for j in 0..length {
+            let b = prev.get(offset + j).copied().unwrap_or(0);
+            write!(out, "{b:02x}").unwrap();
+        }
+        write!(out, " ").unwrap();
+        // new bytes
         for b in &new[offset..offset + length] {
             write!(out, "{b:02x}").unwrap();
         }
