@@ -1342,12 +1342,15 @@ pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> 
 /// Designed to be consumed by an external patcher (e.g. BugStalker) that
 /// ptrace-writes each run into a still-running process.
 ///
-/// File format (v2):
+/// File format (v3):
 /// ```text
-/// # wild-patch v2
+/// # wild-patch v3
 /// # old-size: <N>
 /// # new-size: <M>
+/// # old-blake3: <64-hex>
+/// # new-blake3: <64-hex>
 /// # entries: <K>
+/// # fn: <symbol-name>
 /// <hex-offset> <length> <hex-old-bytes> <hex-new-bytes>
 /// ...
 /// ```
@@ -1394,12 +1397,19 @@ fn emit_patch_file(
         runs.push((prev.len(), new.len() - prev.len()));
     }
 
+    let symbol_ranges = patch_symbol_ranges(new);
+
     let mut out = String::new();
-    writeln!(out, "# wild-patch v2").unwrap();
+    writeln!(out, "# wild-patch v3").unwrap();
     writeln!(out, "# old-size: {}", prev.len()).unwrap();
     writeln!(out, "# new-size: {}", new.len()).unwrap();
+    writeln!(out, "# old-blake3: {}", blake3::hash(prev).to_hex()).unwrap();
+    writeln!(out, "# new-blake3: {}", blake3::hash(new).to_hex()).unwrap();
     writeln!(out, "# entries: {}", runs.len()).unwrap();
     for &(offset, length) in &runs {
+        if let Some(symbol) = symbol_for_offset(&symbol_ranges, offset as u64) {
+            writeln!(out, "# fn: {}", sanitize_patch_comment(symbol)).unwrap();
+        }
         write!(out, "{offset:x} {length} ").unwrap();
         // old bytes (zero-padded for any tail beyond prev.len())
         for j in 0..length {
@@ -1415,4 +1425,116 @@ fn emit_patch_file(
     }
 
     std::fs::write(path, out)
+}
+
+#[derive(Debug)]
+struct PatchSymbolRange {
+    file_start: u64,
+    file_end: u64,
+    name: String,
+}
+
+fn patch_symbol_ranges(bytes: &[u8]) -> Vec<PatchSymbolRange> {
+    use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+
+    let Ok(file) = object::File::parse(bytes) else {
+        return Vec::new();
+    };
+
+    #[derive(Debug)]
+    struct Candidate {
+        file_start: u64,
+        explicit_size: u64,
+        section_end: u64,
+        name: String,
+    }
+
+    let mut candidates = Vec::new();
+    for symbol in file.symbols() {
+        if !symbol.is_definition() || symbol.kind() != SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let Ok(section) = file.section_by_index(section_index) else {
+            continue;
+        };
+        if section.kind() != object::SectionKind::Text {
+            continue;
+        }
+        let Some((section_file_start, section_file_size)) = section.file_range() else {
+            continue;
+        };
+        let section_addr = section.address();
+        let section_size = section.size();
+        let symbol_addr = symbol.address();
+        if symbol_addr < section_addr || symbol_addr >= section_addr.saturating_add(section_size) {
+            continue;
+        }
+        let section_offset = symbol_addr - section_addr;
+        if section_offset >= section_file_size {
+            continue;
+        }
+        candidates.push(Candidate {
+            file_start: section_file_start + section_offset,
+            explicit_size: symbol.size(),
+            section_end: section_file_start + section_file_size,
+            name: name.to_owned(),
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        a.file_start
+            .cmp(&b.file_start)
+            .then_with(|| b.explicit_size.cmp(&a.explicit_size))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    candidates.dedup_by(|a, b| a.file_start == b.file_start);
+
+    let mut ranges = Vec::with_capacity(candidates.len());
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let inferred_end = candidates
+            .iter()
+            .skip(idx + 1)
+            .find(|next| next.file_start > candidate.file_start)
+            .map(|next| next.file_start)
+            .unwrap_or(candidate.section_end);
+        let explicit_end = candidate
+            .explicit_size
+            .checked_add(candidate.file_start)
+            .filter(|end| *end > candidate.file_start);
+        let file_end = explicit_end.unwrap_or(inferred_end).min(candidate.section_end);
+        if file_end > candidate.file_start {
+            ranges.push(PatchSymbolRange {
+                file_start: candidate.file_start,
+                file_end,
+                name: candidate.name.clone(),
+            });
+        }
+    }
+    ranges
+}
+
+fn symbol_for_offset(ranges: &[PatchSymbolRange], offset: u64) -> Option<&str> {
+    let idx = ranges
+        .partition_point(|range| range.file_start <= offset)
+        .checked_sub(1)?;
+    let range = &ranges[idx];
+    (offset < range.file_end).then_some(range.name.as_str())
+}
+
+fn sanitize_patch_comment(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\r' => ' ',
+            _ => c,
+        })
+        .collect()
 }
