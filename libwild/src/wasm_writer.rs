@@ -9063,12 +9063,32 @@ fn merge_inputs(
                 if !is_undefined && sym.index >= parsed.num_function_imports {
                     let local_func_idx = sym.index - parsed.num_function_imports;
                     let local_output_idx = obj_info.func_base + local_func_idx;
-                    // For weak/COMDAT symbols, use the winning definition if different.
-                    let output_idx = if !sym.name.is_empty() {
+                    // BINDING_LOCAL (0x02) is TU-private: lld emits one
+                    // copy per TU. Cross-input name lookup would
+                    // collapse all copies onto the first definer's
+                    // slot, which is exactly NOT what
+                    // `init-fini.ll`'s `Functions: [9, 11, 13, 17, 19,
+                    // 21]` expects — index 17 is the second input's
+                    // local `.Lcall_dtors.101`, distinct from the
+                    // first's `.Lcall_dtors.101` at idx 9.
+                    //
+                    // Resolve via `local_output_idx` plus the synth-
+                    // function-front shift (`__wasm_call_ctors`,
+                    // weak-undef stubs, sig-mismatch traps), since
+                    // `function_name_map` values are post-shift but
+                    // `obj_info.func_base` was set pre-shift and not
+                    // updated.
+                    let is_local = (sym.flags & 0x02) != 0;
+                    let synth_front_offset = if needs_ctors { 1 } else { 0 }
+                        + weak_undef_stub_names.len() as u32
+                        + n_sig_mismatch;
+                    let output_idx = if !sym.name.is_empty() && !is_local {
                         function_name_map
                             .get(sym.name.as_slice())
                             .copied()
                             .unwrap_or(local_output_idx)
+                    } else if is_local {
+                        local_output_idx + synth_front_offset
                     } else {
                         local_output_idx
                     };
