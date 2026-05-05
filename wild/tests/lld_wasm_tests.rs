@@ -191,6 +191,12 @@ const KNOWN_PASSING: &[&str] = &[
     // per-input encounter order, at the same (cmdline_rank=1, pos=2)
     // sort key as `exportWeak1`.
     "weak-symbols",
+    // The `name` custom section's FunctionNames subsection now
+    // demangles each entry under default `--demangle` (Itanium C++
+    // ABI). Synth-prefix names like `undefined_weak:_Z3bari` get
+    // their suffix demangled to `undefined_weak:bar(int)`. EXPORT
+    // names stay raw — only the name-section presentation changes.
+    "name-section-mangling",
     // `func-attr` (already passing) emits a custom section with
     // `<sym>@FUNCINDEX` payloads. `func-attr-tombstone` tests the
     // GC'd-symbol tombstone case: when a symbol's function got

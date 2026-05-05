@@ -1411,10 +1411,44 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         let mut name_entries: Vec<(u32, &[u8])> = per_idx.into_iter().collect();
         name_entries.sort_by_key(|(idx, _)| *idx);
 
+        // Demangle each entry under default `--demangle` (Itanium C++
+        // ABI). The prefix-aware split keeps wild's synth wrappers
+        // (`undefined_weak:`, `signature_mismatch:`, `<sym>.command_export`)
+        // intact and demangles only the symbol name carried after the
+        // prefix. lld's name-section-mangling.s pins this:
+        // `undefined_weak:_Z3bari` → `undefined_weak:bar(int)` under
+        // `--demangle`, raw under `--no-demangle`.
+        let demangle_on = layout.symbol_db.args.common.demangle;
+        let demangle_one = |raw: &[u8]| -> Vec<u8> {
+            if !demangle_on {
+                return raw.to_vec();
+            }
+            let s = std::str::from_utf8(raw).unwrap_or("");
+            // Split on the first ':' (synth-wrapper prefix) and try
+            // demangling only the suffix. `.command_export` lives at
+            // the END of the name, not as a prefix — handle by trying
+            // the whole-string demangle first; if that fails (i.e.
+            // the demangled form equals the input) and the name has a
+            // ':', re-try on the suffix.
+            let demangled = symbolic_demangle::demangle(s).to_string();
+            if demangled != s {
+                return demangled.into_bytes();
+            }
+            if let Some(colon) = s.find(':') {
+                let prefix = &s[..colon + 1];
+                let suffix = &s[colon + 1..];
+                let suffix_dm = symbolic_demangle::demangle(suffix).to_string();
+                if suffix_dm != suffix {
+                    return format!("{prefix}{suffix_dm}").into_bytes();
+                }
+            }
+            raw.to_vec()
+        };
         write_leb128(&mut func_names, name_entries.len() as u32);
         for (idx, name) in &name_entries {
             write_leb128(&mut func_names, *idx);
-            write_name(&mut func_names, name);
+            let display = demangle_one(name);
+            write_name(&mut func_names, &display);
         }
 
         // Subsection 1: function names.
