@@ -851,7 +851,12 @@ pub(crate) fn write_output<A: Arch<Platform = MachO>>(
     };
     let gap_bytes = text_vm_end.saturating_sub(text_content_end);
     let comment_layout = layout.section_layouts.get(output_section_id::COMMENT);
-    let unwind_info_vm_addr = if !plain_entries.is_empty() && comment_layout.mem_size > 0 {
+    // `-no_compact_unwind` short-circuits before we run the expensive
+    // FDE scan + index build. The runtime falls back to scanning
+    // `__eh_frame` for unwind data.
+    let unwind_info_vm_addr = if layout.symbol_db.args.no_compact_unwind {
+        0u64
+    } else if !plain_entries.is_empty() && comment_layout.mem_size > 0 {
         comment_layout.mem_offset
     } else if plain_entries.is_empty() || gap_bytes == 0 {
         0u64
@@ -1534,6 +1539,56 @@ fn lib_ordinal_for_symbol(has_extra_dylibs: bool, flat_namespace: bool) -> u8 {
         0xFE // BIND_SPECIAL_DYLIB_FLAT_LOOKUP
     } else {
         1 // libSystem
+    }
+}
+
+/// Two-level-namespace ordinal for a specific symbol bind.
+///
+/// Wild emits load commands as `[LibSystem, ExtraDylibs[0..N]]`, so the
+/// bind ordinals are:
+/// * `1` — libSystem (default for any symbol that isn't otherwise
+///   attributed to a specific dylib).
+/// * `i + 2` — `extra_dylibs[i]`, when `dylib_symbol_provenance` maps
+///   the symbol name there. The provenance map is populated when a
+///   .tbd / .dylib is resolved through `-l<lib>` /
+///   `-framework <name>` / positional input.
+/// * `0xFE` — `BIND_SPECIAL_DYLIB_FLAT_LOOKUP`. We fall back to flat
+///   lookup only when `-flat_namespace` is in effect; otherwise an
+///   uncategorised symbol is assigned to libSystem (matches ld64's
+///   default for most C/POSIX entries).
+///
+/// This replaces the old all-or-nothing `lib_ordinal_for_symbol`
+/// behaviour where any presence of `extra_dylibs` forced every bind
+/// to flat lookup. Two-level binds let dyld skip dylibs the symbol
+/// can't possibly come from, which both speeds up image load and
+/// matches the binary layout `otool -dyld_info` reports for ld64.
+fn lib_ordinal_for_named_symbol(args: &crate::args::macho::MachOArgs, name: &[u8]) -> u8 {
+    if args.flat_namespace {
+        return 0xFE;
+    }
+    if let Some(&extra_idx) = args.dylib_symbol_provenance.get(name) {
+        // extra_dylibs[i] sits at bind ordinal i + 2 (libSystem is 1).
+        if let Ok(ord) = u8::try_from(extra_idx + 2) {
+            return ord;
+        }
+        // More than 253 extra dylibs — fall back to flat lookup.
+        return 0xFE;
+    }
+    // Symbol wasn't attributed to any specific extra dylib. We have
+    // two safe defaults:
+    //   * libSystem (ordinal 1) — works for the C/POSIX entries, but
+    //     fails for libc++ entries like `___cxa_allocate_exception`
+    //     when the link doesn't separately flag libc++ as its
+    //     provider.
+    //   * BIND_SPECIAL_DYLIB_FLAT_LOOKUP (0xFE) — dyld searches every
+    //     loaded image, slower but always finds it (matches wild's
+    //     historical behaviour before two-level binds landed).
+    // Choose flat lookup when the link has any extra dylibs beyond
+    // libSystem; otherwise libSystem is the only candidate anyway.
+    if args.extra_dylibs.is_empty() {
+        1
+    } else {
+        0xFE
     }
 }
 
@@ -2534,18 +2589,19 @@ fn write_exports_trie_compat(
         entries.push((b"__mh_execute_header".to_vec(), 0));
         seen.insert(b"__mh_execute_header".to_vec());
 
-        // Beyond `__mh_execute_header`, an executable's exports_trie
-        // should only contain symbols the user explicitly asked to
-        // export (`-export_dynamic`, `-exported_symbol`, or an
-        // exports list). ld64 defaults to just the header — walking
-        // every external symbol would publish inlined C++ weak
-        // definitions (e.g. `__ZN3FooC1Ev`), which the `weak-def-ref`
-        // test expects absent.
-        let only_header = !layout.symbol_db.args.export_dynamic
-            && layout.symbol_db.args.exported_symbols_list.is_none()
-            && layout.symbol_db.args.exported_symbols.is_empty();
-
-        if !only_header {
+        // Beyond `__mh_execute_header`, scan every resolved external
+        // symbol. ld64 emits non-hidden externals to an executable's
+        // exports trie unconditionally; per-symbol filtering below
+        // (DYNAMIC, N_PEXT, downgrade-to-local, missing-N_EXT) keeps
+        // out internal/hidden/weak-def-can-be-hidden definitions —
+        // including the inlined C++ weak ctors the `weak-def-ref`
+        // test asserts must be absent (visibility merging marks them
+        // Hidden, which sets `DOWNGRADE_TO_LOCAL`, which the loop
+        // skips). The `-export_dynamic`, `-exported_symbol`, and
+        // `-exported_symbols_list` flags affect the *nlist* symtab
+        // (and downstream visibility flags), not whether we run this
+        // loop.
+        {
             // Pre-compute per-symbol `N_EXT` and `N_PEXT` bits in one
             // sweep over input objects, so the hot loop below is 𝒪(1)
             // per symbol instead of calling `is_symbol_external` /
@@ -4058,10 +4114,89 @@ fn write_stubs_and_got<A: Arch<Platform = MachO>>(
         let is_objc_stub = name.starts_with(b"_objc_msgSend$");
 
         if is_objc_stub {
-            // ObjC stubs: the 12-byte stub calls _objc_msgSend via GOT.
-            // The selector isn't loaded in x1 (runtime does it via selref).
-            // For now, just bind to _objc_msgSend — a full implementation
-            // would synthesize 32-byte stubs with selector loading.
+            // ObjC selector stub. Layout per stub
+            // (`OBJC_STUB_SLOT_BYTES` total):
+            //   bytes 0..32  — 5 ARM64 insns + brk #1 padding:
+            //                  adrp x1, methname_page
+            //                  add  x1, x1, methname_off
+            //                  adrp x16, this-stub's GOT page
+            //                  ldr  x16, [x16, GOT off]   ; _objc_msgSend
+            //                  br   x16
+            //   bytes 32..   — NUL-terminated selector string
+            // The per-stub GOT slot is bound to `_objc_msgSend` by the
+            // bind code further down, so each stub is self-contained
+            // (no shared msgSend GOT slot needed). The selector is
+            // passed in x1 as a raw `char*`; modern ObjC runtimes
+            // (macOS 13+) handle uniquing on first dispatch. The cost
+            // vs. ld64's `__objc_selrefs`-rebased layout is one extra
+            // sel_registerName call per unique selector at first use.
+            let selector = &name[b"_objc_msgSend$".len()..];
+            if selector.len() > crate::macho::OBJC_STUB_MAX_SELECTOR {
+                crate::bail!(
+                    "ObjC selector too long ({} chars, max {}): `{}`",
+                    selector.len(),
+                    crate::macho::OBJC_STUB_MAX_SELECTOR,
+                    String::from_utf8_lossy(selector)
+                );
+            }
+            let selref_addr = res.format_specific.selref_address;
+            if let Some(plt_file_off) = vm_addr_to_file_offset(plt_addr, mappings) {
+                let slot_bytes = crate::macho::OBJC_STUB_SLOT_BYTES as usize;
+                if plt_file_off + slot_bytes <= out.len() {
+                    let methname_addr = plt_addr + crate::macho::OBJC_STUB_CODE_BYTES as u64;
+                    let sref = selref_addr.unwrap_or_else(|| {
+                        // Layout invariant: every OBJC_STUB resolution
+                        // gets a selref slot in `allocate_resolution`.
+                        // If we landed here without one, fall back to
+                        // the methname address itself (matches the old
+                        // ADRP+ADD layout) so dispatch still partly
+                        // works rather than crashing in the writer.
+                        debug_assert!(false, "OBJC_STUB without selref_address");
+                        methname_addr
+                    });
+                    write_objc_msgsend_stub(
+                        &mut out[plt_file_off..plt_file_off + slot_bytes],
+                        plt_addr,
+                        sref,
+                        got_addr,
+                        selector,
+                    );
+                    if selref_addr.is_some() {
+                        if let Some(sref_file_off) = vm_addr_to_file_offset(sref, mappings) {
+                            // Initial slot value = methname address
+                            // (will be rebased for ASLR by dyld).
+                            out[sref_file_off..sref_file_off + 8]
+                                .copy_from_slice(&methname_addr.to_le_bytes());
+                            rebase_fixups.push(RebaseFixup {
+                                file_offset: sref_file_off,
+                                target: methname_addr,
+                            });
+                        }
+                    }
+                }
+            }
+            // Fall through to the GOT-bind logic below — the per-stub
+            // GOT slot is bound to `_objc_msgSend` (handled by the
+            // existing `import_name = b"_objc_msgSend"` branch). Skip
+            // the regular 12-byte PLT writer.
+            if let Some(got_file_off) = vm_addr_to_file_offset(got_addr, mappings) {
+                debug_assert_got_addr_in_section(layout, got_addr, "objc-stub got");
+                let import_index = imports.len() as u32;
+                imports.push(ImportEntry {
+                    name: b"_objc_msgSend".to_vec(),
+                    lib_ordinal: lib_ordinal_for_named_symbol(
+                        layout.symbol_db.args,
+                        b"_objc_msgSend",
+                    ),
+                    weak_import: false,
+                });
+                bind_fixups.push(BindFixup {
+                    file_offset: got_file_off,
+                    import_index,
+                    addend: 0,
+                });
+            }
+            continue;
         }
 
         if let Some(plt_file_off) = vm_addr_to_file_offset(plt_addr, mappings) {
@@ -4109,12 +4244,10 @@ fn write_stubs_and_got<A: Arch<Platform = MachO>>(
             } else {
                 layout.symbol_db.is_weak_ref(symbol_id)
             };
+            let ord_name: &[u8] = &import_name;
             imports.push(ImportEntry {
-                name: import_name,
-                lib_ordinal: lib_ordinal_for_symbol(
-                    has_extra_dylibs,
-                    layout.symbol_db.args.flat_namespace,
-                ),
+                name: import_name.clone(),
+                lib_ordinal: lib_ordinal_for_named_symbol(layout.symbol_db.args, ord_name),
                 weak_import: weak,
             });
             bind_fixups.push(BindFixup {
@@ -4174,6 +4307,85 @@ fn debug_assert_got_addr_in_section<P: crate::platform::Platform>(
 ///   brk  #1 (x3 padding)
 ///
 /// **Complexity:** 𝒪(1) CPU and memory — emits exactly 8 ARM64 instructions.
+/// Write a synthesised `_objc_msgSend$<selector>` stub into `buf`.
+/// `buf.len()` must be ≥ `OBJC_STUB_SLOT_BYTES`. Layout matches what
+/// ld64 emits for selector-stub call sites:
+///
+/// ```text
+/// bytes 0..32  : adrp x1, selref_page           ; __DATA,__objc_selrefs
+///                ldr  x1, [x1, selref_off]      ; SEL canonicalised by dyld
+///                adrp x16, msgsend_got_page     ; per-stub GOT slot
+///                ldr  x16, [x16, msgsend_got_off]
+///                br   x16
+///                brk #1; brk #1; brk #1         ; pad to 32 bytes
+/// bytes 32..   : selector\0\0\0...               ; methname pointed-to by selref
+/// ```
+///
+/// The selref slot in `__objc_selrefs` is rebased at link time to the
+/// methname address (`stub_vm + 32`) and the section's flags
+/// (`S_LITERAL_POINTERS | S_ATTR_NO_DEAD_STRIP`) tell dyld+objc to
+/// canonicalise each entry through `sel_registerName` before any user
+/// code runs. Without that indirection the SEL pointer the stub passes
+/// to `_objc_msgSend` is a raw `char*` and dispatch aborts.
+fn write_objc_msgsend_stub(
+    buf: &mut [u8],
+    stub_vm: u64,
+    selref_vm: u64,
+    msgsend_got_vm: u64,
+    selector: &[u8],
+) {
+    debug_assert!(buf.len() >= crate::macho::OBJC_STUB_SLOT_BYTES as usize);
+    debug_assert!(selector.len() < crate::macho::OBJC_STUB_MAX_SELECTOR + 1);
+    debug_assert!(stub_vm % 4 == 0, "stub_vm must be 4-byte aligned for ARM64");
+    debug_assert!(
+        selref_vm % 8 == 0,
+        "selref_vm must be 8-byte aligned for LDR x1, [.., #imm12]"
+    );
+
+    // adrp x1, selref_page
+    let selref_page = selref_vm & !0xFFF;
+    let pc0_page = stub_vm & !0xFFF;
+    let sref_delta = (selref_page.wrapping_sub(pc0_page) as i64) >> 12;
+    let immlo0 = ((sref_delta & 0x3) as u32) << 29;
+    let immhi0 = (((sref_delta >> 2) & 0x7_FFFF) as u32) << 5;
+    let adrp_x1 = 0x9000_0001u32 | immhi0 | immlo0;
+    buf[0..4].copy_from_slice(&adrp_x1.to_le_bytes());
+
+    // ldr x1, [x1, #selref_off]
+    let sref_off = ((selref_vm & 0xFFF) >> 3) as u32;
+    let ldr_x1 = 0xF940_0021u32 | (sref_off << 10);
+    buf[4..8].copy_from_slice(&ldr_x1.to_le_bytes());
+
+    // adrp x16, msgsend_got_page
+    let got_page = msgsend_got_vm & !0xFFF;
+    let pc2_page = (stub_vm + 8) & !0xFFF;
+    let got_delta = (got_page.wrapping_sub(pc2_page) as i64) >> 12;
+    let immlo2 = ((got_delta & 0x3) as u32) << 29;
+    let immhi2 = (((got_delta >> 2) & 0x7_FFFF) as u32) << 5;
+    let adrp_x16 = 0x9000_0010u32 | immhi2 | immlo2;
+    buf[8..12].copy_from_slice(&adrp_x16.to_le_bytes());
+
+    // ldr x16, [x16, #got_off]
+    let got_off = ((msgsend_got_vm & 0xFFF) >> 3) as u32;
+    let ldr_x16 = 0xF940_0210u32 | (got_off << 10);
+    buf[12..16].copy_from_slice(&ldr_x16.to_le_bytes());
+
+    // br x16
+    buf[16..20].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+
+    // brk #1 padding (3 instructions to fill to 32 bytes).
+    for i in (20..32).step_by(4) {
+        buf[i..i + 4].copy_from_slice(&0xD420_0020u32.to_le_bytes());
+    }
+
+    // Methname inline at byte 32, NUL-terminated.
+    let code = crate::macho::OBJC_STUB_CODE_BYTES;
+    buf[code..code + selector.len()].copy_from_slice(selector);
+    buf[code + selector.len()] = 0;
+    // Tail of slot is already zero from the writer's section initialisation.
+}
+
+#[allow(dead_code)] // historical 32-byte stub kept for reference
 fn write_objc_stub(buf: &mut [u8], selref_addr: u64, msgsend_got_addr: u64, stub_addr: u64) {
     // adrp x1, selref@PAGE
     let stub_page = stub_addr & !0xFFF;
@@ -4273,12 +4485,10 @@ fn write_got_entries(
                         Err(_) => continue,
                     };
                     let import_index = imports.len() as u32;
+                    let ord = lib_ordinal_for_named_symbol(layout.symbol_db.args, &name);
                     imports.push(ImportEntry {
                         name,
-                        lib_ordinal: lib_ordinal_for_symbol(
-                            has_extra_dylibs,
-                            layout.symbol_db.args.flat_namespace,
-                        ),
+                        lib_ordinal: ord,
                         weak_import: false,
                     });
                     bind_fixups.push(BindFixup {
@@ -4966,10 +5176,37 @@ fn write_object_sections(
         // atom boundaries, positive entries delete dormant atom
         // bytes (see `compact_atom_managed_sections`). Any delta
         // at all → route through the subsection-aware copier.
-        if let Some(deltas) = obj.section_relax_deltas.get(sec_idx)
-            && !deltas.is_empty()
+        // `-order_file` reorder takes precedence: when atom_output_offsets
+        // is set, the per-atom map fully drives placement and any deltas
+        // are redundant by construction (load_section skips them).
+        let atom_reorder = obj
+            .subsection_tracking
+            .get(&sec_idx)
+            .filter(|t| t.atom_output_offsets.is_some());
+        if atom_reorder.is_some()
+            || obj
+                .section_relax_deltas
+                .get(sec_idx)
+                .is_some_and(|d| !d.is_empty())
         {
-            copy_section_with_subsection_padding(slice, input_data, deltas)?;
+            if let Some(tracking) = atom_reorder {
+                copy_section_with_atom_reorder(
+                    slice,
+                    input_data,
+                    &tracking.atoms,
+                    tracking
+                        .atom_output_offsets
+                        .as_ref()
+                        .expect("atom_reorder check above"),
+                    &tracking.scanned,
+                )?;
+            } else {
+                let deltas = obj
+                    .section_relax_deltas
+                    .get(sec_idx)
+                    .expect("delta check above");
+                copy_section_with_subsection_padding(slice, input_data, deltas)?;
+            }
             if let Ok(relocs) = input_section.relocations(le, obj.object.data) {
                 let segname = crate::macho::trim_nul(&input_section.segname);
                 let sectname_trimmed = crate::macho::trim_nul(input_section.sectname());
@@ -5084,6 +5321,47 @@ fn write_object_sections(
 /// alignment padding (`bytes_delta < 0`) or skipping deleted bytes
 /// (`bytes_delta > 0`) as described by `deltas`. `out` is already
 /// positioned at the section's start — writes are local offsets.
+/// Copy each atom's input bytes to its `-order_file`-assigned output
+/// position. Dormant atoms (not scanned by per-atom GC) are zero-filled
+/// at their reordered location so unresolved relocations don't ship.
+/// The output slice is assumed zero-initialised; gaps between atoms
+/// (alignment padding inserted by `compute_atom_output_offsets`) stay
+/// zero on their own.
+fn copy_section_with_atom_reorder(
+    out: &mut [u8],
+    input_data: &[u8],
+    atoms: &[crate::layout::Atom],
+    atom_output_offsets: &[u64],
+    scanned: &[bool],
+) -> Result {
+    for (idx, atom) in atoms.iter().enumerate() {
+        let lo = atom.input_start as usize;
+        let hi = atom.input_end as usize;
+        if hi > input_data.len() || lo > hi {
+            crate::bail!(
+                "atom-reorder copy: atom {idx} input range {lo:#x}..{hi:#x} \
+                 exceeds input_data len {}",
+                input_data.len()
+            );
+        }
+        let dst_lo = atom_output_offsets[idx] as usize;
+        let dst_hi = dst_lo + (hi - lo);
+        if dst_hi > out.len() {
+            crate::bail!(
+                "atom-reorder copy: atom {idx} output range {dst_lo:#x}..{dst_hi:#x} \
+                 exceeds out len {}",
+                out.len()
+            );
+        }
+        if scanned.get(idx).copied().unwrap_or(true) {
+            out[dst_lo..dst_hi].copy_from_slice(&input_data[lo..hi]);
+        } else {
+            out[dst_lo..dst_hi].fill(0);
+        }
+    }
+    Ok(())
+}
+
 fn copy_section_with_subsection_padding(
     out: &mut [u8],
     input_data: &[u8],
@@ -5166,11 +5444,25 @@ fn section_local_vm(
     sec_out: u64,
     input_offset_in_section: u64,
 ) -> u64 {
-    let out_off = match obj.section_relax_deltas.get(sec_idx) {
-        Some(d) if !d.is_empty() => d.input_to_output_offset(input_offset_in_section),
-        _ => input_offset_in_section,
-    };
-    sec_out + out_off
+    sec_out + macho_input_to_output(obj, sec_idx, input_offset_in_section)
+}
+
+/// Translate an input-section offset to its output-section offset under
+/// any active layout transforms — `-order_file` atom reordering takes
+/// precedence over `section_relax_deltas` (alignment padding / dead-atom
+/// deletion) which take precedence over the identity. The atom map and
+/// the delta map are mutually exclusive per section by construction in
+/// `ObjectLayoutState::load_section`.
+fn macho_input_to_output(obj: &ObjectLayout<'_, MachO>, sec_idx: usize, input_offset: u64) -> u64 {
+    if let Some(tracking) = obj.subsection_tracking.get(&sec_idx)
+        && let Some(out) = tracking.input_to_output_offset(input_offset)
+    {
+        return out;
+    }
+    match obj.section_relax_deltas.get(sec_idx) {
+        Some(d) if !d.is_empty() => d.input_to_output_offset(input_offset),
+        _ => input_offset,
+    }
 }
 
 /// Returns true iff the Mach-O input object carries a `__DWARF`
@@ -5273,13 +5565,17 @@ fn apply_relocations(
     let mut pending_addend: i64 = 0;
     let mut pending_subtrahend: Option<u64> = None;
 
-    // `r_address` is input-section coordinate. When the source
-    // section got compacted (dormant atoms deleted via `section_
-    // relax_deltas`), the field we want to patch sits at a
-    // different output offset. Map through the deltas once per
-    // reloc before using `r_address` to compute `patch_file_offset`
-    // or `pc_addr`.
+    // `r_address` is input-section coordinate. Atom reorder (active_atoms
+    // with atom_output_offsets set) takes precedence — moves the patch
+    // site to its reordered output position; otherwise the legacy
+    // `source_deltas` (compaction / alignment padding) drive the
+    // translation; otherwise identity.
     let map_r_address = |r: u32| -> u32 {
+        if let Some(t) = active_atoms
+            && let Some(out) = t.input_to_output_offset(r as u64)
+        {
+            return out as u32;
+        }
         match source_deltas {
             Some(d) if !d.is_empty() => d.input_to_output_offset(r as u64) as u32,
             _ => r,
@@ -5652,31 +5948,125 @@ fn apply_relocations(
             4 => {
                 write_pageoff12(out, patch_file_offset, target_addr);
             }
-            5 => {
-                // ARM64_RELOC_GOT_LOAD_PAGE21
-                if let Some(got) = got_addr {
-                    write_adrp(out, patch_file_offset, pc_addr, got);
+            5 | 6 => {
+                // ARM64_RELOC_GOT_LOAD_PAGE21 (5) / GOT_LOAD_PAGEOFF12 (6).
+                // Mismatch diagnostic (only on the type-5 leg of the pair):
+                // a regular GOT reference into a symbol that the defining
+                // side treats as thread-local. ld64 reports the same
+                // wording the TLVP→non-TLS path uses, since the mismatch
+                // is symmetric. Two flavours to catch:
+                //   1. Dylib import: dylib's nlist places the symbol in an
+                //      S_THREAD_LOCAL_* section (`dylib_tls_symbols`).
+                //   2. Local definition pulled in from another object:
+                //      target_addr lands inside the executable's TLS
+                //      output sections (TDATA/TBSS/PREINIT_ARRAY).
+                if reloc.r_type == 5 && reloc.r_extern {
+                    let sym_idx = object::SymbolIndex(reloc.r_symbolnum as usize);
+                    let sym_id = obj.symbol_id_range.input_to_id(sym_idx);
+                    let mut mismatch = false;
+                    if orig_target_addr == 0 {
+                        if let Ok(name) = layout.symbol_db.symbol_name(sym_id)
+                            && layout
+                                .symbol_db
+                                .args
+                                .dylib_tls_symbols
+                                .contains(name.bytes())
+                        {
+                            mismatch = true;
+                        }
+                    } else {
+                        let tdata = layout.section_layouts.get(output_section_id::TDATA);
+                        let tbss = layout.section_layouts.get(output_section_id::TBSS);
+                        let tvars = layout.section_layouts.get(output_section_id::PREINIT_ARRAY);
+                        let in_tls = (tdata.mem_size > 0
+                            && target_addr >= tdata.mem_offset
+                            && target_addr < tdata.mem_offset + tdata.mem_size)
+                            || (tbss.mem_size > 0
+                                && target_addr >= tbss.mem_offset
+                                && target_addr < tbss.mem_offset + tbss.mem_size)
+                            || (tvars.mem_size > 0
+                                && target_addr >= tvars.mem_offset
+                                && target_addr < tvars.mem_offset + tvars.mem_size);
+                        if in_tls {
+                            mismatch = true;
+                        }
+                    }
+                    if mismatch {
+                        let name = layout
+                            .symbol_db
+                            .symbol_name(sym_id)
+                            .map(|n| String::from_utf8_lossy(n.bytes()).into_owned())
+                            .unwrap_or_default();
+                        crate::bail!(
+                            "illegal thread local variable reference to regular symbol `{name}`"
+                        );
+                    }
+                }
+                if reloc.r_type == 5 {
+                    if let Some(got) = got_addr {
+                        write_adrp(out, patch_file_offset, pc_addr, got);
+                    } else {
+                        write_adrp(out, patch_file_offset, pc_addr, target_addr);
+                    }
                 } else {
-                    write_adrp(out, patch_file_offset, pc_addr, target_addr);
+                    // type 6: GOT_LOAD_PAGEOFF12
+                    if let Some(got) = got_addr {
+                        let page_off = (got & 0xFFF) as u32;
+                        let insn = read_u32(out, patch_file_offset);
+                        let imm12 = (page_off >> 3) & 0xFFF;
+                        write_u32_at(out, patch_file_offset, (insn & 0xFFC0_03FF) | (imm12 << 10));
+                    } else {
+                        let page_off = (target_addr & 0xFFF) as u32;
+                        let insn = read_u32(out, patch_file_offset);
+                        let rd = insn & 0x1F;
+                        let rn = (insn >> 5) & 0x1F;
+                        write_u32_at(
+                            out,
+                            patch_file_offset,
+                            0x9100_0000 | (page_off << 10) | (rn << 5) | rd,
+                        );
+                    }
                 }
             }
-            6 => {
-                // ARM64_RELOC_GOT_LOAD_PAGEOFF12
-                if let Some(got) = got_addr {
+            8 | 9 if reloc.r_extern && orig_target_addr == 0 && got_addr.is_some() => {
+                // ARM64_RELOC_TLVP_LOAD_PAGE21 (8) / ARM64_RELOC_TLVP_LOAD_PAGEOFF12 (9)
+                // for an undefined extern (TLV var imported from a dylib).
+                // We allocated a GOT slot and registered a bind fixup so dyld
+                // fills the slot with the dylib's `__thread_vars` descriptor
+                // address at load time. The TLVP_LOAD_PAGE21 patches an
+                // ADRP to the GOT slot's page; TLVP_LOAD_PAGEOFF12 keeps the
+                // emitted `LDR` (does NOT relax to ADD as the local-TLV case
+                // does) so the load reads the descriptor pointer through the
+                // GOT, matching the same indirection layout as types 5/6.
+                //
+                // Mismatch diagnostic: the importing object thinks `_x` is
+                // thread-local (TLVP reloc), but the dylib defines `_x` in
+                // a non-TLS section. We only fire this on the type-8 leg of
+                // the page21+pageoff12 pair so the error appears once per
+                // bad reference, not twice.
+                if reloc.r_type == 8 {
+                    let sym_idx = object::SymbolIndex(reloc.r_symbolnum as usize);
+                    let sym_id = obj.symbol_id_range.input_to_id(sym_idx);
+                    if let Ok(name) = layout.symbol_db.symbol_name(sym_id) {
+                        let dylib_syms = &layout.symbol_db.args.dylib_symbols;
+                        let dylib_tls = &layout.symbol_db.args.dylib_tls_symbols;
+                        if dylib_syms.contains(name.bytes()) && !dylib_tls.contains(name.bytes()) {
+                            crate::bail!(
+                                "illegal thread local variable reference to regular symbol `{}`",
+                                String::from_utf8_lossy(name.bytes())
+                            );
+                        }
+                    }
+                }
+                let got = got_addr.unwrap();
+                debug_assert_got_addr_in_section(layout, got, "apply_relocations TLVP extern");
+                if reloc.r_type == 8 {
+                    write_adrp(out, patch_file_offset, pc_addr, got);
+                } else {
                     let page_off = (got & 0xFFF) as u32;
                     let insn = read_u32(out, patch_file_offset);
                     let imm12 = (page_off >> 3) & 0xFFF;
                     write_u32_at(out, patch_file_offset, (insn & 0xFFC0_03FF) | (imm12 << 10));
-                } else {
-                    let page_off = (target_addr & 0xFFF) as u32;
-                    let insn = read_u32(out, patch_file_offset);
-                    let rd = insn & 0x1F;
-                    let rn = (insn >> 5) & 0x1F;
-                    write_u32_at(
-                        out,
-                        patch_file_offset,
-                        0x9100_0000 | (page_off << 10) | (rn << 5) | rd,
-                    );
                 }
             }
             8 | 9 if reloc.r_extern && orig_target_addr != 0 => {
@@ -5772,12 +6162,10 @@ fn apply_relocations(
                             Err(_) => b"<unknown>".to_vec(),
                         };
                         let import_index = imports.len() as u32;
+                        let ord = lib_ordinal_for_named_symbol(layout.symbol_db.args, &name);
                         imports.push(ImportEntry {
                             name,
-                            lib_ordinal: lib_ordinal_for_symbol(
-                                has_extra_dylibs,
-                                layout.symbol_db.args.flat_namespace,
-                            ),
+                            lib_ordinal: ord,
                             weak_import: false,
                         });
                         bind_fixups.push(BindFixup {
@@ -7361,6 +7749,18 @@ fn macho_section_info(id: crate::output_section_id::OutputSectionId) -> Option<M
         output_section_id::DATA => (DATA_SEG, name16(b"__data"), 0),
         output_section_id::CSTRING => (DATA_SEG, name16(b"__const"), 0),
         output_section_id::GOT => (DATA_SEG, name16(b"__got"), 0x06),
+        // S_LITERAL_POINTERS (0x05) | S_ATTR_NO_DEAD_STRIP (0x10000000)
+        // = 0x10000005. Tells dyld+objc to walk this section at image
+        // load and rewrite each entry to a canonical SEL via
+        // `sel_registerName` — the runtime then dispatches correctly
+        // when our `_objc_msgSend$<sel>` stubs pass the slot value.
+        output_section_id::OBJC_SELREFS => (DATA_SEG, name16(b"__objc_selrefs"), 0x1000_0005),
+        // S_ATTR_NO_DEAD_STRIP (0x10000000). Bytes are an
+        // (objc_image_info_version, flags) pair sourced from input
+        // objects' `__DATA,__objc_imageinfo` sections — passing the
+        // section through with its proper segname/sectname is what
+        // tells dyld+objc to treat the image as ObjC.
+        output_section_id::OBJC_IMAGEINFO => (DATA_SEG, name16(b"__objc_imageinfo"), 0x1000_0000),
         output_section_id::PREINIT_ARRAY => (DATA_SEG, name16(b"__thread_vars"), 0x13),
         output_section_id::INIT_ARRAY => (DATA_SEG, name16(b"__mod_init_func"), 0x09),
         // S_MOD_TERM_FUNC_POINTERS = 0x0A. Previously mis-encoded as
@@ -7912,9 +8312,15 @@ fn write_headers(
     w.u32(filetype);
     w.u32(ncmds);
     w.u32(cmdsize);
-    let mut flags = MH_PIE | MH_DYLDLINK;
+    let mut flags = MH_DYLDLINK;
+    if !layout.symbol_db.args.no_pie {
+        flags |= MH_PIE;
+    }
     if !layout.symbol_db.args.flat_namespace {
         flags |= MH_TWOLEVEL;
+    }
+    if layout.symbol_db.args.bind_at_load {
+        flags |= 0x0000_0008; // MH_BINDATLOAD — dyld resolves all binds eagerly
     }
     if has_tlv {
         flags |= 0x0080_0000; // MH_HAS_TLV_DESCRIPTORS

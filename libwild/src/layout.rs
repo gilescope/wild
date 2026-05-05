@@ -1189,6 +1189,15 @@ pub(crate) struct SubsectionTracking {
     /// to O(relocs) amortised across all atom activations, with O(1)
     /// bucket lookup per atom.
     pub(crate) reloc_buckets: std::sync::OnceLock<Vec<Vec<u32>>>,
+    /// `-order_file` reorder map. When `Some`, `atom_output_offsets[i]`
+    /// is the offset (within the output section) at which `atoms[i]`
+    /// should land. Set during section load when the order file ranks
+    /// at least one atom anchor in this section and the resulting
+    /// priority-sorted order differs from the input order.
+    /// `section_relax_deltas` is left empty for these sections — the
+    /// per-atom map is the sole source of truth for input→output offset
+    /// translation and section-byte placement.
+    pub(crate) atom_output_offsets: Option<Vec<u64>>,
 }
 
 /// Per-atom record: a byte range within an input section plus the
@@ -1209,6 +1218,16 @@ impl SubsectionTracking {
     /// libstd (1350 symbols ≈ one section with ~1350 atoms, and this
     /// method is only called during symbol-request processing, O(1)
     /// per request on average since we bucket).
+    /// Translate an input-section offset to its output offset under
+    /// `-order_file` atom reordering. Falls back to the identity when
+    /// `atom_output_offsets` isn't set or `offset` lies outside any atom
+    /// (the head-of-section padding before the first symbol, mostly).
+    pub(crate) fn input_to_output_offset(&self, input_offset: u64) -> Option<u64> {
+        let offsets = self.atom_output_offsets.as_ref()?;
+        let idx = self.atom_index_for_offset(input_offset)?;
+        Some(offsets[idx] + (input_offset - self.atoms[idx].input_start))
+    }
+
     pub(crate) fn atom_index_for_offset(&self, offset: u64) -> Option<usize> {
         // Atoms are sorted by input_start; binary-search the range
         // containing `offset`.
@@ -1586,10 +1605,7 @@ impl<'data, P: Platform> Layout<'data, P> {
                 };
                 let key = crate::parsed_input_cache::bundle_key_for(
                     obj.input.file.filename.as_path(),
-                    obj.input
-                        .entry
-                        .as_ref()
-                        .map(|e| e.identifier.as_slice()),
+                    obj.input.entry.as_ref().map(|e| e.identifier.as_slice()),
                 );
                 for slot in &obj.sections {
                     if let crate::resolution::SectionSlot::Loaded(section) = slot {
@@ -4085,30 +4101,53 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         let header = self.object.section(section_index)?;
         let mut section = Section::create(header, self, section_index, part_id)?;
 
-        // Mach-O `.subsections_via_symbols`: widen the section to hold
-        // per-symbol alignment padding before the relocation scan
-        // reports its size. The padding deltas get stored alongside
-        // any future relaxation deltas — they share the
-        // `section_relax_deltas` sparse map, and the sign of each
-        // delta (negative = insertion) disambiguates the semantics at
-        // query time.
-        let subsection_padding = <A::Platform as Platform>::compute_subsection_padding_deltas(
-            &self.object,
-            section_index,
-        );
-        if !subsection_padding.is_empty() {
-            let ss = linker_utils::relaxation::SectionDeltas::new(subsection_padding);
-            // `total_delta` is negative for insertions, so flipping
-            // the sign gives the byte growth.
-            let growth = (-ss.total_delta()) as u64;
-            section.size = section.size.saturating_add(growth);
-            self.section_relax_deltas.insert_sorted(section_index.0, ss);
-        }
-
         // Atom map for Mach-O subsections-via-symbols sections. Built
         // once at load time; atom scans are driven by subsequent
         // symbol-request-triggered activations below.
         let atoms = <A::Platform as Platform>::compute_atoms(&self.object, section_index);
+
+        // `-order_file` reorder: when the order file ranks at least one atom
+        // anchor in this section AND the priority-sorted order differs from
+        // input order, place atoms at custom output offsets and skip the
+        // padding-deltas path entirely. The atom_output_offsets map is the
+        // sole input→output translator for these sections.
+        let atom_output_offsets = if atoms.is_empty() {
+            None
+        } else {
+            <A::Platform as Platform>::compute_atom_output_offsets(
+                &self.object,
+                section_index,
+                &atoms,
+                resources.symbol_db.args.symbol_order(),
+            )
+        };
+
+        if let Some((_, total_size)) = atom_output_offsets.as_ref() {
+            // Atom reorder owns the section's total size — replace, don't
+            // accumulate, so any compiler-emitted leading bytes are dropped.
+            section.size = *total_size;
+        } else {
+            // Mach-O `.subsections_via_symbols`: widen the section to hold
+            // per-symbol alignment padding before the relocation scan
+            // reports its size. The padding deltas get stored alongside
+            // any future relaxation deltas — they share the
+            // `section_relax_deltas` sparse map, and the sign of each
+            // delta (negative = insertion) disambiguates the semantics at
+            // query time.
+            let subsection_padding = <A::Platform as Platform>::compute_subsection_padding_deltas(
+                &self.object,
+                section_index,
+            );
+            if !subsection_padding.is_empty() {
+                let ss = linker_utils::relaxation::SectionDeltas::new(subsection_padding);
+                // `total_delta` is negative for insertions, so flipping
+                // the sign gives the byte growth.
+                let growth = (-ss.total_delta()) as u64;
+                section.size = section.size.saturating_add(growth);
+                self.section_relax_deltas.insert_sorted(section_index.0, ss);
+            }
+        }
+
         if !atoms.is_empty() {
             let scanned = vec![false; atoms.len()];
             self.subsection_tracking.insert(
@@ -4117,6 +4156,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                     atoms,
                     scanned,
                     reloc_buckets: std::sync::OnceLock::new(),
+                    atom_output_offsets: atom_output_offsets.map(|(offsets, _)| offsets),
                 },
             );
         }
@@ -4346,10 +4386,16 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 let input_offset = self
                     .object
                     .symbol_value_in_section(local_symbol, section_index)?;
-                let output_offset = opt_input_to_output(
-                    self.section_relax_deltas.get(section_index.0),
-                    input_offset,
-                );
+                let output_offset = self
+                    .subsection_tracking
+                    .get(&section_index.0)
+                    .and_then(|t| t.input_to_output_offset(input_offset))
+                    .unwrap_or_else(|| {
+                        opt_input_to_output(
+                            self.section_relax_deltas.get(section_index.0),
+                            input_offset,
+                        )
+                    });
                 output_offset + section_address
             } else {
                 // With `MergeStringRefs::disabled()` (above) every
@@ -5209,13 +5255,11 @@ fn layout_section_parts<P: Platform>(
                 if args.common().incremental_cache.writes_cache()
                     && file_offset > section_start_file_offset
                 {
-                    let merge_target =
-                        output_sections.primary_output_section(section_id);
+                    let merge_target = output_sections.primary_output_section(section_id);
                     let section_flags = output_sections.section_flags(merge_target);
                     if section_flags.is_alloc() && !args.should_output_partial_object() {
                         const TIER4_PAD: usize = 4096;
-                        let padded_file_end =
-                            file_offset.next_multiple_of(TIER4_PAD);
+                        let padded_file_end = file_offset.next_multiple_of(TIER4_PAD);
                         let pad_bytes = padded_file_end - file_offset;
                         file_offset = padded_file_end;
                         mem_offset += pad_bytes as u64;

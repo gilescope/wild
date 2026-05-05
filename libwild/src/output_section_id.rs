@@ -102,6 +102,10 @@ pub(crate) const SYMTAB_SHNDX_GLOBAL: OutputSectionId =
     part_id::SYMTAB_SHNDX_GLOBAL.output_section_id();
 // Mach-O specific sections (used by the Mach-O writer pipeline)
 #[allow(dead_code)]
+pub(crate) const OBJC_SELREFS: OutputSectionId = part_id::OBJC_SELREFS.output_section_id();
+#[allow(dead_code)]
+pub(crate) const OBJC_IMAGEINFO: OutputSectionId = part_id::OBJC_IMAGEINFO.output_section_id();
+#[allow(dead_code)]
 pub(crate) const PAGEZERO_SEGMENT: OutputSectionId = part_id::PAGEZERO_SEGMENT.output_section_id();
 #[allow(dead_code)]
 pub(crate) const TEXT_SEGMENT: OutputSectionId = part_id::TEXT_SEGMENT.output_section_id();

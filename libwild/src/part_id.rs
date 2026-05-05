@@ -54,7 +54,19 @@ pub(crate) const DATA_SEGMENT: PartId = PartId(33);
 pub(crate) const LINK_EDIT_SEGMENT: PartId = PartId(34);
 pub(crate) const ENTRY_POINT: PartId = PartId(35);
 
-pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 36;
+/// Mach-O `__DATA,__objc_selrefs` — synthesised by the linker for each
+/// `_objc_msgSend$<sel>` stub. Holds an 8-byte pointer per selector
+/// that dyld+objc rewrite at image load to the canonical SEL via
+/// `sel_registerName`. ELF doesn't touch this section.
+pub(crate) const OBJC_SELREFS: PartId = PartId(36);
+
+/// Mach-O `__DATA,__objc_imageinfo` — 8-byte version+flags struct that
+/// tells dyld+objc this image is an Objective-C image. Without it the
+/// runtime skips our `__objc_selrefs` / `__objc_classrefs` etc. and
+/// `_objc_msgSend` dispatches against un-canonicalised SEL pointers.
+pub(crate) const OBJC_IMAGEINFO: PartId = PartId(37);
+
+pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 38;
 
 #[cfg(test)]
 pub(crate) const NUM_BUILT_IN_PARTS: usize = NUM_SINGLE_PART_SECTIONS as usize

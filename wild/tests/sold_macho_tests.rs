@@ -38,6 +38,19 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
         }
 
         let test_name = path.file_stem().unwrap().to_string_lossy().to_string();
+
+        // Skip arch-incompatible tests at discovery time — they
+        // would only ever show up as `ignored`, which conflates
+        // "wild can't do this" with "the source can't even produce
+        // the expected artifacts on this arch". `literals` is the
+        // canonical example: ARM64 clang materialises double
+        // constants via `MOVK` instead of emitting a `__literal8`
+        // section, so the test's `objdump` grep would never match
+        // regardless of linker.
+        if !cfg!(target_arch = "x86_64") && is_x86_only(&test_name) {
+            continue;
+        }
+
         let test_path = path.clone();
         let wd = work_dir.clone();
 
@@ -50,6 +63,10 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
             .with_ignored_flag(ignored),
         );
     }
+}
+
+fn is_x86_only(name: &str) -> bool {
+    matches!(name, "literals")
 }
 
 fn should_ignore(name: &str) -> bool {
@@ -67,7 +84,7 @@ fn should_ignore(name: &str) -> bool {
         // exported-symbols-list now passes (export trie filtering via export_list)
         // unexported-symbols-list now passes (unexport_list filtering)
         // export-dynamic now passes (LTO support + EXPORT_DYNAMIC flag fix)
-        "merge-scope", // .weak_def_can_be_hidden visibility merging
+        // merge-scope now passes (weak_def_can_be_hidden visibility merging + trie default)
         // hidden-l now passes (archive symbols added to unexport list)
         // needed-l now passes (prefix link modifiers fall through to -l logic)
         // needed-framework now passes (dead_strip_dylibs + needed)
@@ -82,8 +99,8 @@ fn should_ignore(name: &str) -> bool {
         // search-paths-first now passes (default search order is paths-first)
         // search-dylibs-first now passes (pre-scan for global flags)
         // sectcreate now passes (-sectcreate data written to TEXT segment gap)
-        "order-file", /* -order_file
-                       * stack-size now passes
+        // order-file now passes (atom-reorder via per-atom output offsets)
+        /* stack-size now passes
                        * map now passes (link map file writer)
                        * dependency-info now passes
                        * print-dependencies now passes (--print-dependencies output)
@@ -104,38 +121,49 @@ fn should_ignore(name: &str) -> bool {
     // Tests that need linking against a .dylib
     const NEEDS_DYLIB_INPUT: &[&str] = &[
         // dylib now passes (dylib input consumption)
-        "tls-dylib", /* TLS across dylibs
-                      * data-reloc now passes
-                      * fixup-chains-addend now passes (implicit addend from data + import table
-                      * addend) fixup-chains-addend64 now passes
-                      * (DYLD_CHAINED_IMPORT_ADDEND64 format 3)
-                      * weak-def-dylib now passes
-                      * mark-dead-strippable-dylib now passes (MH_DEAD_STRIPPABLE_DYLIB +
-                      * auto-strip) */
+        // tls-dylib now passes (cross-dylib TLV via GOT-bound TLV descriptor)
+        /* data-reloc now passes
+         * fixup-chains-addend now passes (implicit addend from data + import table
+         * addend) fixup-chains-addend64 now passes
+         * (DYLD_CHAINED_IMPORT_ADDEND64 format 3)
+         * weak-def-dylib now passes
+         * mark-dead-strippable-dylib now passes (MH_DEAD_STRIPPABLE_DYLIB +
+         * auto-strip) */
     ];
 
     // Validation/correctness bugs in Wild to fix
     const WILD_BUGS: &[&str] = &[
-        "tls",           // TLV across dylib (link-time resolution)
-        "tls-mismatch",  // TLS type mismatch errors
-        "tls-mismatch2", // TLS type mismatch errors
-        // cstring now passes (S_CSTRING_LITERALS merge enabled)
-        // duplicate-error now passes (error format matches sold)
-        // missing-error now passes (error format matches sold)
-        // undef now passes (-u symbols kept alive as GC roots)
-        // fixup-chains-unaligned-error now passes (test asm symbol prefix fix)
-        // exception-in-static-initializer now passes (libc++ message wording fix)
-        // indirect-symtab now passes (DYSYMTAB + indirect symbol table)
-        // init-offsets now passes (__init_offsets section with S_INIT_FUNC_OFFSETS)
-        // init-offsets-fixup-chains now passes (-fixup_chains implies -init_offsets)
-        "literals",  // ARM64 cc doesn't emit __literal8 (x86-only)
-        "libunwind", // libunwind integration
-        "objc-selector", /* ObjC selector refs
-                      * debuginfo now passes (SO/BNSYM/FUN/ENSYM stab synthesis for dsymutil) */
+        /* tls now passes (cross-dylib TLV via GOT-bound TLV descriptor)
+         * tls-mismatch now passes (dylib_tls_symbols set + TLVP-on-non-TLS check)
+         * tls-mismatch2 now passes (regular-GOT-on-TLS-target check)
+         * cstring now passes (S_CSTRING_LITERALS merge enabled)
+         * duplicate-error now passes (error format matches sold)
+         * missing-error now passes (error format matches sold)
+         * undef now passes (-u symbols kept alive as GC roots)
+         * fixup-chains-unaligned-error now passes (test asm symbol prefix fix)
+         * exception-in-static-initializer now passes (libc++ message wording fix)
+         * indirect-symtab now passes (DYSYMTAB + indirect symbol table)
+         * init-offsets now passes (__init_offsets section with S_INIT_FUNC_OFFSETS)
+         * init-offsets-fixup-chains now passes (-fixup_chains implies -init_offsets)
+         * libunwind/objc-selector now pass (TBD ObjC-key expansion,
+         * data-section pass-through, 32-byte selector-loading stubs in
+         * `__stubs` with inline methname strings, synthesised
+         * `__DATA,__objc_selrefs` and `__DATA,__objc_imageinfo` sections so
+         * dyld+objc canonicalise SELs at image load, and two-level-namespace
+         * binds via `dylib_symbol_provenance`).
+         * debuginfo now passes (SO/BNSYM/FUN/ENSYM stab synthesis for dsymutil) */
     ];
 
-    // x86_64-specific tests
-    const X86_ONLY: &[&str] = &[];
+    // x86_64-specific tests — skipped on ARM64 because the source
+    // wouldn't generate the expected section/encoding to begin with,
+    // not because of a wild bug.
+    const X86_ONLY: &[&str] = &[
+        // ARM64 clang materialises double constants via four `MOVK`
+        // instructions, so no `__literal8` section is emitted from
+        // the input — no linker can synthesise one. Apple ld64 also
+        // wouldn't pass this test on ARM64.
+        "literals",
+    ];
 
     // Tests that invoke ld64 directly (not through cc --ld-path)
     const NO_LD_PATH: &[&str] = &[];

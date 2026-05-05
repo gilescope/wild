@@ -19,6 +19,26 @@ pub(crate) struct MachO;
 
 const LE: Endianness = Endianness::Little;
 
+/// Bytes reserved per `_objc_msgSend$<selector>` stub in `__stubs`.
+/// Layout: 32 bytes of selector-loading stub instructions (5 × 4-byte
+/// ARM64 insns + 12 bytes of `brk #1` padding) followed by up to
+/// `OBJC_STUB_SLOT_BYTES - 32` bytes for an inline NUL-terminated
+/// methname string. The trailing string is what the per-stub GOT slot
+/// points at — the stub loads `[GOT slot]` into `x1` and tail-calls
+/// `_objc_msgSend`, so the string acts as the per-selector selref the
+/// runtime needs.
+///
+/// 96 bytes covers Apple's longest published Foundation/AppKit
+/// selectors (≈60 chars + NUL); shorter selectors leave the trailing
+/// bytes zeroed. A future optimisation could pack methnames out-of-band
+/// in a synthesised `__objc_methname` section to reclaim the per-stub
+/// padding, but the inline layout keeps the resolution + write paths
+/// constant-size which simplifies layout consistency checks.
+pub(crate) const OBJC_STUB_SLOT_BYTES: u64 = 96;
+pub(crate) const OBJC_STUB_CODE_BYTES: usize = 32;
+pub(crate) const OBJC_STUB_MAX_SELECTOR: usize =
+    (OBJC_STUB_SLOT_BYTES as usize) - OBJC_STUB_CODE_BYTES - 1; // -1 for NUL
+
 type SectionTable<'data> = &'data [macho::Section64<Endianness>];
 type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHeader64<Endianness>>;
 pub(crate) type SymtabEntry = macho::Nlist64<Endianness>;
@@ -140,6 +160,9 @@ pub(crate) fn estimate_unwind_info_entries(
 /// `estimate_unwind_info_entries`); arithmetic on the result is 𝒪(1).
 /// 𝒪(1) memory.
 pub(crate) fn unwind_info_reserved_bytes(symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>) -> u64 {
+    if symbol_db.args.no_compact_unwind {
+        return 0;
+    }
     let entries = estimate_unwind_info_entries(symbol_db);
     if entries == 0 {
         return 0;
@@ -1615,8 +1638,35 @@ fn scan_reloc_range_for_atom_impl<'data, 'scope, A: platform::Arch<Platform = Ma
                     let desc = s.n_desc(le);
                     (desc & macho::N_WEAK_DEF) != 0 && (s.n_type() & 0x0e) != 0
                 });
+            // Detect `_objc_msgSend$<selector>` stub references early so
+            // we can route them to a PLT|GOT|OBJC_STUB allocation
+            // regardless of which relocation kind first reaches the
+            // symbol. The `OBJC_STUB` flag tells `allocate_resolution`
+            // to reserve room for the 32-byte selector-loading stub
+            // plus an inline NUL-terminated methname; without it the
+            // synthesised selref + stub bytes wouldn't fit and the
+            // following PLT entry would land on top of them.
+            let is_objc_msgsend_stub = reloc.r_extern
+                && resources
+                    .symbol_db
+                    .symbol_name(symbol_id)
+                    .ok()
+                    .map_or(false, |n| n.bytes().starts_with(b"_objc_msgSend$"));
             let flags_to_add = match reloc.r_type {
                 5 | 6 | 7 => crate::value_flags::ValueFlags::GOT,
+                // ARM64_RELOC_TLVP_LOAD_PAGE21 (8) / TLVP_LOAD_PAGEOFF12 (9):
+                // for an undefined extern (i.e. TLV var imported from a
+                // dylib) we need a GOT-like slot that dyld binds to the
+                // dylib's `__thread_vars` descriptor — without it, the
+                // TLVP load reads zero and segfaults at first access.
+                // For locally-defined TLVs the descriptor lives in the
+                // executable's own `__thread_vars`, no GOT needed.
+                8 | 9 if is_def_undef => crate::value_flags::ValueFlags::GOT,
+                2 if is_objc_msgsend_stub => {
+                    crate::value_flags::ValueFlags::PLT
+                        | crate::value_flags::ValueFlags::GOT
+                        | crate::value_flags::ValueFlags::OBJC_STUB
+                }
                 2 if is_def_undef || (flat_ns && reloc.r_extern) || is_weak_def_local => {
                     crate::value_flags::ValueFlags::PLT | crate::value_flags::ValueFlags::GOT
                 }
@@ -1715,6 +1765,74 @@ pub(crate) fn scan_atom_relocations<'data, 'scope, A: platform::Arch<Platform = 
 /// section) and a = N_EXT symbols in the section (sort + dedup).
 /// Second pass over sym_offsets is 𝒪(a). 𝒪(a) memory for
 /// `sym_offsets` and result `deltas`.
+/// Reorder atoms in a `.subsections_via_symbols` section by `-order_file`
+/// priority. Returns `(per-atom output offset, total section size)` when a
+/// reorder is required; returns `None` if no atom is named in `symbol_order`,
+/// the symbol-order map is empty, or the sorted order already matches input
+/// order (in which case the existing padding-deltas path handles alignment).
+///
+/// Output offsets are computed by walking atoms in `(priority, input_start)`
+/// order and placing each at the next position aligned to the section's
+/// alignment. Atoms whose anchor symbol isn't in `symbol_order` get priority
+/// `u32::MAX` and trail the ranked atoms while preserving their input order.
+pub(crate) fn compute_atom_output_offsets(
+    file: &File<'_>,
+    section_index: object::SectionIndex,
+    atoms: &[crate::layout::Atom],
+    symbol_order: &std::collections::HashMap<String, u32>,
+) -> Option<(Vec<u64>, u64)> {
+    if symbol_order.is_empty() || atoms.is_empty() {
+        return None;
+    }
+    let section = file.sections.get(section_index.0)?;
+    let align_exp = section.align.get(LE);
+    if align_exp >= 32 {
+        return None;
+    }
+    let alignment: u64 = 1u64 << align_exp;
+
+    let strings = file.symbols.strings();
+    let priority = |atom: &crate::layout::Atom| -> u32 {
+        let Some(sym) = file.symbols.iter().nth(atom.anchor.0) else {
+            return u32::MAX;
+        };
+        let Ok(name_bytes) = sym.name(LE, strings) else {
+            return u32::MAX;
+        };
+        let Ok(name_str) = std::str::from_utf8(name_bytes) else {
+            return u32::MAX;
+        };
+        symbol_order.get(name_str).copied().unwrap_or(u32::MAX)
+    };
+
+    let priorities: Vec<u32> = atoms.iter().map(priority).collect();
+    if priorities.iter().all(|&p| p == u32::MAX) {
+        return None;
+    }
+
+    // Stable sort by (priority, input_start). Indices array points into atoms[].
+    let mut indices: Vec<usize> = (0..atoms.len()).collect();
+    indices.sort_by_key(|&i| (priorities[i], atoms[i].input_start));
+
+    // If the sort is the identity, no reorder is needed; the existing
+    // padding-deltas path handles alignment for input-order layouts.
+    if indices.iter().enumerate().all(|(i, &j)| i == j) {
+        return None;
+    }
+
+    let mut atom_output_offsets: Vec<u64> = vec![0; atoms.len()];
+    let mut cursor: u64 = 0;
+    for &i in &indices {
+        if alignment > 1 {
+            cursor = cursor.next_multiple_of(alignment);
+        }
+        atom_output_offsets[i] = cursor;
+        let size = atoms[i].input_end.saturating_sub(atoms[i].input_start);
+        cursor = cursor.saturating_add(size);
+    }
+    Some((atom_output_offsets, cursor))
+}
+
 pub(crate) fn compute_subsection_padding_deltas(
     file: &File<'_>,
     section_index: object::SectionIndex,
@@ -2367,12 +2485,26 @@ impl platform::Symbol for SymtabEntry {
     fn visibility(&self) -> crate::symbol_db::Visibility {
         let n_type = self.n_type();
         if (n_type & macho::N_PEXT) != 0 {
-            crate::symbol_db::Visibility::Hidden
-        } else if (n_type & macho::N_EXT) != 0 {
-            crate::symbol_db::Visibility::Default
-        } else {
-            crate::symbol_db::Visibility::Hidden
+            return crate::symbol_db::Visibility::Hidden;
         }
+        if (n_type & macho::N_EXT) == 0 {
+            return crate::symbol_db::Visibility::Hidden;
+        }
+        // `.weak_def_can_be_hidden`: defined symbol with both N_WEAK_DEF
+        // and N_WEAK_REF set. Apple's directive marks a weak def that
+        // may be hidden if every translation unit that defines it has
+        // the same flag set. Treat it as Hidden here; the merge in
+        // `process_alternatives` flips it back to Default if any peer
+        // definition is unconditionally visible.
+        let kind = n_type & macho::N_TYPE;
+        let is_defined = kind == macho::N_SECT || kind == macho::N_ABS;
+        if is_defined {
+            let n_desc = self.n_desc(LE);
+            if (n_desc & macho::N_WEAK_DEF) != 0 && (n_desc & macho::N_WEAK_REF) != 0 {
+                return crate::symbol_db::Visibility::Hidden;
+            }
+        }
+        crate::symbol_db::Visibility::Default
     }
 
     fn value(&self) -> u64 {
@@ -2631,6 +2763,8 @@ fn macho_header_bytes(
             output_section_id::DATA
                 | output_section_id::CSTRING
                 | output_section_id::GOT
+                | output_section_id::OBJC_SELREFS
+                | output_section_id::OBJC_IMAGEINFO
                 | output_section_id::PREINIT_ARRAY
                 | output_section_id::INIT_ARRAY
                 | output_section_id::FINI_ARRAY
@@ -2654,6 +2788,8 @@ fn macho_header_bytes(
             id,
             output_section_id::DATA
                 | output_section_id::CSTRING
+                | output_section_id::OBJC_SELREFS
+                | output_section_id::OBJC_IMAGEINFO
                 | output_section_id::PREINIT_ARRAY
                 | output_section_id::TDATA
                 | output_section_id::TBSS
@@ -2772,7 +2908,13 @@ fn macho_header_bytes(
     if !args.no_adhoc_codesign {
         sz += LC_CODE_SIGNATURE_BYTES;
     }
-    sz += DEFAULT_HEADERPAD_BYTES;
+    // `-headerpad <n>` overrides; `-headerpad_max_install_names` lands
+    // here as Some(0x1000). Anything below the wild default would
+    // re-collide with codesign post-link, so floor it.
+    sz += args
+        .headerpad
+        .map(|n| n.max(DEFAULT_HEADERPAD_BYTES))
+        .unwrap_or(DEFAULT_HEADERPAD_BYTES);
 
     // __text must start on a 4-byte boundary (ARM64 instructions).
     (sz + TEXT_ALIGNMENT_BYTES - 1) & !(TEXT_ALIGNMENT_BYTES - 1)
@@ -2861,6 +3003,13 @@ pub(crate) struct MachOResolutionExt {
     pub(crate) got_address: Option<u64>,
     /// PLT stub address (if the symbol needs a dynamic call stub).
     pub(crate) plt_address: Option<u64>,
+    /// `__DATA,__objc_selrefs` slot for `_objc_msgSend$<sel>` stubs.
+    /// The slot is rebased at link time to point at the inline
+    /// methname inside the stub's `__stubs` slot; dyld+objc rewrite
+    /// it to the canonical SEL during image load via
+    /// `sel_registerName`. `None` for any symbol that isn't an ObjC
+    /// selector stub.
+    pub(crate) selref_address: Option<u64>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -2940,6 +3089,10 @@ impl<'data> Iterator for MachOSectionIter<'data> {
 }
 
 impl platform::Platform for MachO {
+    const ALL_WEAK_MIN_VISIBILITY: bool = true;
+    const PROMOTE_WEAK_TO_EXPORT_DYNAMIC: bool = true;
+    const APPLY_HIDDEN_VIS_DOWNGRADE_TO_DEFS: bool = true;
+
     type File<'data> = File<'data>;
     type SymtabEntry = SymtabEntry;
     type SectionHeader = SectionHeader;
@@ -3062,6 +3215,15 @@ impl platform::Platform for MachO {
         section_index: object::SectionIndex,
     ) -> Vec<crate::layout::Atom> {
         compute_atoms(file, section_index)
+    }
+
+    fn compute_atom_output_offsets<'data>(
+        file: &<Self as platform::Platform>::File<'data>,
+        section_index: object::SectionIndex,
+        atoms: &[crate::layout::Atom],
+        symbol_order: &std::collections::HashMap<String, u32>,
+    ) -> Option<(Vec<u64>, u64)> {
+        compute_atom_output_offsets(file, section_index, atoms, symbol_order)
     }
 
     fn scan_atom_relocations<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -3281,11 +3443,7 @@ impl platform::Platform for MachO {
                         relocs.iter().copied().collect();
                     for (idx, r) in relocs.iter().enumerate() {
                         let ri = r.info(le);
-                        if ri.r_type == 7
-                            && ri.r_length == 2
-                            && ri.r_pcrel
-                            && ri.r_extern
-                        {
+                        if ri.r_type == 7 && ri.r_length == 2 && ri.r_pcrel && ri.r_extern {
                             let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
                             let local_id = state.symbol_id_range.input_to_id(sym_idx);
                             let sym_id = resources.symbol_db.definition(local_id);
@@ -3314,19 +3472,12 @@ impl platform::Platform for MachO {
                                 && next.r_extern
                                 && next.r_address == ri.r_address
                             {
-                                let sym_idx =
-                                    object::SymbolIndex(next.r_symbolnum as usize);
-                                let local_id =
-                                    state.symbol_id_range.input_to_id(sym_idx);
+                                let sym_idx = object::SymbolIndex(next.r_symbolnum as usize);
+                                let local_id = state.symbol_id_range.input_to_id(sym_idx);
                                 let sym_id = resources.symbol_db.definition(local_id);
-                                let prev = resources
-                                    .per_symbol_flags
-                                    .get_atomic(sym_id)
-                                    .get();
+                                let prev = resources.per_symbol_flags.get_atomic(sym_id).get();
                                 if !prev.has_resolution() {
-                                    queue.send_symbol_request::<A>(
-                                        sym_id, resources, scope,
-                                    );
+                                    queue.send_symbol_request::<A>(sym_id, resources, scope);
                                 }
                             }
                         }
@@ -3698,6 +3849,40 @@ impl platform::Platform for MachO {
             location: None,
             secondary_order: None,
         };
+        // `__DATA,__objc_selrefs` — synthesised, one 8-byte pointer per
+        // `_objc_msgSend$<sel>` stub. Flags `S_LITERAL_POINTERS |
+        // S_ATTR_NO_DEAD_STRIP` (0x10000005) tell the ObjC runtime
+        // (via dyld's image registration) to walk the section and
+        // canonicalise each pointer through `sel_registerName`. Without
+        // this `objc_msgSend` aborts dispatch on a SEL pointer
+        // mismatch (the warning the runtime emits before
+        // `doesNotRecognizeSelector:` forwarding).
+        infos[crate::output_section_id::OBJC_SELREFS.as_usize()] = SectionOutputInfo {
+            kind: SectionKind::Primary(SectionName(b"__objc_selrefs")),
+            section_attributes: SectionAttributes {
+                flags: macho::S_LITERAL_POINTERS | macho::S_ATTR_NO_DEAD_STRIP,
+                segname: *b"__DATA\0\0\0\0\0\0\0\0\0\0",
+            },
+            min_alignment: crate::alignment::GOT_ENTRY,
+            location: None,
+            secondary_order: None,
+        };
+        // `__DATA,__objc_imageinfo` — version+flags struct that tells
+        // dyld+objc this image is an Objective-C image so the runtime
+        // walks our `__objc_selrefs` / `__objc_classrefs` etc. on
+        // image load. Without it the SEL pointers in `__objc_selrefs`
+        // never get canonicalised and `_objc_msgSend` aborts with the
+        // "selector does not match" warning.
+        infos[crate::output_section_id::OBJC_IMAGEINFO.as_usize()] = SectionOutputInfo {
+            kind: SectionKind::Primary(SectionName(b"__objc_imageinfo")),
+            section_attributes: SectionAttributes {
+                flags: macho::S_ATTR_NO_DEAD_STRIP,
+                segname: *b"__DATA\0\0\0\0\0\0\0\0\0\0",
+            },
+            min_alignment: crate::alignment::MIN,
+            location: None,
+            secondary_order: None,
+        };
         infos
     }
 
@@ -3971,7 +4156,28 @@ impl platform::Platform for MachO {
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
-        if flags.needs_plt() {
+        if flags.contains(crate::value_flags::ValueFlags::OBJC_STUB) {
+            // ObjC selector stub: 32-byte stub instructions + room for
+            // a NUL-terminated methname inline. We reserve a fixed
+            // worst-case (`OBJC_STUB_SLOT_BYTES`) per stub so the
+            // per-symbol cursor advances by a constant amount that
+            // `create_resolution` can mirror without re-deriving the
+            // selector from the symbol name. Selectors longer than
+            // `OBJC_STUB_MAX_SELECTOR` chars (incl. NUL) get truncated
+            // at write time — Apple's longest published selectors are
+            // around 60 chars, so 64 is comfortably enough.
+            mem_sizes.increment(crate::part_id::PLT_GOT, OBJC_STUB_SLOT_BYTES);
+            // Per-stub GOT slot is bound to `_objc_msgSend` so each
+            // stub is self-contained; the stub loads `_objc_msgSend`
+            // through this slot and tail-calls.
+            mem_sizes.increment(crate::part_id::GOT, 8);
+            // Per-stub `__objc_selrefs` slot — 8-byte pointer rebased
+            // to the methname address so dyld+objc canonicalise it to
+            // a registered SEL at image load. Without this the SEL the
+            // stub passes to `_objc_msgSend` is a raw `char*` and
+            // dispatch aborts on the SEL-pointer mismatch.
+            mem_sizes.increment(crate::part_id::OBJC_SELREFS, 8);
+        } else if flags.needs_plt() {
             // Mach-O stubs are 12 bytes (adrp + ldr + br)
             mem_sizes.increment(crate::part_id::PLT_GOT, 12);
             // Each stub needs a GOT entry (8 bytes) for the dyld bind target
@@ -4021,8 +4227,21 @@ impl platform::Platform for MachO {
     ) -> crate::layout::Resolution<Self> {
         let mut got_address = None;
         let mut plt_address = None;
+        let mut selref_address = None;
 
-        if flags.needs_plt() {
+        if flags.contains(crate::value_flags::ValueFlags::OBJC_STUB) {
+            let got_addr = *memory_offsets.get(crate::part_id::GOT);
+            *memory_offsets.get_mut(crate::part_id::GOT) += 8;
+            got_address = Some(got_addr);
+
+            let plt_addr = *memory_offsets.get(crate::part_id::PLT_GOT);
+            *memory_offsets.get_mut(crate::part_id::PLT_GOT) += OBJC_STUB_SLOT_BYTES;
+            plt_address = Some(plt_addr);
+
+            let sel_addr = *memory_offsets.get(crate::part_id::OBJC_SELREFS);
+            *memory_offsets.get_mut(crate::part_id::OBJC_SELREFS) += 8;
+            selref_address = Some(sel_addr);
+        } else if flags.needs_plt() {
             let got_addr = *memory_offsets.get(crate::part_id::GOT);
             *memory_offsets.get_mut(crate::part_id::GOT) += 8;
             got_address = Some(got_addr);
@@ -4071,6 +4290,7 @@ impl platform::Platform for MachO {
             format_specific: MachOResolutionExt {
                 got_address,
                 plt_address,
+                selref_address,
             },
         }
     }
@@ -4145,6 +4365,16 @@ impl platform::Platform for MachO {
         // `macho_writer::write_headers` then splits the merged DATA
         // region at this boundary into __DATA_CONST + __DATA.
         builder.add_section(output_section_id::RELRO_PADDING);
+        // `__DATA,__objc_selrefs` lives in the writable __DATA segment
+        // so dyld+objc can rewrite each slot to the canonical SEL at
+        // image load (`sel_registerName` over each entry). Place it
+        // AFTER `RELRO_PADDING` so the segment carve-out lands it on
+        // the writable side of the __DATA_CONST/__DATA split — the
+        // section header's segname is `__DATA`, and a mismatch with
+        // the actual VM range tripped a SIGKILL at load with our first
+        // attempt.
+        builder.add_section(output_section_id::OBJC_SELREFS);
+        builder.add_section(output_section_id::OBJC_IMAGEINFO);
         builder.add_section(output_section_id::DATA);
         builder.add_section(output_section_id::CSTRING); // __DATA,__const
         builder.add_section(output_section_id::PREINIT_ARRAY); // __thread_vars
@@ -4208,6 +4438,28 @@ const MACHO_SECTION_RULES: &[crate::layout_rules::SectionRule<'static>] = {
         SectionRule::exact_section(b"__unwind_info", output_section_id::RODATA),
         SectionRule::exact_section(b"__eh_frame", output_section_id::EH_FRAME),
         SectionRule::exact_section(b"__compact_unwind", output_section_id::RODATA),
+        // ObjC data sections — pass them through as DATA so the
+        // class-ref / selector-ref / cfstring tables that clang
+        // emits for `[NSException raise:…]` and friends survive
+        // the link. The pointer fields inside still need
+        // resolution (`_OBJC_CLASS_$_NSException` rebases / binds);
+        // synthesising `__objc_stubs` for the
+        // `_objc_msgSend$<selector>` selector-stub ABI is a
+        // separate piece of work tracked in the libunwind ignore
+        // comment.
+        SectionRule::exact_section(b"__objc_classrefs", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_classlist", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_catlist", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_protolist", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_protorefs", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_selrefs", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_imageinfo", output_section_id::OBJC_IMAGEINFO),
+        SectionRule::exact_section(b"__objc_const", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_data", output_section_id::DATA),
+        SectionRule::exact_section(b"__cfstring", output_section_id::DATA),
+        SectionRule::exact_section(b"__objc_methname", output_section_id::RODATA),
+        SectionRule::exact_section(b"__objc_methtype", output_section_id::RODATA),
+        SectionRule::exact_section(b"__objc_classname", output_section_id::RODATA),
     ]
 };
 
