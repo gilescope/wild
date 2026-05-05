@@ -5,7 +5,7 @@ wild's wasm linker. Snapshot date 2026-04-30 (updated post Phase 1).
 
 Current state (after Phase 1 + Phase 3a + targeted wins):
 
-- `lld_wasm_tests`: **144 passed** (was 122), 80 ignored, 0 failed.
+- `lld_wasm_tests`: **145 passed** (was 122), 79 ignored, 0 failed.
 - `wasm_regression_tests`: 2 passed.
 - `--lld-compat` flag (mach-o `-ld64_compat` analog) enabled by the
   test runner; off by default for production users who want speed
@@ -13,6 +13,38 @@ Current state (after Phase 1 + Phase 3a + targeted wins):
 
 The remaining ignored tests sort into roughly 5 buckets by effort
 and risk. Phases run independently and can ship as separate commits.
+
+## Status (2026-05-05 second push — gc_imports)
+
+- ✅ **GC of unreferenced function/global imports** (`gc-imports.s`):
+  new `gc_imports` post-pass after `gc_functions`. Walks surviving
+  bodies for funcidx + globalidx operands, plus roots (entry,
+  exports, table_entries, dylink), compacts `merged.imports`,
+  decrements `num_imported_*`, and remaps every body and metadata
+  field that holds a function-or-global wasm index. Conservative
+  gate: function-import GC is skipped when DATA segments are
+  present — a `TABLE_INDEX_I32` reloc baked into a 4-byte data
+  value pins an import without surfacing in any walker we can run
+  here (`lto/undef.ll`'s `@ptr = global ptr @foo` pinned this).
+  Global-import GC stays unconditional.
+
+  Side fix: spec §4.2 GlobalNames / FunctionNames — when an UNDEF
+  symbol lacks `WASM_SYM_EXPLICIT_NAME`, the linking section omits
+  the name and the import's `field` is the symbol's effective name.
+  Wild's import_*_name_map population now falls back to imp.field
+  for those cases (skipping weak undefs and the linker-internalised
+  PIC bases).
+
+  Tally: **144 → 145**.
+
+  Next phase: Phase 4a metadata-table refactor. comdats.ll's
+  `constantData` ordering (between `comdatFn` rank 1 and
+  `callComdatFn1` rank 1) demonstrates that lld sorts EXPORT by
+  `(sym_pos, cmdline_rank)` not `(cmdline_rank, sym_pos)` —
+  data-as-global GLOBALs interleave by their data sym's position
+  in the source object, not by rank-grouping. The full table is
+  the principled fix; a one-key swap would regress tests that
+  pinned the current rank-first behaviour.
 
 ## Status (2026-05-05 — small contained wins)
 
