@@ -221,6 +221,27 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     /// For platforms that don't support symbol versioning, this can just be the unit type.
     type VerneedTable<'data>: VerneedTable<'data>;
 
+    /// When every alternative definition of a symbol is weak, merge their visibilities
+    /// using `min()` (least-restrictive wins) instead of `max()` (most-restrictive).
+    /// Mach-O's `.weak_def_can_be_hidden` directive (`N_WEAK_DEF | N_WEAK_REF`) hides the
+    /// symbol only if every defining translation unit agrees; a single peer without the
+    /// flag promotes the merged symbol back to default visibility. ELF has no equivalent
+    /// — its `STV_HIDDEN` is unconditional, so the default is `false`.
+    const ALL_WEAK_MIN_VISIBILITY: bool = false;
+
+    /// When `ALL_WEAK_MIN_VISIBILITY` produces a default-visibility merge from at least
+    /// one originally-hidden alternative, force `EXPORT_DYNAMIC` on the selected symbol
+    /// so the layout creates a resolution and the output's exports table can carry the
+    /// promoted symbol. Mach-O needs this; ELF doesn't.
+    const PROMOTE_WEAK_TO_EXPORT_DYNAMIC: bool = false;
+
+    /// Apply `DOWNGRADE_TO_LOCAL | NON_INTERPOSABLE` to defined externals whose input
+    /// visibility is `Hidden`. Mach-O uses this so that `weak_def_can_be_hidden`
+    /// (`N_WEAK_DEF | N_WEAK_REF`) and `private_extern` (`N_PEXT`) symbols stay out of
+    /// the exports trie. ELF keeps the existing flow where hidden defs only get
+    /// `NON_INTERPOSABLE` and dynsym inclusion is gated separately.
+    const APPLY_HIDDEN_VIS_DOWNGRADE_TO_DEFS: bool = false;
+
     /// Invoke the linker for requested architecture.
     fn link_for_arch<'data>(
         linker: &'data crate::Linker,
@@ -344,6 +365,21 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
         _section_index: object::SectionIndex,
     ) -> Vec<layout::Atom> {
         Vec::new()
+    }
+
+    /// For an `MH_SUBSECTIONS_VIA_SYMBOLS` section whose atoms have
+    /// at least one anchor symbol named in `-order_file` (`symbol_order`),
+    /// returns `(per-atom output offset, total section size)` after
+    /// reordering atoms by priority. Returns `None` when no reorder is
+    /// needed (every atom unranked, or sorted order matches input
+    /// order). Default: `None` — only Mach-O reorders subsections.
+    fn compute_atom_output_offsets<'data>(
+        _file: &<Self as Platform>::File<'data>,
+        _section_index: object::SectionIndex,
+        _atoms: &[layout::Atom],
+        _symbol_order: &std::collections::HashMap<String, u32>,
+    ) -> Option<(Vec<u64>, u64)> {
+        None
     }
 
     /// Scans the subset of an input section's relocations whose
@@ -1273,6 +1309,16 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         None
     }
 
+    /// Symbol-order map from `-order_file` (Mach-O). Maps each symbol name
+    /// listed in the order file to its priority (0-based index in the file).
+    /// Empty when no order file was provided. Used by Mach-O subsection
+    /// reordering; ELF returns the empty default.
+    fn symbol_order(&self) -> &std::collections::HashMap<String, u32> {
+        static EMPTY: std::sync::OnceLock<std::collections::HashMap<String, u32>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(std::collections::HashMap::new)
+    }
+
     /// Path to libLTO.dylib for native LTO compilation (Mach-O -lto_library).
     fn lto_library_path(&self) -> Option<&Path> {
         None
@@ -1330,6 +1376,16 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
 
     /// Returns whether multiple symbols with the same name should be permitted.
     fn allow_multiple_definitions(&self) -> bool {
+        false
+    }
+
+    /// Returns whether multiple-definition collisions should emit a
+    /// warning instead of being silently dropped. Implies
+    /// `allow_multiple_definitions`. Lld's `--noinhibit-exec` sets this:
+    /// the link succeeds, the first definition wins, and a one-line
+    /// `warning: duplicate symbol: <name>` goes to stderr per
+    /// collision.
+    fn warn_multiple_definitions(&self) -> bool {
         false
     }
 

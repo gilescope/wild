@@ -197,6 +197,12 @@ const KNOWN_PASSING: &[&str] = &[
     // their suffix demangled to `undefined_weak:bar(int)`. EXPORT
     // names stay raw — only the name-section presentation changes.
     "name-section-mangling",
+    // `--noinhibit-exec` now emits `warning: duplicate symbol: <name>`
+    // per collision in addition to setting allow_multiple_definitions
+    // (lld behaviour). `-z muldefs` is wired up as the silent variant
+    // (no warning). `allow-multiple-definition.s` checks both paths
+    // plus the default-error and `--fatal-warnings` cases.
+    "allow-multiple-definition",
     // `func-attr` (already passing) emits a custom section with
     // `<sym>@FUNCINDEX` payloads. `func-attr-tombstone` tests the
     // GC'd-symbol tombstone case: when a symbol's function got

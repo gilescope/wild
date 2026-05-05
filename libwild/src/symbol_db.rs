@@ -1263,10 +1263,27 @@ fn process_alternatives<'data, P: Platform>(
         // the visibility we'll use for our selected symbol. This seems like odd behaviour, but it
         // matches what GNU ld appears to do and some programs will fail to link if we don't do
         // this.
+        //
+        // Platform exception (Mach-O via `ALL_WEAK_MIN_VISIBILITY`): if every alternative is a
+        // weak definition, take the *least* restrictive visibility instead. Mach-O's
+        // `weak_def_can_be_hidden` directive (`N_WEAK_DEF | N_WEAK_REF`) hides the symbol only
+        // if every defining translation unit agrees; a single peer without the flag must
+        // promote the merged symbol back to default visibility. ELF has no equivalent —
+        // `STV_HIDDEN` is unconditional, so this branch stays off.
+        let all_weak = P::ALL_WEAK_MIN_VISIBILITY
+            && std::iter::once(first)
+                .chain(alternatives.iter().copied())
+                .all(|id| symbol_db.symbol_strength(id, resolved) == SymbolStrength::Weak);
+        let saw_hidden_alternative = all_weak
+            && (symbol_db.input_symbol_visibility(first) == Visibility::Hidden
+                || alternatives
+                    .iter()
+                    .any(|id| symbol_db.input_symbol_visibility(*id) == Visibility::Hidden));
         let visibility = alternatives
             .iter()
             .fold(symbol_db.input_symbol_visibility(first), |vis, id| {
-                vis.max(symbol_db.input_symbol_visibility(*id))
+                let other = symbol_db.input_symbol_visibility(*id);
+                if all_weak { vis.min(other) } else { vis.max(other) }
             });
 
         match select_symbol(symbol_db, per_symbol_flags, first, &alternatives, resolved) {
@@ -1280,9 +1297,24 @@ fn process_alternatives<'data, P: Platform>(
                 if visibility != Visibility::Default {
                     handle_non_default_visibility(per_symbol_flags, first, visibility);
 
-                    for alt in alternatives {
-                        handle_non_default_visibility(per_symbol_flags, alt, visibility);
+                    for alt in &alternatives {
+                        handle_non_default_visibility(per_symbol_flags, *alt, visibility);
                     }
+                } else if P::PROMOTE_WEAK_TO_EXPORT_DYNAMIC && saw_hidden_alternative {
+                    // The min-visibility merge promoted at least one originally-hidden
+                    // weak alternative back to default. Clear any `DOWNGRADE_TO_LOCAL`
+                    // that load_symbols set on the originally-hidden alternatives, then
+                    // force `EXPORT_DYNAMIC` on the selected symbol. Without the export
+                    // flag, an unreferenced weak def would skip the resolution pipeline
+                    // (no `has_resolution`) and never reach the exports trie.
+                    for id in std::iter::once(first).chain(alternatives.iter().copied()) {
+                        per_symbol_flags
+                            .get_atomic(id)
+                            .remove(ValueFlags::DOWNGRADE_TO_LOCAL);
+                    }
+                    per_symbol_flags
+                        .get_atomic(selected)
+                        .or_assign(ValueFlags::EXPORT_DYNAMIC);
                 }
             }
             Err(err) => {
@@ -1370,16 +1402,23 @@ fn select_symbol<'data, P: Platform>(
             // We don't implement full COMDAT logic, however if we encounter duplicate
             // strong definitions, then we don't emit errors if all the strong definitions
             // are defined in COMDAT group sections.
-            if (!symbol_db.is_in_comdat_group(existing, resolved)
-                || !symbol_db.is_in_comdat_group(id, resolved))
-                && !symbol_db.db.args.allow_multiple_definitions()
-            {
-                bail!(
-                    "duplicate symbol: {}: {}: {}",
-                    symbol_db.file(symbol_db.file_id_for_symbol(id)),
-                    symbol_db.file(symbol_db.file_id_for_symbol(existing)),
-                    symbol_db.symbol_name_for_display(first_id),
-                );
+            let comdat_protected = symbol_db.is_in_comdat_group(existing, resolved)
+                && symbol_db.is_in_comdat_group(id, resolved);
+            if !comdat_protected {
+                if !symbol_db.db.args.allow_multiple_definitions() {
+                    bail!(
+                        "duplicate symbol: {}: {}: {}",
+                        symbol_db.file(symbol_db.file_id_for_symbol(id)),
+                        symbol_db.file(symbol_db.file_id_for_symbol(existing)),
+                        symbol_db.symbol_name_for_display(first_id),
+                    );
+                }
+                if symbol_db.db.args.warn_multiple_definitions() {
+                    eprintln!(
+                        "warning: duplicate symbol: {}",
+                        symbol_db.symbol_name_for_display(first_id),
+                    );
+                }
             }
         }
 
@@ -2066,6 +2105,17 @@ trait SymbolLoader<'data, P: Platform> {
             if symbol.is_local() {
                 sink.set_next(flags, resolution, file_id);
                 continue;
+            }
+
+            // Mach-O: a defined external whose input visibility is `Hidden` (either
+            // `N_PEXT` or `weak_def_can_be_hidden` = `N_WEAK_DEF | N_WEAK_REF`) must not
+            // leak into the exports trie. Apply `DOWNGRADE_TO_LOCAL | NON_INTERPOSABLE`
+            // here so the writer's trie loop (which keys on `is_downgraded_to_local`)
+            // can filter it out without a separate visibility lookup. The merge in
+            // `process_alternatives` clears these flags again if a peer definition
+            // promotes the merged visibility back to default.
+            if P::APPLY_HIDDEN_VIS_DOWNGRADE_TO_DEFS && symbol.visibility() == Visibility::Hidden {
+                flags |= ValueFlags::DOWNGRADE_TO_LOCAL | ValueFlags::NON_INTERPOSABLE;
             }
 
             let info = self.get_symbol_name_and_version(symbol, local_index)?;

@@ -62,6 +62,12 @@ pub struct WasmArgs {
     pub(crate) initial_heap: Option<u64>,
     /// Allow multiple definitions (--allow-multiple-definition).
     pub(crate) allow_multiple_definitions: bool,
+    /// Emit `warning: duplicate symbol: <name>` per collision and
+    /// continue. Implies `allow_multiple_definitions`. Set by
+    /// `--noinhibit-exec`; left off for plain
+    /// `--allow-multiple-definition` and `-z muldefs`, which lld
+    /// silences.
+    pub(crate) warn_multiple_definitions: bool,
     /// `-rpath` / `--rpath` entries — runtime library search paths
     /// emitted as the dylink.0 RuntimePath subsection (id 5).
     /// `rpath.s` pins this for the wasm dynamic-linker convention.
@@ -216,6 +222,7 @@ impl Default for WasmArgs {
             global_base: None,
             initial_heap: None,
             allow_multiple_definitions: false,
+            warn_multiple_definitions: false,
             rpath: Vec::new(),
             force_undefined: Vec::new(),
             stub_unresolved_functions: false,
@@ -342,6 +349,10 @@ impl platform::Args for WasmArgs {
         self.allow_multiple_definitions
     }
 
+    fn warn_multiple_definitions(&self) -> bool {
+        self.warn_multiple_definitions
+    }
+
     fn force_undefined_symbol_names(&self) -> &[String] {
         &self.force_undefined
     }
@@ -434,10 +445,15 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             "--no-allow-multiple-definition" => args.allow_multiple_definitions = false,
             // `--noinhibit-exec`: lld convention for "let the link
             // succeed even with errors, downgrade fatal duplicate-
-            // symbol errors to warnings". Wild treats this as an
-            // alias for --allow-multiple-definition for now; the
-            // symbol_db doesn't emit per-input warnings yet.
-            "--noinhibit-exec" => args.allow_multiple_definitions = true,
+            // symbol errors to warnings". Implies
+            // `--allow-multiple-definition` *and* prints a one-line
+            // `warning: duplicate symbol: <name>` per collision —
+            // distinct from plain `--allow-multiple-definition` /
+            // `-z muldefs`, which lld silences entirely.
+            "--noinhibit-exec" => {
+                args.allow_multiple_definitions = true;
+                args.warn_multiple_definitions = true;
+            }
             // `-Bsymbolic`: bind locally to defined symbols in shared
             // libraries. Only meaningful with `-shared`; for an
             // executable link lld emits a warning, then proceeds.
@@ -527,6 +543,12 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                     let val = val.as_ref();
                     if let Some(size) = val.strip_prefix("stack-size=") {
                         args.stack_size = size.parse().ok();
+                    } else if val == "muldefs" {
+                        // `-z muldefs` is the lld/binutils synonym for
+                        // `--allow-multiple-definition` (silent — no
+                        // warning). Distinct from `--noinhibit-exec`,
+                        // which sets `warn_multiple_definitions` too.
+                        args.allow_multiple_definitions = true;
                     }
                     // Other -z flags silently accepted
                 }
