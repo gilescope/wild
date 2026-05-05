@@ -203,6 +203,18 @@ const KNOWN_PASSING: &[&str] = &[
     // (no warning). `allow-multiple-definition.s` checks both paths
     // plus the default-error and `--fatal-warnings` cases.
     "allow-multiple-definition",
+    // `gc-imports.s`: with --gc-sections (default), a function or
+    // global import only reachable from a now-dropped defined function
+    // is itself elided. New `gc_imports` post-pass after `gc_functions`
+    // walks surviving bodies for funcidx + globalidx operands plus
+    // roots (entry, exports, table_entries, dylink), compacts
+    // `merged.imports`, decrements `num_imported_*`, and remaps every
+    // body and metadata field that holds a function-or-global index.
+    // Conservative gate: function-import GC is skipped when DATA
+    // segments are present (a TABLE_INDEX_I32 reloc baked into a
+    // 4-byte data value pins the import without surfacing in any
+    // walker we can run here — `lto/undef.ll` pinned this).
+    "gc-imports",
     // `func-attr` (already passing) emits a custom section with
     // `<sym>@FUNCINDEX` payloads. `func-attr-tombstone` tests the
     // GC'd-symbol tombstone case: when a symbol's function got

@@ -269,6 +269,9 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             &function_origin,
         );
         merged.function_origin = function_origin;
+        // GC of imports: an import only reachable from a now-dropped
+        // defined function can be elided too. Pinned by `gc-imports.s`.
+        gc_imports(&mut merged);
     }
 
     // Strong-undef function refs that survived GC: error out by
@@ -6398,6 +6401,477 @@ fn walk_funcidx_operands(
     Ok(())
 }
 
+/// Walk a function body and report every operand carrying a *global*
+/// index — `global.get` (0x23) and `global.set` (0x24). Mirrors
+/// `walk_funcidx_operands`'s shape so the two stay in sync; only the
+/// callback opcodes differ. `local.get` / `local.set` / `local.tee`
+/// (0x20..=0x22) consume a localidx and are skipped without a
+/// callback. Returns Err on an unrecognised opcode.
+fn walk_globalidx_operands(
+    body: &[u8],
+    mut on_globalidx: impl FnMut(usize, u32),
+) -> crate::error::Result<()> {
+    let mut pos = 0;
+    let (local_count, c) = read_leb128(body)?;
+    pos += c;
+    for _ in 0..local_count {
+        let (_, c) = read_leb128(&body[pos..])?;
+        pos += c + 1;
+    }
+    while pos < body.len() {
+        let opcode = body[pos];
+        pos += 1;
+        match opcode {
+            0x00 | 0x01 | 0x05 | 0x0B | 0x0F | 0x1A | 0x1B | 0x45..=0xC4 | 0xD1 => {}
+            0x02 | 0x03 | 0x04 => {
+                if pos < body.len() {
+                    let b = body[pos];
+                    if b == 0x40 || (0x6B..=0x7F).contains(&b) {
+                        pos += 1;
+                    } else {
+                        let (_, c) = read_sleb128(&body[pos..])?;
+                        pos += c;
+                    }
+                }
+            }
+            0x0C | 0x0D | 0x09 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x0E => {
+                let (count, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                for _ in 0..=count {
+                    let (_, c) = read_leb128(&body[pos..])?;
+                    pos += c;
+                }
+            }
+            0x10 | 0x12 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x11 | 0x13 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x1C => {
+                let (count, c) = read_leb128(&body[pos..])?;
+                pos += c + count;
+            }
+            // local.get / local.set / local.tee — localidx, no callback.
+            0x20..=0x22 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            // global.get / global.set — globalidx, the operand we want.
+            0x23 | 0x24 => {
+                let start = pos;
+                let (idx, c) = read_leb128(&body[pos..])?;
+                on_globalidx(start, idx as u32);
+                pos += c;
+            }
+            0x25 | 0x26 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x28..=0x3E => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x3F | 0x40 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0x41 => {
+                let (_, c) = read_sleb128(&body[pos..])?;
+                pos += c;
+            }
+            0x42 => {
+                let (_, c) = read_sleb128_i64_consumed(&body[pos..])?;
+                pos += c;
+            }
+            0x43 => {
+                if pos + 4 > body.len() {
+                    return Err(crate::error!("wasm globalidx walker: truncated f32.const"));
+                }
+                pos += 4;
+            }
+            0x44 => {
+                if pos + 8 > body.len() {
+                    return Err(crate::error!("wasm globalidx walker: truncated f64.const"));
+                }
+                pos += 8;
+            }
+            0xD0 => {
+                if pos < body.len() {
+                    pos += 1;
+                }
+            }
+            0xD2 => {
+                let (_, c) = read_leb128(&body[pos..])?;
+                pos += c;
+            }
+            0xFC => {
+                let (sub, c) = read_leb128(&body[pos..])?;
+                pos += c;
+                match sub {
+                    0x00..=0x07 => {}
+                    0x08 | 0x0A | 0x0C | 0x0E => {
+                        let (_, c) = read_leb128(&body[pos..])?;
+                        pos += c;
+                        let (_, c) = read_leb128(&body[pos..])?;
+                        pos += c;
+                    }
+                    0x09 | 0x0B | 0x0D | 0x0F | 0x10 | 0x11 => {
+                        let (_, c) = read_leb128(&body[pos..])?;
+                        pos += c;
+                    }
+                    other => {
+                        return Err(crate::error!(
+                            "wasm globalidx walker: unknown 0xFC sub-opcode {other:#x}"
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(crate::error!(
+                    "wasm globalidx walker: unknown opcode {other:#x} at offset {}",
+                    pos - 1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remap globalidx operands in a function body using `index_map`. Mirrors
+/// `remap_call_targets` for the global-index space. Caller is
+/// responsible for ensuring the destination indices fit in the leb's
+/// padding (we use `write_padded_leb128` which preserves byte width).
+fn remap_global_targets(body: &mut [u8], index_map: &[Option<u32>]) {
+    let mut patches: Vec<(usize, u32)> = Vec::new();
+    let walk = walk_globalidx_operands(body, |off, old_idx| {
+        if let Some(Some(new_idx)) = index_map.get(old_idx as usize) {
+            patches.push((off, *new_idx));
+        }
+    });
+    if walk.is_err() {
+        tracing::warn!(
+            "wasm: globalidx remap skipped — body uses an opcode outside the walker's vocabulary"
+        );
+        return;
+    }
+    for (off, new_idx) in patches {
+        write_padded_leb128(body, off, new_idx);
+    }
+}
+
+/// GC of unreferenced function/global imports. Runs *after*
+/// `gc_functions` has dropped dead defined functions: any import only
+/// reachable from a dead defined function is now unreachable from
+/// every surviving body and can be elided from the IMPORT section.
+///
+/// Walks every surviving body for `call` / `return_call` / `ref.func`
+/// (function imports) and `global.get` / `global.set` (global
+/// imports), then compacts `merged.imports`, decrements
+/// `num_imported_functions` / `num_imported_globals`, and rewrites
+/// every body and every metadata field that holds a function-or-
+/// global wasm index.
+///
+/// Pinned by `gc-imports.s`: under default `--gc-sections`, an
+/// unreached `unused_undef_function` import (referenced only by a
+/// GC'd `foo`) and `unused_undef_global` import (no live ref at all)
+/// are dropped from the output's IMPORT section. Imports kept by the
+/// link's roots — the entry function, `WASM_SYM_EXPORTED` /
+/// `--export=` symbols, and indirect-table entries — survive.
+///
+/// Other import kinds (memory, table, tag) are kept as-is for now —
+/// none of the lld-wasm fixtures exercise their per-kind GC and the
+/// reach analysis would need parallel walkers.
+fn gc_imports(merged: &mut MergedModule) {
+    if merged.num_imported_functions == 0 && merged.num_imported_globals == 0 {
+        return;
+    }
+    let n_func_imp = merged.num_imported_functions;
+    let n_glob_imp = merged.num_imported_globals;
+
+    // Conservative: when DATA segments are present, a function pointer
+    // baked into a data byte (TABLE_INDEX_I32 reloc) keeps an import
+    // alive without surfacing in any body, exports, or table_entries
+    // — it lives in 4 bytes of payload that look like any other
+    // numeric data. Without per-input reloc tracking at this stage,
+    // we can't tell which function imports are pinned by such
+    // pointers, so we skip the function-import side of GC entirely.
+    // Pinned by `lto/undef.ll`: `@ptr = global ptr @foo` lands in DATA
+    // and `foo` (UNDEF function) must survive even though no surviving
+    // body calls `foo`. Global-import GC is safe because globals
+    // aren't referenced by raw data-section bytes.
+    let function_imp_gc_safe = merged.data_segments.is_empty();
+
+    // Pass 1: walk surviving bodies + roots, marking which imports
+    // are reached. When function-import GC is disabled, mark every
+    // function import as a root so the remap loop becomes identity
+    // for that kind.
+    let mut reached_func_imp = vec![!function_imp_gc_safe; n_func_imp as usize];
+    let mut reached_glob_imp = vec![false; n_glob_imp as usize];
+
+    for func in &merged.functions {
+        let _ = walk_funcidx_operands(&func.body, |_, idx| {
+            if idx < n_func_imp {
+                reached_func_imp[idx as usize] = true;
+            }
+        });
+        let _ = walk_globalidx_operands(&func.body, |_, idx| {
+            if idx < n_glob_imp {
+                reached_glob_imp[idx as usize] = true;
+            }
+        });
+    }
+
+    // Roots: entry, exported_indices, table_entries — all hold
+    // function indices that may point at an import.
+    if let Some(idx) = merged.entry_function_index
+        && idx < n_func_imp
+    {
+        reached_func_imp[idx as usize] = true;
+    }
+    for &idx in &merged.exported_indices {
+        if idx < n_func_imp {
+            reached_func_imp[idx as usize] = true;
+        }
+    }
+    for &idx in &merged.table_entries {
+        if idx < n_func_imp {
+            reached_func_imp[idx as usize] = true;
+        }
+    }
+    // Layout-bucket / synth globals (e.g. `__memory_base`,
+    // `__table_base`) live at imported global indices in PIC mode and
+    // are roots even if no body uses them — the dynamic linker
+    // resolves them during instantiation.
+    if merged.is_static_pic
+        || merged.memory_base_global_idx.is_some()
+        || merged.table_base_global_idx.is_some()
+    {
+        // Conservative: if any PIC base is registered, keep all
+        // global imports. They're already minimal under PIC and the
+        // dynamic linker may reach them indirectly.
+        for slot in &mut reached_glob_imp {
+            *slot = true;
+        }
+    }
+    // dylink_import_info entries (weak-undef imports under -shared /
+    // -pie) are dynamic-linker contracts — keep their imports alive
+    // even with no static body reference, so the runtime can route a
+    // late-bound resolution back to its slot.
+    for (module, field, _) in &merged.dylink_import_info {
+        for (i, imp) in merged.imports.iter().enumerate() {
+            if &imp.module != module || &imp.field != field {
+                continue;
+            }
+            // Walk to find this import's kind-relative index.
+            let mut fi = 0u32;
+            let mut gi = 0u32;
+            for (j, prev) in merged.imports.iter().enumerate() {
+                if j == i {
+                    match &prev.kind {
+                        ImportKind::Function(_) => {
+                            if (fi as usize) < reached_func_imp.len() {
+                                reached_func_imp[fi as usize] = true;
+                            }
+                        }
+                        ImportKind::Global { .. } => {
+                            if (gi as usize) < reached_glob_imp.len() {
+                                reached_glob_imp[gi as usize] = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
+                match &prev.kind {
+                    ImportKind::Function(_) => fi += 1,
+                    ImportKind::Global { .. } => gi += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Pass 2: build kind-relative remap tables.
+    let new_n_func_imp = reached_func_imp.iter().filter(|&&b| b).count() as u32;
+    let new_n_glob_imp = reached_glob_imp.iter().filter(|&&b| b).count() as u32;
+    if new_n_func_imp == n_func_imp && new_n_glob_imp == n_glob_imp {
+        return; // nothing to do
+    }
+    let mut func_imp_remap: Vec<Option<u32>> = vec![None; n_func_imp as usize];
+    {
+        let mut next = 0u32;
+        for (i, &keep) in reached_func_imp.iter().enumerate() {
+            if keep {
+                func_imp_remap[i] = Some(next);
+                next += 1;
+            }
+        }
+    }
+    let mut glob_imp_remap: Vec<Option<u32>> = vec![None; n_glob_imp as usize];
+    {
+        let mut next = 0u32;
+        for (i, &keep) in reached_glob_imp.iter().enumerate() {
+            if keep {
+                glob_imp_remap[i] = Some(next);
+                next += 1;
+            }
+        }
+    }
+
+    // Build the unified function-index remap: imports compact, then
+    // defined functions shift down by (old_n_func_imp - new_n_func_imp).
+    let n_def_func = merged.functions.len() as u32;
+    let total_func = n_func_imp + n_def_func;
+    let mut func_index_map: Vec<Option<u32>> = vec![None; total_func as usize];
+    for i in 0..n_func_imp {
+        func_index_map[i as usize] = func_imp_remap[i as usize];
+    }
+    for j in 0..n_def_func {
+        func_index_map[(n_func_imp + j) as usize] = Some(new_n_func_imp + j);
+    }
+    // Same for globals.
+    let n_def_glob = merged.globals.len() as u32;
+    let total_glob = n_glob_imp + n_def_glob;
+    let mut glob_index_map: Vec<Option<u32>> = vec![None; total_glob as usize];
+    for i in 0..n_glob_imp {
+        glob_index_map[i as usize] = glob_imp_remap[i as usize];
+    }
+    for j in 0..n_def_glob {
+        glob_index_map[(n_glob_imp + j) as usize] = Some(new_n_glob_imp + j);
+    }
+
+    // Pass 3: filter merged.imports.
+    let mut new_imports: Vec<OutputImport> = Vec::with_capacity(merged.imports.len());
+    let mut fi = 0u32;
+    let mut gi = 0u32;
+    for imp in merged.imports.drain(..) {
+        let keep = match &imp.kind {
+            ImportKind::Function(_) => {
+                let k = reached_func_imp[fi as usize];
+                fi += 1;
+                k
+            }
+            ImportKind::Global { .. } => {
+                let k = reached_glob_imp[gi as usize];
+                gi += 1;
+                k
+            }
+            _ => true,
+        };
+        if keep {
+            new_imports.push(imp);
+        }
+    }
+    merged.imports = new_imports;
+    merged.num_imported_functions = new_n_func_imp;
+    merged.num_imported_globals = new_n_glob_imp;
+
+    // Compact import_global_names: drop entries for unreached global
+    // imports. The Vec is parallel to global imports in import-index
+    // order, so a filter-by-keep is enough.
+    if !reached_glob_imp.iter().all(|&b| b) {
+        let mut new_names = Vec::with_capacity(new_n_glob_imp as usize);
+        for (i, name) in merged.import_global_names.drain(..).enumerate() {
+            if reached_glob_imp.get(i).copied().unwrap_or(false) {
+                new_names.push(name);
+            }
+        }
+        merged.import_global_names = new_names;
+    }
+
+    // Pass 4: rewrite bodies (function indices first, then globals).
+    for func in &mut merged.functions {
+        remap_call_targets(&mut func.body, &func_index_map);
+        remap_global_targets(&mut func.body, &glob_index_map);
+    }
+
+    // Pass 5: rewrite metadata that holds function indices.
+    if let Some(idx) = merged.entry_function_index {
+        merged.entry_function_index = func_index_map.get(idx as usize).copied().flatten();
+    }
+    merged.function_name_map = merged
+        .function_name_map
+        .iter()
+        .filter_map(|(name, &old)| {
+            func_index_map
+                .get(old as usize)
+                .copied()
+                .flatten()
+                .map(|new| (name.clone(), new))
+        })
+        .collect();
+    merged.exported_indices = merged
+        .exported_indices
+        .iter()
+        .filter_map(|&old| func_index_map.get(old as usize).copied().flatten())
+        .collect();
+    merged.no_strip_indices = merged
+        .no_strip_indices
+        .iter()
+        .filter_map(|&old| func_index_map.get(old as usize).copied().flatten())
+        .collect();
+    merged.table_entries = merged
+        .table_entries
+        .iter()
+        .filter_map(|&old| func_index_map.get(old as usize).copied().flatten())
+        .collect();
+    merged.func_to_table_index = merged
+        .table_entries
+        .iter()
+        .enumerate()
+        .map(|(i, &idx)| (idx, (i + 1) as u32))
+        .collect();
+    if let Some(idx) = merged.init_memory_func_idx {
+        merged.init_memory_func_idx = func_index_map.get(idx as usize).copied().flatten();
+    }
+    // Wrappers: original-fn idx → wrapper-fn idx. Both are defined
+    // (>= old n_func_imp), but their entries shift through the map.
+    merged.export_wrappers = merged
+        .export_wrappers
+        .iter()
+        .filter_map(|(&orig, &wrap)| {
+            let new_orig = func_index_map.get(orig as usize).copied().flatten()?;
+            let new_wrap = func_index_map.get(wrap as usize).copied().flatten()?;
+            Some((new_orig, new_wrap))
+        })
+        .collect();
+
+    // Pass 6: rewrite metadata that holds global indices.
+    if let Some(idx) = merged.memory_base_global_idx {
+        merged.memory_base_global_idx = glob_index_map.get(idx as usize).copied().flatten();
+    }
+    if let Some(idx) = merged.table_base_global_idx {
+        merged.table_base_global_idx = glob_index_map.get(idx as usize).copied().flatten();
+    }
+
+    // Pass 7: rewrite global init exprs (defined globals can carry a
+    // single `global.get importidx` that references an imported
+    // base — typical PIC pattern). Init-expr encoding is one of:
+    //   0x23 globalidx 0x0B   global.get base
+    //   0x41 sleb 0x0B        i32.const  k
+    //   0x42 sleb 0x0B        i64.const  k
+    // We only need to remap the global.get form.
+    for g in &mut merged.globals {
+        // Defined globals' init values are currently stored as
+        // numeric constants (init_value: u64), not as init-expr
+        // bytes — there's nothing global-index-bearing to remap.
+        // If/when wild grows a `global.get`-init-expr representation,
+        // this is the place to remap it.
+        let _ = g;
+    }
+}
+
 /// Consume an SLEB128 i64 and return (value, bytes_consumed).
 fn read_sleb128_i64_consumed(data: &[u8]) -> crate::error::Result<(i64, usize)> {
     let mut result: i64 = 0;
@@ -10737,11 +11211,26 @@ fn merge_inputs(
                                 && (s.flags & 0x10) != 0
                                 && s.index == input_func_imp_idx
                         });
-                    if let Some(name) = undef_sym
-                        .filter(|s| !s.name.is_empty())
-                        .map(|s| s.name.clone())
-                    {
-                        import_function_name_map.push((name, import_wasm_idx));
+                    // Per spec §4.2: if `WASM_SYM_EXPLICIT_NAME`
+                    // (0x40) is NOT set on an UNDEF function symbol,
+                    // the linking section omits the name and the
+                    // import's field is the symbol's effective name.
+                    // Fall back to `imp.field` so wild's name custom
+                    // section's FunctionNames subsection emits a row
+                    // for the import (lld behaviour). Only fall back
+                    // for non-weak undefs — weak undefs go through
+                    // wild's stub-synthesis path which registers the
+                    // name itself, and double-pushing here would land
+                    // the import_wasm_idx in `function_name_map` for
+                    // a name whose stub has a *defined-function* idx.
+                    let is_weak = undef_sym.is_some_and(|s| (s.flags & 0x01) != 0);
+                    let resolved_name: Vec<u8> = match undef_sym {
+                        Some(s) if !s.name.is_empty() => s.name.clone(),
+                        Some(_) if !is_weak => imp.field.clone(),
+                        _ => Vec::new(),
+                    };
+                    if !resolved_name.is_empty() {
+                        import_function_name_map.push((resolved_name, import_wasm_idx));
                     }
                     // dylink.0 ImportInfo: track weak-undef function
                     // imports so the dynamic linker knows to tolerate
@@ -10821,16 +11310,15 @@ fn merge_inputs(
                     // that here so `weak-undefined-pic.s`'s
                     // `GlobalNames: [..., 2=foo]` entry surfaces.
                     let import_wasm_idx = num_imported_globals;
-                    let sym_name = obj_info
-                        .parsed
-                        .symbols
-                        .iter()
-                        .find(|s| {
-                            s.kind == 2
-                                && (s.flags & 0x10) != 0
-                                && s.index == input_global_imp_idx
-                                && !s.name.is_empty()
-                        })
+                    // Locate the UNDEF global symbol pointing at this
+                    // input's global-import index. Filter on weak so
+                    // we don't override wild's weak-undef stub path.
+                    let undef_sym = obj_info.parsed.symbols.iter().find(|s| {
+                        s.kind == 2 && (s.flags & 0x10) != 0 && s.index == input_global_imp_idx
+                    });
+                    let is_weak = undef_sym.is_some_and(|s| (s.flags & 0x01) != 0);
+                    let sym_name = undef_sym
+                        .filter(|s| !s.name.is_empty())
                         .map(|s| s.name.clone());
                     if let Some(name) = sym_name {
                         import_global_name_map.push((name, import_wasm_idx));
@@ -10839,6 +11327,30 @@ fn merge_inputs(
                         || imp.module == b"GOT.data")
                         && !imp.field.is_empty()
                     {
+                        import_global_name_map.push((imp.field.clone(), import_wasm_idx));
+                    } else if !is_weak
+                        && undef_sym.is_some()
+                        && !imp.field.is_empty()
+                        // Skip the linker-internalised PIC bases —
+                        // wild handles their names in the
+                        // `import_global_name_map.push` calls earlier
+                        // (when in PIC mode) or replaces them with
+                        // defined globals (non-PIC). Double-pushing
+                        // here lands `__memory_base` / `__table_base`
+                        // in the name section pointing at an idx that
+                        // doesn't survive to the output.
+                        && imp.field != b"__memory_base".as_slice()
+                        && imp.field != b"__table_base".as_slice()
+                        && imp.field != b"__tls_base".as_slice()
+                        && imp.field != b"__stack_pointer".as_slice()
+                    {
+                        // Per spec §4.2: if `WASM_SYM_EXPLICIT_NAME`
+                        // (0x40) is NOT set on an UNDEF global symbol,
+                        // the linking section omits the name and the
+                        // import's field is the symbol's effective
+                        // name. Pinned by `gc-imports.s`'s
+                        // `used_undef_global` IMPORT — needs to land
+                        // in the name section's GlobalNames.
                         import_global_name_map.push((imp.field.clone(), import_wasm_idx));
                     }
                     num_imported_globals += 1;
