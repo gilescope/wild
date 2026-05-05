@@ -1,4 +1,29 @@
-# subsections-via-symbols: Per-Symbol Section Splitting
+# subsections-via-symbols: Per-Symbol Section Splitting — DONE; order-file reorder added 2026-04-27
+
+The base subsections-via-symbols feature shipped earlier — `subsection_tracking`,
+per-atom GC, and alignment-padding deltas all live in
+`libwild/src/layout.rs::SubsectionTracking` and `libwild/src/macho.rs::compute_atoms`.
+The plan below describes the original design; what shipped diverged from it
+(deltas via `section_relax_deltas` rather than a new offset map), but the goal
+landed.
+
+`-order_file` reorder shipped 2026-04-27. Atoms in `MH_SUBSECTIONS_VIA_SYMBOLS`
+sections are now placed at custom output offsets when the order file ranks at
+least one anchor in the section. New surface:
+
+- `Platform::compute_atom_output_offsets` — Mach-O override returns
+  `(per-atom output offset, total section size)` when reorder is required.
+- `Args::symbol_order()` — exposes `MachOArgs::symbol_order` to the layout
+  pass; defaults to an empty map for ELF.
+- `SubsectionTracking::atom_output_offsets: Option<Vec<u64>>` — when `Some`,
+  drives input→output offset translation (via
+  `SubsectionTracking::input_to_output_offset`) and section-byte placement
+  (via `copy_section_with_atom_reorder`). Mutually exclusive with
+  `section_relax_deltas` for the same section.
+
+The rest of this file is the original analysis, kept for context.
+
+---
 
 ## Problem
 

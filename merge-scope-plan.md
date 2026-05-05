@@ -1,4 +1,24 @@
-# merge-scope: Weak Def Visibility Merging
+# merge-scope: Weak Def Visibility Merging — DONE 2026-04-27
+
+**Status: implemented.** The `sold-macho/merge-scope` test passes; nothing else
+regressed. Three platform-gated constants on the `Platform` trait carry the
+Mach-O-specific behaviour, defaulting to `false` so ELF stays untouched:
+
+| Const                                       | Mach-O | Effect                                                                                                                                              |
+| ------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALL_WEAK_MIN_VISIBILITY`                   | true   | When every alternative is weak, merge visibility with `min()` instead of `max()` so a single non-`weak_def_can_be_hidden` peer promotes to default. |
+| `PROMOTE_WEAK_TO_EXPORT_DYNAMIC`            | true   | When the merge promotes an originally-hidden alternative back to default, clear `DOWNGRADE_TO_LOCAL` and force `EXPORT_DYNAMIC` on the selected.    |
+| `APPLY_HIDDEN_VIS_DOWNGRADE_TO_DEFS`        | true   | At symbol-load time, mark Hidden-visibility defined externals with `DOWNGRADE_TO_LOCAL \| NON_INTERPOSABLE` so the trie writer's existing filter wins.|
+
+Phase 2 (`visibility()` honours `N_WEAK_DEF | N_WEAK_REF` for defined symbols)
+landed in `libwild/src/macho.rs:2367`. Phase 1 (drop the `only_header` gate in
+`write_exports_trie_compat`) landed in `libwild/src/macho_writer.rs:2530`; the
+existing per-symbol filters (`pext_bits`, `is_downgraded_to_local`, `DYNAMIC`)
+keep the C++ inline weak ctors (`weak-def-ref`) out of the trie automatically.
+
+The rest of this file is the original analysis, kept for context.
+
+---
 
 ## Problem
 

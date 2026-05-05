@@ -1,10 +1,11 @@
-# Remaining Mach-O Work — 10 Tests + Architectural Issues
+# Remaining Mach-O Work — 8 Tests + Architectural Issues
 
-Status after session: **124 passed, 10 ignored** (from 100/34).
+Status: **128 passed, 7 ignored** (was 124/10; merge-scope and order-file landed 2026-04-27).
 
 Dedicated plans exist for:
-- `merge-scope-plan.md` — weak def visibility merging
-- `subsections-via-symbols-plan.md` — per-symbol section splitting
+
+- `merge-scope-plan.md` — weak def visibility merging *(DONE 2026-04-27)*
+- `subsections-via-symbols-plan.md` — per-symbol section splitting *(superseded; DONE earlier; order-file reorder added 2026-04-27)*
 - `tls-plan.md` — cross-dylib TLS and mismatch detection
 
 ## Remaining Tests
@@ -87,12 +88,14 @@ undefined error). The stub redirects to `_objc_msgSend` via a regular
 send the wrong selector.
 
 **What's needed**: Full 32-byte stubs that:
+
 1. Load selector string address into x1 from a `__objc_selrefs` entry
 2. Load `_objc_msgSend` address from GOT into x16
 3. Branch to x16
 4. Pad to 32 bytes
 
 This requires:
+
 - A `__TEXT,__objc_methname` section with selector C-strings
 - A `__DATA,__objc_selrefs` section with pointers to the strings
 - 32-byte stub code in `__TEXT,__objc_stubs`
@@ -123,6 +126,7 @@ doesn't follow these re-export chains.
 "undefined" even though Foundation is linked.
 
 **Fix**: Extend `collect_tbd_symbols` and `parse_tbd_install_name` to:
+
 1. Parse `re-exports:` entries from `.tbd` files
 2. Resolve re-exported library paths (may use `@rpath`, install names)
 3. Recursively collect symbols from re-exported `.tbd` files
