@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["host", "plugin"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+
+[profile.dev]
+# Opt out of incremental compilation — we want the full re-link on
+# every change so the "how fast is wild?" signal is honest. Flip
+# back to incremental = true to see the cache do its thing.
+incremental = false

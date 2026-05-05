@@ -1,0 +1,18 @@
+# Point rustc at wild for every target this workspace builds.
+# Adjust the path if you move wild's checkout. `cargo build`
+# resolves the env_forcing relative to this config file, so the
+# `target/release/wild` reference is relative to wild's repo root.
+
+[target.aarch64-apple-darwin]
+linker = "../../target/release/wild"
+
+[target.x86_64-apple-darwin]
+linker = "../../target/release/wild"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=../../target/release/wild"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=../../target/release/wild"]

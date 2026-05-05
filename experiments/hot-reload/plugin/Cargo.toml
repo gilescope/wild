@@ -1,0 +1,10 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+# cdylib so there's no rust-ABI surface — only the extern "C" fns.
+# The host loads this at runtime via libloading.
+crate-type = ["cdylib"]
