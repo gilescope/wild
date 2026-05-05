@@ -5,7 +5,7 @@ wild's wasm linker. Snapshot date 2026-04-30 (updated post Phase 1).
 
 Current state (after Phase 1 + Phase 3a + targeted wins):
 
-- `lld_wasm_tests`: **132 passed** (was 122), 92 ignored, 0 failed.
+- `lld_wasm_tests`: **144 passed** (was 122), 80 ignored, 0 failed.
 - `wasm_regression_tests`: 2 passed.
 - `--lld-compat` flag (mach-o `-ld64_compat` analog) enabled by the
   test runner; off by default for production users who want speed
@@ -13,6 +13,36 @@ Current state (after Phase 1 + Phase 3a + targeted wins):
 
 The remaining ignored tests sort into roughly 5 buckets by effort
 and risk. Phases run independently and can ship as separate commits.
+
+## Status (2026-05-05 — small contained wins)
+
+- ✅ **`allow-multiple-definition.s`**: split `--noinhibit-exec`
+  from `--allow-multiple-definition` / `-z muldefs`. New
+  `Args::warn_multiple_definitions` trait method (default false,
+  overridden by wasm) gates the per-collision
+  `warning: duplicate symbol: <name>` lld emits under
+  `--noinhibit-exec`. Plain `--allow-multiple-definition` and
+  `-z muldefs` stay silent (lld behaviour).
+  Tally: **143 → 144**.
+- 🟡 **`map-file.s` partial fix**: switched per-CODE-row and
+  per-DATA-row offsets to lld's virtual stacking convention
+  (first chunk Off = section_start + 1, Size = body_total;
+  subsequent chunks stack via Off += prev.Size). Pulled segment
+  names from `merged.data_segments[].name` instead of
+  synthesising `.data.N`. Stored `function_origin` as full
+  input path so `<path>:(<sym>)` matches lld's regex.
+  Remaining: per-input data-segment attribution rows + BSS
+  row synthesis for the BSS region not emitted to wasm DATA.
+- ✅ **`__wasm_call_ctors` --export-dynamic suppression**:
+  registered the synth ctor stub in `function_is_hidden` at
+  insertion time so `comdats.ll`, `command-exports.s` and similar
+  --export-dynamic fixtures stop seeing a phantom export. Explicit
+  `--export=__wasm_call_ctors` still works.
+- ✅ **`-l:NAME`**: route the binutils literal-filename library
+  syntax to `InputSpec::Search` instead of `InputSpec::Lib`. Wild
+  no longer searches for `liblibls.a.so` / `liblibls.a.a` for
+  `-l:libls.a`. Pinned by `libsearch.s` (still failing on a
+  deeper archive-extraction issue).
 
 ## Status (2026-05-04 — Phase 4a investigation)
 
