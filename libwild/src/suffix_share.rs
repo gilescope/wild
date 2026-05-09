@@ -8,17 +8,15 @@
 //!
 //! The algorithm is straightforward:
 //!
-//!   1. Sort input strings by reversed byte order. That groups strings
-//!      sharing a common suffix adjacently — e.g. reversed, both
-//!      `"foo"` (→ `"oof"`) and `"bar_foo"` (→ `"oof_rab"`) sort to
-//!      keys starting with `"oof"`, landing next to each other.
-//!   2. Walk the sorted list. If `s[i]` ends with `s[i-1]` (i.e. the
-//!      previous string is a suffix of the current one), skip writing
-//!      `s[i-1]` to the packed buffer — it'll live inside `s[i]`.
-//!   3. Emit each "owner" (not-a-suffix-of-its-successor) to the
-//!      packed buffer. Record its packed offset.
-//!   4. For every string that was skipped, resolve its offset as
-//!      `owner.offset + (owner.len - self.len)`.
+//!   1. Sort input strings by reversed byte order. That groups strings sharing a common suffix
+//!      adjacently — e.g. reversed, both `"foo"` (→ `"oof"`) and `"bar_foo"` (→ `"oof_rab"`) sort
+//!      to keys starting with `"oof"`, landing next to each other.
+//!   2. Walk the sorted list. If `s[i]` ends with `s[i-1]` (i.e. the previous string is a suffix of
+//!      the current one), skip writing `s[i-1]` to the packed buffer — it'll live inside `s[i]`.
+//!   3. Emit each "owner" (not-a-suffix-of-its-successor) to the packed buffer. Record its packed
+//!      offset.
+//!   4. For every string that was skipped, resolve its offset as `owner.offset + (owner.len -
+//!      self.len)`.
 //!
 //! # Packed-size bound
 //!

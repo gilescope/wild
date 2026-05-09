@@ -3,17 +3,14 @@
 //! Set once by `lib.rs` before calling `P::write_output_file`; read
 //! by the Mach-O writer at two points:
 //!
-//! 1. **Pre-fill** — at the top of `write_direct_inner` we copy the
-//!    previous output's bytes into the new output buffer for every
-//!    "reusable" section (file ranges that are unchanged since the
-//!    last link). This gives those sections their final content
-//!    *before* the platform writer runs.
+//! 1. **Pre-fill** — at the top of `write_direct_inner` we copy the previous output's bytes into
+//!    the new output buffer for every "reusable" section (file ranges that are unchanged since the
+//!    last link). This gives those sections their final content *before* the platform writer runs.
 //!
-//! 2. **Per-section emit filter** — `split_output_for_objects` drops
-//!    contributions whose target output section is reusable so the
-//!    writer never iterates over them. Saves the per-input-section
-//!    work (memcpy + reloc apply) proportional to how much of the
-//!    output is reusable.
+//! 2. **Per-section emit filter** — `split_output_for_objects` drops contributions whose target
+//!    output section is reusable so the writer never iterates over them. Saves the
+//!    per-input-section work (memcpy + reloc apply) proportional to how much of the output is
+//!    reusable.
 //!
 //! Cleared by `lib.rs` after the writer returns. The legacy "all
 //! reusable" speculative-skip (tier-3 phase 2b) still wins when 100 %
@@ -75,9 +72,7 @@ pub(crate) fn set(s: Option<State>) {
 /// local cache today.
 pub(crate) fn contains(id: OutputSectionId) -> bool {
     let guard = STATE.lock().expect("tier3_skip mutex poisoned");
-    guard
-        .as_ref()
-        .is_some_and(|s| s.reusable_ids.contains(&id))
+    guard.as_ref().is_some_and(|s| s.reusable_ids.contains(&id))
 }
 
 /// Run `f` with a borrowed view of the current state, if any. Used

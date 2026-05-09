@@ -460,9 +460,7 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             // `bsymbolic.s` checks for that exact warning text.
             "-Bsymbolic" | "-Bsymbolic-functions" => {
                 if !args.is_shared {
-                    eprintln!(
-                        "warning: -Bsymbolic is only meaningful when combined with -shared"
-                    );
+                    eprintln!("warning: -Bsymbolic is only meaningful when combined with -shared");
                 }
             }
 
@@ -562,7 +560,8 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
             "--strip-debug" | "-strip-debug" | "-S" => args.strip = Strip::Debug,
             "--strip-all" | "-strip-all" | "-s" => args.strip = Strip::All,
             _ if arg.starts_with("--keep-section=") => {
-                args.keep_sections.push(arg["--keep-section=".len()..].to_string());
+                args.keep_sections
+                    .push(arg["--keep-section=".len()..].to_string());
             }
 
             // --- Relocatable / shared ---
@@ -788,20 +787,18 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                 args.map_file = Some(MapFileTarget::Stdout);
             }
             _ if arg.starts_with("-Map=") => {
-                args.map_file = Some(MapFileTarget::Path(
-                    std::path::PathBuf::from(&arg["-Map=".len()..]),
-                ));
+                args.map_file = Some(MapFileTarget::Path(std::path::PathBuf::from(
+                    &arg["-Map=".len()..],
+                )));
             }
             _ if arg.starts_with("--Map=") => {
-                args.map_file = Some(MapFileTarget::Path(
-                    std::path::PathBuf::from(&arg["--Map=".len()..]),
-                ));
+                args.map_file = Some(MapFileTarget::Path(std::path::PathBuf::from(
+                    &arg["--Map=".len()..],
+                )));
             }
             "-Map" | "--Map" => {
                 if let Some(p) = iter.next() {
-                    args.map_file = Some(MapFileTarget::Path(
-                        std::path::PathBuf::from(p.as_ref()),
-                    ));
+                    args.map_file = Some(MapFileTarget::Path(std::path::PathBuf::from(p.as_ref())));
                 }
             }
             "--emit-relocs" => args.emit_relocs = true,

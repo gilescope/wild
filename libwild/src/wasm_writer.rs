@@ -135,12 +135,12 @@ impl Buf for Cursor<'_> {
 /// within bounds. The doubling and the 64 KiB tail cover sources
 /// that *can* grow vs the inputs:
 ///
-/// - Linker-synthesised globals (`__stack_pointer`, `__memory_base`,
-///   `__table_base`, `__tls_base`, GOT slots).
+/// - Linker-synthesised globals (`__stack_pointer`, `__memory_base`, `__table_base`, `__tls_base`,
+///   GOT slots).
 /// - Synthesised exports / imports under shared / `--export-dynamic`.
 /// - The element segment for indirect-call targets.
-/// - Re-emitted custom sections (relocs, linking, name) — wild may
-///   write a richer reloc table than the inputs collectively did.
+/// - Re-emitted custom sections (relocs, linking, name) — wild may write a richer reloc table than
+///   the inputs collectively did.
 /// - Padding/alignment between sections.
 ///
 /// For tiny fixtures (≤ 200-byte inputs) the linker overhead
@@ -694,11 +694,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         // imported (the `memory-naming.test` --both case), so the
         // import gate only applies when no explicit export-memory
         // name was set.
-        let export_memory_name = layout
-            .symbol_db
-            .args
-            .export_memory_name
-            .as_deref();
+        let export_memory_name = layout.symbol_db.args.export_memory_name.as_deref();
         let export_memory = if export_memory_name.is_some() {
             !is_shared
         } else {
@@ -714,17 +710,13 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
         //
         // Auto-export semantics (lld/wasm/Writer.cpp::calculateExports,
         // Apache-2.0 with LLVM Exceptions):
-        // - `--export-all` exports every defined global, regardless of
-        //   visibility or mutability.
-        // - `--export-dynamic` exports non-hidden defined globals, but
-        //   GATES linker-synthesized mutable globals (no backing input
-        //   file) on the `mutable-globals` target feature being declared
-        //   by some input. Without that feature the wasm runtime can't
-        //   import a mutable global, so exporting one produces a module
-        //   that won't instantiate. Examples: assembly inputs without
-        //   `.target_features` skip this gate (no mutable-globals → no
-        //   __stack_pointer export); llc-emitted .o files set the
-        //   feature and pass.
+        // - `--export-all` exports every defined global, regardless of visibility or mutability.
+        // - `--export-dynamic` exports non-hidden defined globals, but GATES linker-synthesized
+        //   mutable globals (no backing input file) on the `mutable-globals` target feature being
+        //   declared by some input. Without that feature the wasm runtime can't import a mutable
+        //   global, so exporting one produces a module that won't instantiate. Examples: assembly
+        //   inputs without `.target_features` skip this gate (no mutable-globals → no
+        //   __stack_pointer export); llc-emitted .o files set the feature and pass.
         if !is_shared {
             let export_all = layout.symbol_db.args.export_all;
             let export_dynamic =
@@ -888,8 +880,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                     // `--export-dynamic`; `--export-all` overrides
                     // visibility (it doesn't override binding).
                     !merged.local_functions.contains(name.as_slice())
-                        && (!skip_hidden
-                            || !merged.hidden_functions.contains(name.as_slice()))
+                        && (!skip_hidden || !merged.hidden_functions.contains(name.as_slice()))
                 })
                 .map(|(name, &idx)| (name.clone(), idx))
                 .collect();
@@ -1081,23 +1072,20 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                 .then_with(|| {
                     // Kind tiebreak. Three GLOBAL classes:
                     //   - synth/layout (no `global_export_pos`)
-                    //   - data-as-global (`global_export_pos` entry,
-                    //     from `--export-dynamic` walk over data syms)
+                    //   - data-as-global (`global_export_pos` entry, from `--export-dynamic` walk
+                    //     over data syms)
                     //
                     // Default ordering at same (rank, pos):
                     //   synth GLOBAL → FUNC → data-as-global GLOBAL
                     //
                     // Pinned by:
-                    //   - visibility-hidden.ll: `__stack_pointer`
-                    //     (synth, no entry, output idx 0) precedes
-                    //     the function exports.
-                    //   - mutable-global-exports.s CHECK-SP:
-                    //     `__stack_pointer` (synth) at output GLOBAL
-                    //     idx 0 ties (0, 0) with `_start` (FUNC at
-                    //     output idx 0); test wants synth-first.
-                    //   - weak-symbols.s: `weakGlobal` (data-as-global,
-                    //     sym_pos=2, has entry) shares (1, 2) with
-                    //     FUNC `exportWeak1` and emits AFTER it.
+                    //   - visibility-hidden.ll: `__stack_pointer` (synth, no entry, output idx 0)
+                    //     precedes the function exports.
+                    //   - mutable-global-exports.s CHECK-SP: `__stack_pointer` (synth) at output
+                    //     GLOBAL idx 0 ties (0, 0) with `_start` (FUNC at output idx 0); test wants
+                    //     synth-first.
+                    //   - weak-symbols.s: `weakGlobal` (data-as-global, sym_pos=2, has entry)
+                    //     shares (1, 2) with FUNC `exportWeak1` and emits AFTER it.
                     //
                     // Under `--lld-compat --export-all` (the CHECK-ALL
                     // arm of mutable-global-exports.s), the order
@@ -1401,9 +1389,9 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
                         .iter()
                         .any(|w| w.as_slice() == *existing);
                     let prefer_new = match (is_weak, existing_weak) {
-                        (false, true) => true,                      // strong beats weak
-                        (true, false) => false,                     // keep strong
-                        _ => name.as_slice() < *existing,           // tie → alphabetical
+                        (false, true) => true,            // strong beats weak
+                        (true, false) => false,           // keep strong
+                        _ => name.as_slice() < *existing, // tie → alphabetical
                     };
                     if prefer_new {
                         *existing = name.as_slice();
@@ -1589,10 +1577,7 @@ pub(crate) fn write_direct<A: Arch<Platform = Wasm>>(
             }
             crate::args::wasm::MapFileTarget::Path(p) => {
                 if let Err(e) = std::fs::write(&p, map_text.as_bytes()) {
-                    crate::bail!(
-                        "wild: error: cannot open map file {}: {e}",
-                        p.display()
-                    );
+                    crate::bail!("wild: error: cannot open map file {}: {e}", p.display());
                 }
             }
         }
@@ -1692,8 +1677,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // stub. Stubs occupy the first M defined-function slots
     // (function indices `num_func_imports_final` .. `+M`), matching
     // wasm-ld's layout where the stub appears before all real defs.
-    let mut stub_func_idx_by_name: std::collections::HashMap<Vec<u8>, u32> =
-        Default::default();
+    let mut stub_func_idx_by_name: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     // Sentinel base for "redirect this UNDEF symbol to the eventual
     // stub slot at end-of-table". The actual symbol-table slot of
     // the stub isn't known until the main walk completes, so we
@@ -1701,8 +1685,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // after the deferred stubs are appended.
     const STUB_SENTINEL_BASE: u32 = u32::MAX - 65536;
     let stub_sentinel = |i: u32| STUB_SENTINEL_BASE + i;
-    let mut stub_sentinel_by_name: std::collections::HashMap<Vec<u8>, u32> =
-        Default::default();
+    let mut stub_sentinel_by_name: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     for (i, (name, _)) in sig_mismatch_stubs.iter().enumerate() {
         stub_sentinel_by_name.insert(name.clone(), stub_sentinel(i as u32));
     }
@@ -1720,8 +1703,12 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // value is set per-thread by `__wasm_apply_global_tls_relocs`
     // (left as 0 in the -r output; the next link step or runtime
     // fixes them up).
-    let mut defined_globals: Vec<(Vec<u8>, u8 /*valtype*/, bool /*mutable*/, u64 /*init*/)> =
-        Vec::new();
+    let mut defined_globals: Vec<(
+        Vec<u8>,
+        u8,   /* valtype */
+        bool, /* mutable */
+        u64,  /* init */
+    )> = Vec::new();
     // Map: original GOT.mem/GOT.data <field> → defined-global idx in
     // the OUTPUT global namespace (after imports). Used to redirect
     // symbol-table entries that pointed at the dropped import.
@@ -1795,8 +1782,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // here to the `-r` path's flat symbol table. Promotes UNDEFINED
     // → DEFINED when a later input provides a definition; redirects
     // dropped (COMDAT-loser) symbols' relocs to the surviving twin.
-    let mut name_to_output_sym_idx: std::collections::HashMap<Vec<u8>, u32> =
-        Default::default();
+    let mut name_to_output_sym_idx: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     // COMDAT first-definition tracker — feeds `compute_comdat_skip_sets`
     // exactly the way `merge_inputs` does, so the executable and the
     // `-r` path land on identical winners for the same input order.
@@ -1902,7 +1888,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                     // local→output mapping points at the eventual
                     // stub's function index so element segments
                     // referencing it land on the stub.
-                    local_func_import_to_output.push(stub_func_idx_by_name.get(&imp.field).copied());
+                    local_func_import_to_output
+                        .push(stub_func_idx_by_name.get(&imp.field).copied());
                     continue;
                 }
                 if imp.kind == 2 {
@@ -1953,9 +1940,9 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                     local_func_import_to_output.push(Some(existing_idx as u32));
                     continue;
                 }
-                let dup = imports.iter().any(|(m, f, k, _, _)| {
-                    *m == imp.module && *f == imp.field && *k == imp.kind
-                });
+                let dup = imports
+                    .iter()
+                    .any(|(m, f, k, _, _)| *m == imp.module && *f == imp.field && *k == imp.kind);
                 if dup {
                     continue;
                 }
@@ -1998,8 +1985,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 .iter()
                 .filter(|(name, _)| !seen_comdat_groups.contains(name))
                 .collect();
-            let winning_comdat_groups_owned: Vec<(Vec<u8>, Vec<(u8, u32)>)> =
-                winning_comdat_groups.iter().map(|g| (g.0.clone(), g.1.clone())).collect();
+            let winning_comdat_groups_owned: Vec<(Vec<u8>, Vec<(u8, u32)>)> = winning_comdat_groups
+                .iter()
+                .map(|g| (g.0.clone(), g.1.clone()))
+                .collect();
             let (skip_funcs, skip_data, _skip_tags) =
                 compute_comdat_skip_sets(&parsed, &mut seen_comdat_groups);
 
@@ -2053,11 +2042,11 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // skipped body is dropped (its surviving COMDAT twin lives
             // in another file).
             let prior_symbol_count: u32 = symbol_entries.len() as u32;
-            let input_code_count_leb_bytes =
-                leb128_len(parsed.functions.len() as u32) as u32;
+            let input_code_count_leb_bytes = leb128_len(parsed.functions.len() as u32) as u32;
             let mut input_body_starts: Vec<u32> = Vec::with_capacity(parsed.functions.len());
             let mut input_body_ends: Vec<u32> = Vec::with_capacity(parsed.functions.len());
-            let mut output_body_starts: Vec<Option<u32>> = Vec::with_capacity(parsed.functions.len());
+            let mut output_body_starts: Vec<Option<u32>> =
+                Vec::with_capacity(parsed.functions.len());
             // Index into the global `functions` Vec for each kept body,
             // so the post-walk reloc-patch step can mutate the cloned
             // body bytes in place (LEB-encoded immediates need to be
@@ -2097,10 +2086,18 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // undefs) can have its name recovered from the matching
             // import's field. Without this the output `name` section
             // misses entries the test harness checks for.
-            let func_imports: Vec<&Vec<u8>> =
-                parsed.imports.iter().filter(|i| i.kind == 0).map(|i| &i.field).collect();
-            let global_imports: Vec<&Vec<u8>> =
-                parsed.imports.iter().filter(|i| i.kind == 3).map(|i| &i.field).collect();
+            let func_imports: Vec<&Vec<u8>> = parsed
+                .imports
+                .iter()
+                .filter(|i| i.kind == 0)
+                .map(|i| &i.field)
+                .collect();
+            let global_imports: Vec<&Vec<u8>> = parsed
+                .imports
+                .iter()
+                .filter(|i| i.kind == 3)
+                .map(|i| &i.field)
+                .collect();
 
             // Decide which data segments survive into the output.
             // `.bss.*` segments and any COMDAT-skipped data segments
@@ -2140,8 +2137,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // it actually lives in the merged image. Padding for
             // alignment matches wasm-ld's behaviour (align_up the
             // running offset to the segment's natural alignment).
-            let mut input_seg_payload_starts: Vec<u32> = Vec::with_capacity(parsed.data_segments.len());
-            let mut input_seg_payload_ends: Vec<u32> = Vec::with_capacity(parsed.data_segments.len());
+            let mut input_seg_payload_starts: Vec<u32> =
+                Vec::with_capacity(parsed.data_segments.len());
+            let mut input_seg_payload_ends: Vec<u32> =
+                Vec::with_capacity(parsed.data_segments.len());
             let mut output_seg_payload_starts: Vec<Option<u32>> =
                 Vec::with_capacity(parsed.data_segments.len());
             // Memory placement assigned to every input segment,
@@ -2164,8 +2163,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // its alignment-padded position within the merged data.
             // Used by the reloc patcher so input-relative offsets
             // address the right bytes inside the merged buffer.
-            let mut local_seg_data_offset: Vec<u32> =
-                vec![0; parsed.data_segments.len()];
+            let mut local_seg_data_offset: Vec<u32> = vec![0; parsed.data_segments.len()];
 
             // First pass: classify each input seg as TLS-merged,
             // non-TLS-kept, or dropped. lld merges all TLS segments
@@ -2175,9 +2173,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // merging across files would need to share state in
             // `data_segments` outside this loop — out of scope for
             // single-input fixtures like `tls.s`.
-            let is_tls_seg = |seg: &ParsedDataSegment| -> bool {
-                seg.is_tls || seg.name.starts_with(b".tdata")
-            };
+            let is_tls_seg =
+                |seg: &ParsedDataSegment| -> bool { seg.is_tls || seg.name.starts_with(b".tdata") };
             let tls_kept_indices: Vec<usize> = parsed
                 .data_segments
                 .iter()
@@ -2211,15 +2208,14 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // takes idx 0 in `segment_names`, matching lld's ordering).
             let tls_merged_slot: Option<usize> = if !tls_kept_indices.is_empty() {
                 let merged_payload_len = merged_tls_data.len() as u32;
-                let mem_offset = (running_mem_offset + merged_tls_align - 1)
-                    & !(merged_tls_align - 1);
+                let mem_offset =
+                    (running_mem_offset + merged_tls_align - 1) & !(merged_tls_align - 1);
                 running_mem_offset = mem_offset + merged_payload_len;
                 let sleb_size = sleb128_len(mem_offset as i32) as u32;
                 let framing_overhead = 1 + 1 + sleb_size + 1;
                 let framing_start = output_data_pos;
-                let payload_start = framing_start
-                    + framing_overhead
-                    + leb128_len(merged_payload_len) as u32;
+                let payload_start =
+                    framing_start + framing_overhead + leb128_len(merged_payload_len) as u32;
                 output_data_pos = framing_start
                     + framing_overhead
                     + leb128_len(merged_payload_len) as u32
@@ -2283,9 +2279,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                             output_seg_payload_starts.push(Some(payload_start + local_off));
                             break;
                         }
-                        cursor += s_frame
-                            + leb128_len(s_data.len() as u32) as u32
-                            + s_data.len() as u32;
+                        cursor +=
+                            s_frame + leb128_len(s_data.len() as u32) as u32 + s_data.len() as u32;
                     }
                     local_seg_to_data_seg_idx.push(Some(slot));
                     let _ = (framing_overhead, merged_payload_len);
@@ -2303,10 +2298,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 let payload_start =
                     framing_start + framing_overhead + leb128_len(payload_len) as u32;
                 output_seg_payload_starts.push(Some(payload_start));
-                output_data_pos = framing_start
-                    + framing_overhead
-                    + leb128_len(payload_len) as u32
-                    + payload_len;
+                output_data_pos =
+                    framing_start + framing_overhead + leb128_len(payload_len) as u32 + payload_len;
                 local_seg_to_data_seg_idx.push(Some(data_segments.len()));
                 data_segments.push((seg.data.clone(), seg.alignment));
                 segment_names.push(seg.name.clone());
@@ -2341,8 +2334,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                                     .copied()
                                     .flatten()
                             } else {
-                                let local_def =
-                                    (input_idx - parsed.num_function_imports) as usize;
+                                let local_def = (input_idx - parsed.num_function_imports) as usize;
                                 local_def_to_output_def_idx
                                     .get(local_def)
                                     .copied()
@@ -2389,8 +2381,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // `seg_logical_offset + sym.segment_offset`. Globals are
             // indexed by the import-side global index (we don't yet
             // emit defined globals on the `-r` path).
-            let mut local_sym_addr: Vec<Option<u32>> =
-                Vec::with_capacity(parsed.symbols.len());
+            let mut local_sym_addr: Vec<Option<u32>> = Vec::with_capacity(parsed.symbols.len());
 
             // Collect symbols for the linking section.
             for sym in &parsed.symbols {
@@ -2419,7 +2410,9 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                             // matching import field if the linking
                             // section omitted it (standard for
                             // non-explicit undefs).
-                            if name.is_empty() && let Some(n) = func_imports.get(sym.index as usize) {
+                            if name.is_empty()
+                                && let Some(n) = func_imports.get(sym.index as usize)
+                            {
                                 name = (*n).clone();
                             }
                             // If this UNDEF symbol's name is in the
@@ -2438,7 +2431,11 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                             }
                         } else {
                             let local_def_idx = (sym.index - parsed.num_function_imports) as usize;
-                            match local_def_to_output_def_idx.get(local_def_idx).copied().flatten() {
+                            match local_def_to_output_def_idx
+                                .get(local_def_idx)
+                                .copied()
+                                .flatten()
+                            {
                                 Some(out_def_idx) => {
                                     // Use FINAL func-imports count
                                     // so an early-walked DEF symbol
@@ -2465,11 +2462,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                         if (sym.flags & 0x10) == 0 {
                             if dropped_data_segs.contains(&sym.segment_index) {
                                 new_flags |= 0x10; // WASM_SYM_UNDEFINED
-                            } else if let Some(out_seg) =
-                                local_seg_to_data_seg_idx
-                                    .get(sym.segment_index as usize)
-                                    .copied()
-                                    .flatten()
+                            } else if let Some(out_seg) = local_seg_to_data_seg_idx
+                                .get(sym.segment_index as usize)
+                                .copied()
+                                .flatten()
                             {
                                 new_seg = out_seg as u32;
                                 new_seg_value = new_seg;
@@ -2568,7 +2564,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                             let total_global_imports = imports
                                 .iter()
                                 .filter(|(_, _, kind, _, _)| *kind == 3)
-                                .count() as u32;
+                                .count()
+                                as u32;
                             let this_file_globals = global_imports.len() as u32;
                             total_global_imports
                                 .checked_sub(this_file_globals)
@@ -2613,8 +2610,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                         }
                         t
                     } else {
-                        let local_def_idx =
-                            (sym.index - parsed.num_function_imports) as usize;
+                        let local_def_idx = (sym.index - parsed.num_function_imports) as usize;
                         parsed.functions.get(local_def_idx).map(|f| {
                             type_map
                                 .get(f.type_index as usize)
@@ -2665,10 +2661,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                         // Look up the existing slot's sig: import →
                         // import's type idx; def → functions[..].0.
                         let existing_func_idx = existing.index;
-                        let total_func_imports = imports
-                            .iter()
-                            .filter(|(_, _, k, _, _)| *k == 0)
-                            .count() as u32;
+                        let total_func_imports =
+                            imports.iter().filter(|(_, _, k, _, _)| *k == 0).count() as u32;
                         let existing_sig = if existing_func_idx < total_func_imports {
                             // Find the kind=0 import at this position.
                             let mut k0 = 0u32;
@@ -2697,10 +2691,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                         // earlier-file relocs that still expect the
                         // old sig retain a typecheckable target.
                         let existing_func_idx = existing.index;
-                        let total_func_imports = imports
-                            .iter()
-                            .filter(|(_, _, k, _, _)| *k == 0)
-                            .count() as u32;
+                        let total_func_imports =
+                            imports.iter().filter(|(_, _, k, _, _)| *k == 0).count() as u32;
                         let stub_sig = if existing_func_idx < total_func_imports {
                             let mut k0 = 0u32;
                             let mut t = 0u32;
@@ -2721,8 +2713,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                                 .unwrap_or(0)
                         };
                         // locals_count(0) + unreachable + end. Emitter prefixes the
-        // body with its size LEB but doesn't add the locals_count.
-        let stub_body: Vec<u8> = vec![0x00, 0x00, 0x0B];
+                        // body with its size LEB but doesn't add the locals_count.
+                        let stub_body: Vec<u8> = vec![0x00, 0x00, 0x0B];
                         let stub_frame =
                             leb128_len(stub_body.len() as u32) as u32 + stub_body.len() as u32;
                         let stub_func_idx = total_func_imports + functions.len() as u32;
@@ -2841,8 +2833,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 // offset within the data is `reloc.offset -
                 // input_seg_payload_starts[i]`.
                 if let Some(out_seg_idx) = local_seg_to_data_seg_idx[i]
-                    && let Some(sym_addr) =
-                        local_sym_addr.get(reloc.symbol_index as usize).copied().flatten()
+                    && let Some(sym_addr) = local_sym_addr
+                        .get(reloc.symbol_index as usize)
+                        .copied()
+                        .flatten()
                     && !reloc_is_table_index(reloc.reloc_type)
                 {
                     // For TLS-merged segments the input seg's bytes
@@ -2880,9 +2874,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
             // points at the merged output's type slot.
             for reloc in &parsed.code_relocations {
                 let out_sym_local = if reloc.reloc_type == 6 {
-                    type_map
-                        .get(reloc.symbol_index as usize)
-                        .copied()
+                    type_map.get(reloc.symbol_index as usize).copied()
                 } else {
                     local_sym_to_output_sym_idx
                         .get(reloc.symbol_index as usize)
@@ -2894,9 +2886,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                 };
                 let mut found: Option<usize> = None;
                 for i in 0..parsed.functions.len() {
-                    if reloc.offset >= input_body_starts[i]
-                        && reloc.offset < input_body_ends[i]
-                    {
+                    if reloc.offset >= input_body_starts[i] && reloc.offset < input_body_ends[i] {
                         found = Some(i);
                         break;
                     }
@@ -2931,8 +2921,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
                         );
                     }
                 } else if let Some(out_func_idx) = local_func_to_functions_idx[i]
-                    && let Some(sym_addr) =
-                        local_sym_addr.get(reloc.symbol_index as usize).copied().flatten()
+                    && let Some(sym_addr) = local_sym_addr
+                        .get(reloc.symbol_index as usize)
+                        .copied()
+                        .flatten()
                     && !reloc_is_table_index(reloc.reloc_type)
                 {
                     let body_data_start = input_body_starts[i]
@@ -3039,7 +3031,11 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
         }
         let mut perm: Vec<usize> = (0..n).collect();
         perm.sort_by_key(|&i| (seg_priority(&segment_names[i]), i));
-        if perm.iter().enumerate().any(|(new_idx, &old_idx)| new_idx != old_idx) {
+        if perm
+            .iter()
+            .enumerate()
+            .any(|(new_idx, &old_idx)| new_idx != old_idx)
+        {
             // Apply permutation to segments and names.
             let new_segments: Vec<_> = perm.iter().map(|&i| data_segments[i].clone()).collect();
             let new_names: Vec<_> = perm.iter().map(|&i| segment_names[i].clone()).collect();
@@ -3323,12 +3319,10 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // Rebuild the TYPE section to match lld's first-registration
     // order (lld/wasm/Relocations.cpp::scanRelocations +
     // Writer.cpp::calculateTypes, Apache-2.0 with LLVM Exceptions):
-    // 1. Walk all inputs' code_relocations in link-line order;
-    //    register the type referenced by each `R_WASM_TYPE_INDEX_LEB`
-    //    (kind 6) — the dominant phase when `call_indirect` is in
-    //    play. Without this pass `weak-alias.s -r` puts `() → ()`
-    //    at type 0 (input dedup order) but lld puts `() → I32`
-    //    there because the call_indirect target gets registered first.
+    // 1. Walk all inputs' code_relocations in link-line order; register the type referenced by each
+    //    `R_WASM_TYPE_INDEX_LEB` (kind 6) — the dominant phase when `call_indirect` is in play.
+    //    Without this pass `weak-alias.s -r` puts `() → ()` at type 0 (input dedup order) but lld
+    //    puts `() → I32` there because the call_indirect target gets registered first.
     // 2. Imported function signatures, in `imports` order.
     // 3. Defined function signatures, in `functions` order.
     {
@@ -3501,10 +3495,8 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     if !got_tls_internalised.is_empty() {
         let num_imported_globals_final =
             imports.iter().filter(|(_, _, k, _, _)| *k == 3).count() as u32;
-        let mut sorted: Vec<(&Vec<u8>, u32)> = got_tls_internalised
-            .iter()
-            .map(|(k, &v)| (k, v))
-            .collect();
+        let mut sorted: Vec<(&Vec<u8>, u32)> =
+            got_tls_internalised.iter().map(|(k, &v)| (k, v)).collect();
         sorted.sort_by_key(|(_, v)| *v);
         for (field, got_offset) in sorted {
             let mut name = b"GOT.data.internal.".to_vec();
@@ -3538,8 +3530,7 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // every function-index reference downstream:
     //   - `imports` vector (filter out resolved kind=0 entries)
     //   - `symbol_entries[i].index` (when kind=0)
-    //   - `functions[i].body` — call / return_call / ref.func
-    //     operands (via `remap_call_targets`)
+    //   - `functions[i].body` — call / return_call / ref.func operands (via `remap_call_targets`)
     //   - `output_element_segments` — funcref tables
     {
         // OLD function-namespace position (0..num_func_imports_old)
@@ -3652,12 +3643,11 @@ fn write_relocatable<A: Arch<Platform = Wasm>>(
     // looking for call_indirect uses).
     //
     // Side effects:
-    //  - Body lengths grow by 4 bytes per call_indirect, so
-    //    `output_code_relocs` offsets that fall after a padding point
-    //    need to shift, AND the per-body-start cursor through the
-    //    CODE section needs recomputing.
-    //  - All sym refs (in output_code_relocs) at index ≥ the inserted
-    //    TABLE symbol's position shift up by 1.
+    //  - Body lengths grow by 4 bytes per call_indirect, so `output_code_relocs` offsets that fall
+    //    after a padding point need to shift, AND the per-body-start cursor through the CODE
+    //    section needs recomputing.
+    //  - All sym refs (in output_code_relocs) at index ≥ the inserted TABLE symbol's position shift
+    //    up by 1.
     {
         // Collect old body starts (cumulative offsets within the
         // emitted CODE section payload, BEFORE padding). Layout:
@@ -4761,10 +4751,7 @@ fn reorder_synth_functions_first(merged: &mut MergedModule) {
         }
     }
     // Skip if synthetics are already at the front in the canonical order.
-    let already_in_order = synth_local
-        .iter()
-        .enumerate()
-        .all(|(i, &local)| local == i);
+    let already_in_order = synth_local.iter().enumerate().all(|(i, &local)| local == i);
     if already_in_order {
         return;
     }
@@ -4802,7 +4789,11 @@ fn reorder_synth_functions_first(merged: &mut MergedModule) {
     let mut tmp: Vec<Option<MergedFunction>> = merged.functions.drain(..).map(Some).collect();
     let mut reordered: Vec<MergedFunction> = Vec::with_capacity(num_funcs);
     for &old in &new_to_old {
-        reordered.push(tmp[old].take().expect("permutation referenced same idx twice"));
+        reordered.push(
+            tmp[old]
+                .take()
+                .expect("permutation referenced same idx twice"),
+        );
     }
     merged.functions = reordered;
 
@@ -4860,20 +4851,15 @@ fn reorder_synth_functions_first(merged: &mut MergedModule) {
 /// lld's TypeSection registers each unique signature on first call and
 /// the registration sequence is:
 ///
-/// 1. **`scanRelocations`** runs first, in link-line file order. For
-///    each file it walks function chunks → data segments → custom
-///    sections. Every `R_WASM_TYPE_INDEX_LEB` reloc registers the
-///    referenced signature immediately. This is the dominant phase
-///    when inputs use `call_indirect` (its operand emits a TYPE_INDEX
-///    reloc).
-/// 2. **`calculateTypes`** runs after `assignIndexes`, in three passes:
-///    a. Walk every file's `typeIsUsed` flags (for any TYPE-reloc
-///       types that somehow weren't caught above — usually a no-op).
-///    b. Imported function signatures, in `importedSymbols` insertion
-///       order (= link-line file order × symbol-table order).
-///    c. Defined function signatures — synthetics (e.g.
-///       `__wasm_call_ctors`) first, then per-file × per-function
-///       order.
+/// 1. **`scanRelocations`** runs first, in link-line file order. For each file it walks function
+///    chunks → data segments → custom sections. Every `R_WASM_TYPE_INDEX_LEB` reloc registers the
+///    referenced signature immediately. This is the dominant phase when inputs use `call_indirect`
+///    (its operand emits a TYPE_INDEX reloc).
+/// 2. **`calculateTypes`** runs after `assignIndexes`, in three passes: a. Walk every file's
+///    `typeIsUsed` flags (for any TYPE-reloc types that somehow weren't caught above — usually a
+///    no-op). b. Imported function signatures, in `importedSymbols` insertion order (= link-line
+///    file order × symbol-table order). c. Defined function signatures — synthetics (e.g.
+///    `__wasm_call_ctors`) first, then per-file × per-function order.
 ///
 /// Because `registerType` is dedup-by-signature first-wins, later
 /// passes are no-ops for sigs already seen.
@@ -4927,8 +4913,8 @@ fn rebuild_types_in_usage_order(layout: &Layout<'_, Wasm>, merged: &mut MergedMo
                     continue;
                 }
                 if let Some(local_ty) = parsed.types.get(r.symbol_index as usize)
-                    && let Some(&merged_idx) = sig_to_merged_idx
-                        .get(&(local_ty.params.clone(), local_ty.results.clone()))
+                    && let Some(&merged_idx) =
+                        sig_to_merged_idx.get(&(local_ty.params.clone(), local_ty.results.clone()))
                     && seen.insert(merged_idx)
                 {
                     new_order.push(merged_idx);
@@ -6140,13 +6126,17 @@ fn walk_call_indirect_tableidx(
             }
             0x43 => {
                 if pos + 4 > body.len() {
-                    return Err(crate::error!("call_indirect tableidx walker: truncated f32.const"));
+                    return Err(crate::error!(
+                        "call_indirect tableidx walker: truncated f32.const"
+                    ));
                 }
                 pos += 4;
             }
             0x44 => {
                 if pos + 8 > body.len() {
-                    return Err(crate::error!("call_indirect tableidx walker: truncated f64.const"));
+                    return Err(crate::error!(
+                        "call_indirect tableidx walker: truncated f64.const"
+                    ));
                 }
                 pos += 8;
             }
@@ -7070,13 +7060,12 @@ fn report_undefined_strong_refs(
 /// Walks inputs in command-line order, builds the (defined, undef-ref)
 /// symbol set per input, then for each archive entry emits a row
 /// `<reference>\t<extracted>\t<symbol>` where:
-///   * `reference` = first earlier input (in cmdline order) that has
-///     an undef ref to one of this entry's defined symbols, formatted
-///     as `<basename>` for plain inputs and `<archive>(<member>)` for
-///     archive entries;
+///   * `reference` = first earlier input (in cmdline order) that has an undef ref to one of this
+///     entry's defined symbols, formatted as `<basename>` for plain inputs and
+///     `<archive>(<member>)` for archive entries;
 ///   * `extracted` = `<archive>(<member>)` of the loaded entry;
-///   * `symbol` = the defining symbol that drove the load, demangled
-///     by default (Itanium C++ ABI), raw under `--no-demangle`.
+///   * `symbol` = the defining symbol that drove the load, demangled by default (Itanium C++ ABI),
+///     raw under `--no-demangle`.
 ///
 /// Wild's symbol_db loads archive members eagerly, so this is a
 /// post-hoc reconstruction of what *would* have been extracted under
@@ -7208,11 +7197,7 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
         let mut emitted = false;
         for sym in &view.defines {
             if let Some((_, source)) = cmdline_refs.iter().find(|(n, _)| n == sym) {
-                rows.push((
-                    source.to_string(),
-                    view.label.clone(),
-                    display_name(sym),
-                ));
+                rows.push((source.to_string(), view.label.clone(), display_name(sym)));
                 consumed_archives.insert(i);
                 emitted = true;
                 break;
@@ -7249,12 +7234,7 @@ fn emit_why_extract(layout: &Layout<'_, Wasm>) -> crate::error::Result<()> {
     // Output destination: `-` = stdout, anything else = file path.
     // Always emit the header even when no rows (matches lld's
     // why-extract.s CHECK1 arm).
-    let path = layout
-        .symbol_db
-        .args
-        .why_extract
-        .as_deref()
-        .unwrap_or("-");
+    let path = layout.symbol_db.args.why_extract.as_deref().unwrap_or("-");
     let mut out: Box<dyn Write> = if path == "-" {
         Box::new(std::io::stdout())
     } else {
@@ -7307,8 +7287,7 @@ fn merge_inputs(
     // LLVM symbol name. Populated as inputs' EXPORT sections are
     // consumed; consumed by the EXPORT emit pass to override the
     // wasm-level name a function is exported under.
-    let mut export_name_overrides: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-        Default::default();
+    let mut export_name_overrides: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
 
     // --- Pass 1: parse all objects, collect types and functions ---
     struct ObjectInfo {
@@ -7432,9 +7411,8 @@ fn merge_inputs(
                     if ovr.kind == 0 {
                         let local_def = ovr.index as usize;
                         let func = parsed.functions.get(local_def);
-                        let sig = func.and_then(|f| {
-                            parsed.types.get(f.type_index as usize).cloned()
-                        });
+                        let sig =
+                            func.and_then(|f| parsed.types.get(f.type_index as usize).cloned());
                         if let Some(sig) = sig {
                             dylink_exports.push((ovr.name.clone(), 0u8, Some(sig)));
                         }
@@ -7554,9 +7532,7 @@ fn merge_inputs(
                     let sym_pos = parsed
                         .symbols
                         .iter()
-                        .position(|sym| {
-                            sym.kind == 0 && !sym.name.is_empty() && sym.name == *name
-                        })
+                        .position(|sym| sym.kind == 0 && !sym.name.is_empty() && sym.name == *name)
                         .map(|p| p as u32);
                     // Check symbol flags for this function.
                     let sym_flags = parsed
@@ -7579,8 +7555,7 @@ fn merge_inputs(
                         function_name_map.insert(name.clone(), output_idx);
                         function_is_weak.insert(name.clone(), is_weak);
                         if let Some(sp) = sym_pos {
-                            function_export_pos
-                                .insert(name.clone(), (__obj_cmdline_rank, sp));
+                            function_export_pos.insert(name.clone(), (__obj_cmdline_rank, sp));
                         }
                         if is_hidden {
                             function_is_hidden.insert(name.clone());
@@ -7710,8 +7685,7 @@ fn merge_inputs(
                     .map(|s| s.as_encoded_bytes().to_vec())
                     .unwrap_or_default()
             };
-            let always_alive = obj.input.file.modifiers.whole_archive
-                || obj.input.entry.is_none(); // main objects (non-archive) always alive
+            let always_alive = obj.input.file.modifiers.whole_archive || obj.input.entry.is_none(); // main objects (non-archive) always alive
             objects.push(ObjectInfo {
                 parsed,
                 type_map,
@@ -8058,8 +8032,7 @@ fn merge_inputs(
     // instead of the ordinary memory-base. lld emits a synthesized
     // `__wasm_apply_global_tls_relocs` that runs once per thread to
     // overwrite each TLS GOT slot with `__tls_base + tls_rel_offset`.
-    let mut tls_data_offset_by_name: std::collections::HashMap<Vec<u8>, u32> =
-        Default::default();
+    let mut tls_data_offset_by_name: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     for (obj_idx, obj_info) in objects.iter().enumerate() {
         let obj_seg_offsets = &segment_output_offsets[obj_idx];
         for sym in &obj_info.parsed.symbols {
@@ -9116,60 +9089,59 @@ fn merge_inputs(
     // extend the stub treatment to all undef function symbols, not
     // just weak ones.
     let stub_all_undef = layout.symbol_db.args.stub_unresolved_functions;
-    let weak_undef_stub_names: Vec<(Vec<u8>, u32)> = if !layout.symbol_db.args.is_shared
-        && !layout.symbol_db.args.is_pic
-    {
-        let mut seen: std::collections::HashSet<Vec<u8>> = Default::default();
-        let mut out: Vec<(Vec<u8>, u32)> = Vec::new();
-        for obj_info in &objects {
-            let parsed = &obj_info.parsed;
-            for sym in &parsed.symbols {
-                if sym.kind != 0 {
-                    continue;
-                }
-                let undef = (sym.flags & 0x10) != 0;
-                let weak = (sym.flags & 0x01) != 0;
-                if !undef {
-                    continue;
-                }
-                if !weak && !stub_all_undef {
-                    continue;
-                }
-                let name: &[u8] = if !sym.name.is_empty() {
-                    sym.name.as_slice()
-                } else if (sym.index as usize) < parsed.import_function_names.len() {
-                    parsed.import_function_names[sym.index as usize].as_slice()
-                } else {
-                    continue;
-                };
-                if function_name_map.contains_key(name) {
-                    continue; // Defined elsewhere — no stub needed.
-                }
-                if !seen.insert(name.to_vec()) {
-                    continue;
-                }
-                // Resolve the import's type idx for this symbol via
-                // its imports[] entry (kind=0, field == name).
-                let type_idx = parsed
-                    .imports
-                    .iter()
-                    .find(|i| i.kind == 0 && i.field.as_slice() == name)
-                    .map(|i| {
-                        obj_info
-                            .type_map
-                            .get(i.type_index as usize)
-                            .copied()
-                            .unwrap_or(i.type_index)
-                    });
-                if let Some(t) = type_idx {
-                    out.push((name.to_vec(), t));
+    let weak_undef_stub_names: Vec<(Vec<u8>, u32)> =
+        if !layout.symbol_db.args.is_shared && !layout.symbol_db.args.is_pic {
+            let mut seen: std::collections::HashSet<Vec<u8>> = Default::default();
+            let mut out: Vec<(Vec<u8>, u32)> = Vec::new();
+            for obj_info in &objects {
+                let parsed = &obj_info.parsed;
+                for sym in &parsed.symbols {
+                    if sym.kind != 0 {
+                        continue;
+                    }
+                    let undef = (sym.flags & 0x10) != 0;
+                    let weak = (sym.flags & 0x01) != 0;
+                    if !undef {
+                        continue;
+                    }
+                    if !weak && !stub_all_undef {
+                        continue;
+                    }
+                    let name: &[u8] = if !sym.name.is_empty() {
+                        sym.name.as_slice()
+                    } else if (sym.index as usize) < parsed.import_function_names.len() {
+                        parsed.import_function_names[sym.index as usize].as_slice()
+                    } else {
+                        continue;
+                    };
+                    if function_name_map.contains_key(name) {
+                        continue; // Defined elsewhere — no stub needed.
+                    }
+                    if !seen.insert(name.to_vec()) {
+                        continue;
+                    }
+                    // Resolve the import's type idx for this symbol via
+                    // its imports[] entry (kind=0, field == name).
+                    let type_idx = parsed
+                        .imports
+                        .iter()
+                        .find(|i| i.kind == 0 && i.field.as_slice() == name)
+                        .map(|i| {
+                            obj_info
+                                .type_map
+                                .get(i.type_index as usize)
+                                .copied()
+                                .unwrap_or(i.type_index)
+                        });
+                    if let Some(t) = type_idx {
+                        out.push((name.to_vec(), t));
+                    }
                 }
             }
-        }
-        out
-    } else {
-        Vec::new()
-    };
+            out
+        } else {
+            Vec::new()
+        };
     // Reserve function indices 0..N_stubs (or 1..N_stubs+1 when ctors
     // is at 0). Defined-function entries shift by +N_stubs so the
     // stubs occupy the front of the def-index space, matching lld's
@@ -9242,8 +9214,7 @@ fn merge_inputs(
     let mut sig_mismatch_stub_specs: Vec<(Vec<u8>, u32)> = Vec::new();
     let mut sig_mismatch_redirect: std::collections::HashMap<Vec<u8>, u32> = Default::default();
     if n_sig_mismatch > 0 {
-        let pre_offset =
-            (if needs_ctors { 1 } else { 0 }) + weak_undef_stub_names.len() as u32;
+        let pre_offset = (if needs_ctors { 1 } else { 0 }) + weak_undef_stub_names.len() as u32;
         for idx in function_name_map.values_mut() {
             if *idx >= pre_offset {
                 *idx += n_sig_mismatch;
@@ -9268,7 +9239,9 @@ fn merge_inputs(
         // table into merge_inputs's `types` Vec via dedup, so the
         // stub's TYPE matches the importer's expected signature.
         for (i, (name, pre_sig_idx)) in sig_mismatch_pre.sig_mismatch_stubs.iter().enumerate() {
-            let Some(func_type) = sig_mismatch_pre.sig_mismatch_types.get(*pre_sig_idx as usize)
+            let Some(func_type) = sig_mismatch_pre
+                .sig_mismatch_types
+                .get(*pre_sig_idx as usize)
             else {
                 continue;
             };
@@ -9503,13 +9476,13 @@ fn merge_inputs(
     // + unreachable + end. Pass 1.85 already shifted defined
     // functions' name-map indices by `n_stubs` so the per-input
     // bodies pushed below land at indices N_stubs..
-    let weak_undef_stub_idx_set: std::collections::HashSet<u32> = if !weak_undef_stub_names.is_empty()
-    {
-        let ctors_offset = if needs_ctors { 1 } else { 0 };
-        (ctors_offset..ctors_offset + weak_undef_stub_names.len() as u32).collect()
-    } else {
-        Default::default()
-    };
+    let weak_undef_stub_idx_set: std::collections::HashSet<u32> =
+        if !weak_undef_stub_names.is_empty() {
+            let ctors_offset = if needs_ctors { 1 } else { 0 };
+            (ctors_offset..ctors_offset + weak_undef_stub_names.len() as u32).collect()
+        } else {
+            Default::default()
+        };
     for (_name, type_idx) in &weak_undef_stub_names {
         functions.push(MergedFunction {
             type_index: *type_idx,
@@ -9518,10 +9491,8 @@ fn merge_inputs(
     }
     // Sig-mismatch trap stubs land right after weak-undef stubs. Body
     // is the same trap shape — `locals_count(0); unreachable; end`.
-    let sig_mismatch_stub_idx_set: std::collections::HashSet<u32> = sig_mismatch_redirect
-        .values()
-        .copied()
-        .collect();
+    let sig_mismatch_stub_idx_set: std::collections::HashSet<u32> =
+        sig_mismatch_redirect.values().copied().collect();
     for (_name, type_idx) in &sig_mismatch_stub_specs {
         functions.push(MergedFunction {
             type_index: *type_idx,
@@ -9618,26 +9589,20 @@ fn merge_inputs(
                     // Undefined function symbol pointing at an *imported*
                     // function. Two sub-cases, distinguished by name:
                     //
-                    // 1. **Resolved by a definition elsewhere.** Some
-                    //    other input defines the symbol (extern shim
-                    //    resolved by a real impl). Insert into
-                    //    `symbol_to_output_func` so the body-reloc-apply
-                    //    patches the call to the defined function's
-                    //    pre-shift index — the post-merge shift then
-                    //    converts it to the unified namespace correctly.
+                    // 1. **Resolved by a definition elsewhere.** Some other input defines the
+                    //    symbol (extern shim resolved by a real impl). Insert into
+                    //    `symbol_to_output_func` so the body-reloc-apply patches the call to the
+                    //    defined function's pre-shift index — the post-merge shift then converts it
+                    //    to the unified namespace correctly.
                     //
-                    // 2. **Stays as an import.** No defining input — the
-                    //    function lives in `output_imports`, at the
-                    //    output-import-index given by
-                    //    `per_obj_func_imp_remap[obj_idx][sym.index]`.
-                    //    For this case we DELIBERATELY don't insert
-                    //    into `symbol_to_output_func`. If we did, Pass 2
-                    //    would write the (already-unified) import index
-                    //    into the body, and the post-merge shift would
-                    //    then add N a second time, landing the call on
-                    //    a defined function with the wrong signature.
-                    //    Instead we record (merged_fn_idx, off_in_body,
-                    //    output_import_idx) and re-apply the correct
+                    // 2. **Stays as an import.** No defining input — the function lives in
+                    //    `output_imports`, at the output-import-index given by
+                    //    `per_obj_func_imp_remap[obj_idx][sym.index]`. For this case we
+                    //    DELIBERATELY don't insert into `symbol_to_output_func`. If we did, Pass 2
+                    //    would write the (already-unified) import index into the body, and the
+                    //    post-merge shift would then add N a second time, landing the call on a
+                    //    defined function with the wrong signature. Instead we record
+                    //    (merged_fn_idx, off_in_body, output_import_idx) and re-apply the correct
                     //    value AFTER the shift below.
                     let resolve_name = if !sym.name.is_empty() {
                         Some(sym.name.as_slice())
@@ -9889,8 +9854,8 @@ fn merge_inputs(
                             .get(reloc.symbol_index as usize)
                             .filter(|s| s.kind == 1 && (s.flags & 0x10) == 0)
                             .map(|s| s.name.as_slice());
-                        let is_tls_data =
-                            sym_name_for_tls.is_some_and(|n| tls_data_offset_by_name.contains_key(n));
+                        let is_tls_data = sym_name_for_tls
+                            .is_some_and(|n| tls_data_offset_by_name.contains_key(n));
                         let value = if is_tls_data && layout.symbol_db.args.shared_memory {
                             let tls_base = tls_base_offset.unwrap_or(0);
                             let tls_rel = addr.saturating_sub(tls_base) as i32;
@@ -10538,13 +10503,11 @@ fn merge_inputs(
         // Per-function source basename in post-ctors-shifted space.
         // Stubs (weak-undef, sig-mismatch) and ctors itself have no
         // source basename and never contribute to `alive_basenames`.
-        let mut func_idx_to_basename: std::collections::HashMap<u32, &[u8]> =
-            Default::default();
+        let mut func_idx_to_basename: std::collections::HashMap<u32, &[u8]> = Default::default();
         // Source objects that are unconditionally alive — main
         // objects and `--whole-archive` archive members. Their
         // init_funcs survive the prune regardless of reachability.
-        let mut always_alive_basenames: std::collections::HashSet<&[u8]> =
-            Default::default();
+        let mut always_alive_basenames: std::collections::HashSet<&[u8]> = Default::default();
         for obj_info in &objects {
             for local_idx in 0..obj_info.parsed.functions.len() as u32 {
                 let post_idx = ctors_offset + obj_info.func_base + local_idx;
@@ -10585,11 +10548,7 @@ fn merge_inputs(
             for (i, &is_kept) in kept.iter().enumerate() {
                 if is_kept {
                     let (_, pre_ctors_idx) = all_init_funcs[i];
-                    push_root(
-                        pre_ctors_idx + ctors_offset,
-                        &mut reachable,
-                        &mut queue,
-                    );
+                    push_root(pre_ctors_idx + ctors_offset, &mut reachable, &mut queue);
                 }
             }
             // BFS through bodies.
@@ -10608,12 +10567,9 @@ fn merge_inputs(
                 });
             }
             // Compute alive basenames.
-            let mut alive_basenames: std::collections::HashSet<&[u8]> =
-                Default::default();
+            let mut alive_basenames: std::collections::HashSet<&[u8]> = Default::default();
             for (idx, &is_reach) in reachable.iter().enumerate() {
-                if is_reach
-                    && let Some(&bn) = func_idx_to_basename.get(&(idx as u32))
-                {
+                if is_reach && let Some(&bn) = func_idx_to_basename.get(&(idx as u32)) {
                     alive_basenames.insert(bn);
                 }
             }
@@ -10908,10 +10864,7 @@ fn merge_inputs(
                 body.push(0x0B); // end
                 let func_idx = functions.len() as u32;
                 debug_assert_eq!(Some(func_idx), apply_func_idx);
-                function_name_map.insert(
-                    b"__wasm_apply_global_tls_relocs".to_vec(),
-                    func_idx,
-                );
+                function_name_map.insert(b"__wasm_apply_global_tls_relocs".to_vec(), func_idx);
                 functions.push(MergedFunction {
                     type_index: void_type_idx,
                     body,
@@ -11202,15 +11155,9 @@ fn merge_inputs(
                     // local-after-imports index, so it can't supply
                     // import names — only the linking section can.
                     let import_wasm_idx = num_imported_functions;
-                    let undef_sym = obj_info
-                        .parsed
-                        .symbols
-                        .iter()
-                        .find(|s| {
-                            s.kind == 0
-                                && (s.flags & 0x10) != 0
-                                && s.index == input_func_imp_idx
-                        });
+                    let undef_sym = obj_info.parsed.symbols.iter().find(|s| {
+                        s.kind == 0 && (s.flags & 0x10) != 0 && s.index == input_func_imp_idx
+                    });
                     // Per spec §4.2: if `WASM_SYM_EXPLICIT_NAME`
                     // (0x40) is NOT set on an UNDEF function symbol,
                     // the linking section omits the name and the
@@ -11389,8 +11336,7 @@ fn merge_inputs(
         } else {
             stack_pointer_value as u64 + heap_size_u64
         };
-        let (min, max) =
-            compute_imported_memory_limits(layout.symbol_db.args, default_min_bytes);
+        let (min, max) = compute_imported_memory_limits(layout.symbol_db.args, default_min_bytes);
         output_imports.push(OutputImport {
             module,
             field,
@@ -12131,10 +12077,7 @@ fn compute_sig_mismatch_stubs(layout: &Layout<'_, Wasm>) -> PrePassResult {
         if dsig == isig {
             continue;
         }
-        let import_file = first_import_file
-            .get(&name)
-            .cloned()
-            .unwrap_or_default();
+        let import_file = first_import_file.get(&name).cloned().unwrap_or_default();
         let def_file = first_def_file.get(&name).cloned().unwrap_or_default();
         sig_mismatch_diagnostics.push(SigMismatchDiagnostic {
             name: name.clone(),
@@ -12150,22 +12093,26 @@ fn compute_sig_mismatch_stubs(layout: &Layout<'_, Wasm>) -> PrePassResult {
     // Reuses already-parsed inputs from the pre-pass loop above; this
     // second walk is only over the imports list (cheap relative to the
     // parse cost).
-    let sig_mismatch_name_set: std::collections::HashSet<&[u8]> =
-        sig_mismatch_stubs.iter().map(|(n, _)| n.as_slice()).collect();
+    let sig_mismatch_name_set: std::collections::HashSet<&[u8]> = sig_mismatch_stubs
+        .iter()
+        .map(|(n, _)| n.as_slice())
+        .collect();
     let mut total_sig_mismatch_imports_elided = 0u32;
     if !sig_mismatch_name_set.is_empty() {
         for group in &layout.group_layouts {
             for file in &group.files {
-                let FileLayout::Object(obj) = file else { continue };
+                let FileLayout::Object(obj) = file else {
+                    continue;
+                };
                 let data = obj.object.data;
                 if data.len() < 8 || &data[..4] != b"\0asm" {
                     continue;
                 }
-                let Ok(parsed) = parse_wasm_sections(data) else { continue };
+                let Ok(parsed) = parse_wasm_sections(data) else {
+                    continue;
+                };
                 for imp in &parsed.imports {
-                    if imp.kind == 0
-                        && sig_mismatch_name_set.contains(imp.field.as_slice())
-                    {
+                    if imp.kind == 0 && sig_mismatch_name_set.contains(imp.field.as_slice()) {
                         total_sig_mismatch_imports_elided += 1;
                     }
                 }
@@ -12326,8 +12273,8 @@ fn build_name_section_payload(
                 let pick_new = match per_func_idx_pick.get(&e.index) {
                     None => true,
                     Some((existing, existing_weak)) => match (is_weak, *existing_weak) {
-                        (false, true) => true,             // strong beats weak
-                        (true, false) => false,            // keep strong
+                        (false, true) => true,                        // strong beats weak
+                        (true, false) => false,                       // keep strong
                         _ => e.name.as_slice() < existing.as_slice(), // tie → alphabetical
                     },
                 };
@@ -14258,20 +14205,21 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
         }
     };
 
-    let row = |out: &mut String, addr: Option<u64>, off: u64, size: u64, indent: usize, label: &str| {
-        let addr_s = match addr {
-            Some(a) => format!("{a:x}"),
-            None => "-".to_string(),
+    let row =
+        |out: &mut String, addr: Option<u64>, off: u64, size: u64, indent: usize, label: &str| {
+            let addr_s = match addr {
+                Some(a) => format!("{a:x}"),
+                None => "-".to_string(),
+            };
+            out.push_str(&format!(
+                "{:>8} {:>8x} {:>8x} {}{}\n",
+                addr_s,
+                off,
+                size,
+                " ".repeat(indent),
+                label
+            ));
         };
-        out.push_str(&format!(
-            "{:>8} {:>8x} {:>8x} {}{}\n",
-            addr_s,
-            off,
-            size,
-            " ".repeat(indent),
-            label
-        ));
-    };
 
     // Build a quick `output_func_idx → name` map so per-function
     // sub-entries can attribute themselves; ties go to the strong /
@@ -14310,10 +14258,7 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
             let payload = &bytes[payload_start..payload_end];
             let (name_len, nc) = read_leb128(payload).unwrap_or((0, 0));
             let name_bytes = &payload[nc..nc + name_len];
-            format!(
-                "CUSTOM({})",
-                std::str::from_utf8(name_bytes).unwrap_or("?")
-            )
+            format!("CUSTOM({})", std::str::from_utf8(name_bytes).unwrap_or("?"))
         } else {
             section_label(id)
         };
@@ -14330,14 +14275,11 @@ fn generate_map_file(bytes: &[u8], merged: &MergedModule) -> String {
         //
         // lld's per-function map row uses a *virtual* layout, not raw
         // file offsets:
-        //   - First function: Off = section_start + 1 (just past the
-        //     section id byte), Size = body_total (size leb + body).
-        //     The section size leb + num_funcs leb bytes are absorbed
-        //     into this offset (Off + Size doesn't equal the next
-        //     function's actual file offset, but the map just stacks
-        //     them: next.Off = prev.Off + prev.Size).
-        //   - Subsequent functions: Off = prev.Off + prev.Size,
-        //     Size = body_total.
+        //   - First function: Off = section_start + 1 (just past the section id byte), Size =
+        //     body_total (size leb + body). The section size leb + num_funcs leb bytes are absorbed
+        //     into this offset (Off + Size doesn't equal the next function's actual file offset,
+        //     but the map just stacks them: next.Off = prev.Off + prev.Size).
+        //   - Subsequent functions: Off = prev.Off + prev.Size, Size = body_total.
         if id == SECTION_CODE {
             let payload = &bytes[payload_start..payload_end];
             let (num_funcs, nc) = read_leb128(payload).unwrap_or((0, 0));

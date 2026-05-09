@@ -1279,12 +1279,17 @@ fn process_alternatives<'data, P: Platform>(
                 || alternatives
                     .iter()
                     .any(|id| symbol_db.input_symbol_visibility(*id) == Visibility::Hidden));
-        let visibility = alternatives
-            .iter()
-            .fold(symbol_db.input_symbol_visibility(first), |vis, id| {
-                let other = symbol_db.input_symbol_visibility(*id);
-                if all_weak { vis.min(other) } else { vis.max(other) }
-            });
+        let visibility =
+            alternatives
+                .iter()
+                .fold(symbol_db.input_symbol_visibility(first), |vis, id| {
+                    let other = symbol_db.input_symbol_visibility(*id);
+                    if all_weak {
+                        vis.min(other)
+                    } else {
+                        vis.max(other)
+                    }
+                });
 
         match select_symbol(symbol_db, per_symbol_flags, first, &alternatives, resolved) {
             Ok(selected) => {
@@ -1547,10 +1552,7 @@ fn read_symbols<'data, P: Platform>(
     // (which on bevy-dylib was ~200 ms of fs::write storm).
     type GroupOutput<'d> = (
         SymbolLoadOutputs<'d>,
-        Vec<(
-            [u8; crate::parsed_input_cache::BUNDLE_KEY_LEN],
-            Vec<u8>,
-        )>,
+        Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)>,
     );
     let per_group: Vec<GroupOutput<'data>> = shards
         .par_iter_mut()
@@ -1580,8 +1582,7 @@ fn read_symbols<'data, P: Platform>(
     // Write the bundle once for the whole link. Tier-1.5 win: replaces
     // 1649-file fan-out with a single atomic write.
     if !bundle_builder.is_empty() {
-        let bundle_path =
-            crate::parsed_input_cache::bundle_path_for_output(args.output());
+        let bundle_path = crate::parsed_input_cache::bundle_path_for_output(args.output());
         // Best-effort: any IO error drops the bundle silently. The
         // next link will just re-parse — correctness invariant is "a
         // missing or corrupt bundle MUST NOT prevent the link", so we
@@ -1603,17 +1604,15 @@ fn read_symbols<'data, P: Platform>(
 /// Env-var gates for tier-1 incremental-link parse-skip. Three
 /// independent axes:
 ///
-/// * `WILD_INCREMENTAL_PARSE_SKIP_WRITE=1` (alias: `WILD_INCREMENTAL_PARSE_SKIP=1`) —
-///   tee every parse into an on-disk cache file. Safe: writes are
-///   best-effort side-car files that can't affect link correctness.
-/// * `WILD_INCREMENTAL_PARSE_SKIP_CANARY=1` — ALSO load any existing
-///   cache for each input, freshly-build a cache from the live parse,
-///   and compare them byte-for-byte. Any divergence panics the link
-///   with a clear diagnostic. Implies write (a successful canary
-///   refreshes the disk cache). Intended for CI + dev canary runs.
-/// * `WILD_INCREMENTAL_PARSE_SKIP_READ=1` — SKIP the parse entirely
-///   when a cache exists, replaying the cached symbol stream. Only
-///   safe once the canary has been green across the relevant input
+/// * `WILD_INCREMENTAL_PARSE_SKIP_WRITE=1` (alias: `WILD_INCREMENTAL_PARSE_SKIP=1`) — tee every
+///   parse into an on-disk cache file. Safe: writes are best-effort side-car files that can't
+///   affect link correctness.
+/// * `WILD_INCREMENTAL_PARSE_SKIP_CANARY=1` — ALSO load any existing cache for each input,
+///   freshly-build a cache from the live parse, and compare them byte-for-byte. Any divergence
+///   panics the link with a clear diagnostic. Implies write (a successful canary refreshes the disk
+///   cache). Intended for CI + dev canary runs.
+/// * `WILD_INCREMENTAL_PARSE_SKIP_READ=1` — SKIP the parse entirely when a cache exists, replaying
+///   the cached symbol stream. Only safe once the canary has been green across the relevant input
 ///   set; wild itself never enables this implicitly.
 ///
 /// Checked once per group (not per symbol) so the env lookups don't
@@ -1715,7 +1714,9 @@ fn run_object_parse_skip<'data, 'view, P: Platform>(
     // is `Some` only for clean inputs (caller-gated), so any divergence
     // here is a schema or cache-file bug, not a content-changed
     // false-positive.
-    if gates.canary && let Some(view) = cached_view {
+    if gates.canary
+        && let Some(view) = cached_view
+    {
         let fresh_bytes = builder.clone_bytes();
         let disk_bytes = view.as_bytes();
         if fresh_bytes != disk_bytes {
@@ -1777,10 +1778,7 @@ fn read_symbols_for_group<'data, P: Platform>(
     bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
 ) -> Result<(
     SymbolLoadOutputs<'data>,
-    Vec<(
-        [u8; crate::parsed_input_cache::BUNDLE_KEY_LEN],
-        Vec<u8>,
-    )>,
+    Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)>,
 )> {
     verbose_timing_phase!(
         "Read group symbols",
@@ -1795,10 +1793,8 @@ fn read_symbols_for_group<'data, P: Platform>(
     // (key, blob_bytes) pairs to merge into the bundle at end of link.
     // Local to this group; merged into the global bundle by the
     // caller. Allocated empty so non-Objects groups return cleanly.
-    let mut pending_blobs: Vec<(
-        [u8; crate::parsed_input_cache::BUNDLE_KEY_LEN],
-        Vec<u8>,
-    )> = Vec::new();
+    let mut pending_blobs: Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)> =
+        Vec::new();
 
     // Pull `group` out of the shard as a Copy ref before we hand the
     // shard into the sink's &mut. Matching on `shard.group` after the
@@ -1827,9 +1823,7 @@ fn read_symbols_for_group<'data, P: Platform>(
                     .iter()
                     .map(|obj| {
                         let input_is_clean = match clean_input_paths {
-                            Some(clean) => {
-                                clean.contains(obj.parsed.input.file.filename.as_path())
-                            }
+                            Some(clean) => clean.contains(obj.parsed.input.file.filename.as_path()),
                             None => false,
                         };
                         if !input_is_clean {
@@ -2083,11 +2077,7 @@ impl<'data, P: Platform> SymbolSink<'data> for DefaultSymbolSink<'_, '_, '_, 'da
 }
 
 trait SymbolLoader<'data, P: Platform> {
-    fn load_symbols(
-        &self,
-        file_id: FileId,
-        sink: &mut dyn SymbolSink<'data>,
-    ) -> Result {
+    fn load_symbols(&self, file_id: FileId, sink: &mut dyn SymbolSink<'data>) -> Result {
         let base_symbol_id = sink.next_symbol_id();
 
         for symbol in self.object().symbols_iter() {

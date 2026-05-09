@@ -437,20 +437,15 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             }
             (0, 0)
         }
-        let is_shared_library = input.len() >= 22
-            && &input[..4] == b"\0asm"
-            && input[8] == 0
-            && {
-                // section_id=0 (custom), then size LEB, then name LEB,
-                // then the literal bytes "dylink.0".
-                let after_id = &input[9..];
-                let (_size, c1) = quick_leb(after_id);
-                let after_size = &after_id[c1..];
-                let (name_len, c2) = quick_leb(after_size);
-                name_len == 8
-                    && after_size.len() >= c2 + 8
-                    && &after_size[c2..c2 + 8] == b"dylink.0"
-            };
+        let is_shared_library = input.len() >= 22 && &input[..4] == b"\0asm" && input[8] == 0 && {
+            // section_id=0 (custom), then size LEB, then name LEB,
+            // then the literal bytes "dylink.0".
+            let after_id = &input[9..];
+            let (_size, c1) = quick_leb(after_id);
+            let after_size = &after_id[c1..];
+            let (name_len, c2) = quick_leb(after_size);
+            name_len == 8 && after_size.len() >= c2 + 8 && &after_size[c2..c2 + 8] == b"dylink.0"
+        };
 
         // Parse COMDAT groups directly from raw WASM data (§7).
         // The object crate's WASM COMDAT is a stub, so we parse it ourselves.

@@ -3085,13 +3085,11 @@ impl Assertions {
     /// set on the fixture.
     ///
     /// Sampling logic:
-    ///   * Walk the symbol table picking text symbols whose name is
-    ///     unique (skips COMDAT-folded aliases) and whose address is
-    ///     non-zero (skips PLT stubs).
+    ///   * Walk the symbol table picking text symbols whose name is unique (skips COMDAT-folded
+    ///     aliases) and whose address is non-zero (skips PLT stubs).
     ///   * Take the first 64 such symbols.
     ///   * For each, ask `addr2line::Context` to resolve the address.
-    ///   * Count those that come back with at least a function name
-    ///     AND a file AND a line.
+    ///   * Count those that come back with at least a function name AND a file AND a line.
     ///
     /// `addr2line::Loader` walks the binary's `.debug_*` sections
     /// directly via gimli — no external `llvm-symbolizer` /

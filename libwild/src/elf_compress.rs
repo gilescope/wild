@@ -4,24 +4,20 @@
 //! but before the file is finalised. Operates directly on the
 //! `SizedOutput`'s mutable mmap-backed (or in-memory) buffer:
 //!
-//!   1. Walk the SHDR table; pick out every non-`SHF_ALLOC`
-//!      `.debug_*` section that isn't already `SHF_COMPRESSED`
-//!      and whose payload is large enough to compress profitably.
-//!   2. For each picked section, in parallel: zstd-compress the
-//!      payload and prepend an `Elf64_Chdr` header.
-//!   3. Discard any plan whose compressed size isn't strictly
-//!      smaller than the original — leaves the original section
-//!      untouched.
-//!   4. Build the new file as one rewrite: copy through unchanged
-//!      regions, splice in compressed payloads in section order.
-//!   5. Walk SHDR a second time to rewrite every `sh_offset`
-//!      (shifted forward by the running savings up to that section)
-//!      and to update each compressed section's `sh_size` /
-//!      `sh_flags` / `sh_addralign`.
+//!   1. Walk the SHDR table; pick out every non-`SHF_ALLOC` `.debug_*` section that isn't already
+//!      `SHF_COMPRESSED` and whose payload is large enough to compress profitably.
+//!   2. For each picked section, in parallel: zstd-compress the payload and prepend an `Elf64_Chdr`
+//!      header.
+//!   3. Discard any plan whose compressed size isn't strictly smaller than the original — leaves
+//!      the original section untouched.
+//!   4. Build the new file as one rewrite: copy through unchanged regions, splice in compressed
+//!      payloads in section order.
+//!   5. Walk SHDR a second time to rewrite every `sh_offset` (shifted forward by the running
+//!      savings up to that section) and to update each compressed section's `sh_size` / `sh_flags`
+//!      / `sh_addralign`.
 //!   6. Update `e_shoff` in the ELF header.
-//!   7. Tell `SizedOutput` the new final file size via
-//!      [`SizedOutput::set_final_size`] — the same mechanism
-//!      Mach-O uses post-codesign.
+//!   7. Tell `SizedOutput` the new final file size via [`SizedOutput::set_final_size`] — the same
+//!      mechanism Mach-O uses post-codesign.
 //!
 //! `SHF_ALLOC` sections are deliberately untouched: their bytes are
 //! mapped at runtime by `ld.so`, and there is no in-kernel zstd

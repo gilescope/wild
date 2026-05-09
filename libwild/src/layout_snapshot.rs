@@ -6,12 +6,10 @@
 //! AND the list of bundle-keyed input files that contributed bytes
 //! to it. Persisted to `<output>.wild-layout`. Next link can:
 //!
-//! * Compare current vs previous layout to flag layout shifts (the
-//!   tier-2 canary path).
-//! * Combine the contributors map with the parse-skip dirty-input
-//!   set (`.wild-hashes`) to compute a per-section *dirty bitmap*.
-//!   Sections with no dirty contributors and unchanged layout are
-//!   safe for tier 3 to mmap-copy from the previous output.
+//! * Compare current vs previous layout to flag layout shifts (the tier-2 canary path).
+//! * Combine the contributors map with the parse-skip dirty-input set (`.wild-hashes`) to compute a
+//!   per-section *dirty bitmap*. Sections with no dirty contributors and unchanged layout are safe
+//!   for tier 3 to mmap-copy from the previous output.
 //!
 //! This module is **capture + canary only** today — no behavioural
 //! reuse yet. Shipping the storage layer first proves round-trip
@@ -119,7 +117,9 @@ pub(crate) struct LayoutSnapshot {
 
 impl LayoutSnapshot {
     pub(crate) fn new() -> Self {
-        Self { sections: Vec::new() }
+        Self {
+            sections: Vec::new(),
+        }
     }
 
     pub(crate) fn push(&mut self, s: SnapshotSection) {
@@ -176,22 +176,16 @@ impl LayoutSnapshot {
     /// following hold against `prev` (the snapshot from the previous
     /// link, loaded from disk):
     ///
-    /// * Same `(name, file_offset, file_size, mem_offset, mem_size)`
-    ///   — the section hasn't moved or grown, so the bytes a cold
-    ///   writer would emit live at the same spot they used to.
-    /// * The section has at least one contributor — synthetic /
-    ///   writer-generated sections (Mach-O header, LINKEDIT,
-    ///   codesign blob) have empty contributors and are never
-    ///   reusable for tier-3 purposes. The writer regenerates them
-    ///   every link with content that depends on the entire output
-    ///   (e.g. CDHash) or with non-deterministic fields (LC_UUID,
-    ///   build-version timestamp). Pre-filling them from prev would
-    ///   be silently overwritten by the writer; treating them as
-    ///   reusable would also cause spurious canary divergences on
-    ///   the UUID drift.
-    /// * Every contributor key (in `prev`'s contributor list for
-    ///   that section) is in `clean_inputs` — none of the inputs
-    ///   feeding bytes here have changed since the previous link.
+    /// * Same `(name, file_offset, file_size, mem_offset, mem_size)` — the section hasn't moved or
+    ///   grown, so the bytes a cold writer would emit live at the same spot they used to.
+    /// * The section has at least one contributor — synthetic / writer-generated sections (Mach-O
+    ///   header, LINKEDIT, codesign blob) have empty contributors and are never reusable for tier-3
+    ///   purposes. The writer regenerates them every link with content that depends on the entire
+    ///   output (e.g. CDHash) or with non-deterministic fields (LC_UUID, build-version timestamp).
+    ///   Pre-filling them from prev would be silently overwritten by the writer; treating them as
+    ///   reusable would also cause spurious canary divergences on the UUID drift.
+    /// * Every contributor key (in `prev`'s contributor list for that section) is in `clean_inputs`
+    ///   — none of the inputs feeding bytes here have changed since the previous link.
     ///
     /// Returns `Vec<usize>` of indices into `prev.sections` that are
     /// safe for tier 3's writer to mmap-copy from the previous
@@ -326,9 +320,8 @@ impl LayoutSnapshot {
         };
         out[..header_size].copy_from_slice(hdr_bytes);
 
-        let entries_bytes = unsafe {
-            std::slice::from_raw_parts(entries.as_ptr() as *const u8, sections_size)
-        };
+        let entries_bytes =
+            unsafe { std::slice::from_raw_parts(entries.as_ptr() as *const u8, sections_size) };
         out[sections_off..sections_off + sections_size].copy_from_slice(entries_bytes);
         out[names_off..names_off + names_len].copy_from_slice(&names_blob);
         out[contributors_off_aligned..contributors_off_aligned + contributors_len]
@@ -379,10 +372,7 @@ impl LayoutSnapshot {
         }
 
         let entries: &[SectionEntry] = unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr().add(sections_off) as *const SectionEntry,
-                n,
-            )
+            std::slice::from_raw_parts(bytes.as_ptr().add(sections_off) as *const SectionEntry, n)
         };
         let names = &bytes[names_off..names_end];
         let contributors_slice = &bytes[contributors_off..contributors_end];
@@ -402,9 +392,8 @@ impl LayoutSnapshot {
             if cursor + 8 > contributors_slice.len() {
                 return None;
             }
-            let n_keys = u32::from_le_bytes(
-                contributors_slice[cursor..cursor + 4].try_into().ok()?,
-            ) as usize;
+            let n_keys = u32::from_le_bytes(contributors_slice[cursor..cursor + 4].try_into().ok()?)
+                as usize;
             cursor += 8; // skip n_keys + _pad
             let keys_bytes = n_keys.checked_mul(KEY_LEN)?;
             let keys_end = cursor.checked_add(keys_bytes)?;
@@ -583,8 +572,7 @@ mod tests {
     #[test]
     fn write_then_read_round_trip_on_disk() {
         let s = fixture();
-        let tmp =
-            std::env::temp_dir().join(format!("wild-layout-rt-{}.bin", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("wild-layout-rt-{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let snapshot_path = snapshot_path_for_output(&tmp);
         let _ = std::fs::remove_file(&snapshot_path);

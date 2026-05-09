@@ -60,7 +60,6 @@ pub(crate) mod output_section_part_map;
 pub(crate) mod output_trace;
 pub(crate) mod parse_skip;
 pub(crate) mod parsed_input_cache;
-pub(crate) mod tier3_skip;
 pub(crate) mod parsing;
 pub(crate) mod part_id;
 #[cfg(all(
@@ -93,6 +92,7 @@ pub(crate) mod symbol;
 pub(crate) mod symbol_db;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tidy_tests;
+pub(crate) mod tier3_skip;
 pub(crate) mod timing;
 pub(crate) mod validation;
 pub(crate) mod value_flags;
@@ -631,10 +631,7 @@ impl Linker {
         // `(reusable_indices, current_snapshot)` so the post-write
         // path can byte-compare prev_output_mmap vs the freshly-
         // written output for every "would-be reusable" section.
-        let mut tier3_canary_state: Option<(
-            Vec<usize>,
-            layout_snapshot::LayoutSnapshot,
-        )> = None;
+        let mut tier3_canary_state: Option<(Vec<usize>, layout_snapshot::LayoutSnapshot)> = None;
         // Phase 2b "wholesale prev → out copy" predicate: true iff
         // every section's layout matches AND no contributor is
         // dirty. Unlike `tier3_canary_state`'s reusable indices
@@ -659,7 +656,12 @@ impl Linker {
                 let prev_n = prev.len();
                 let cur_n = snapshot.len();
                 let mut first_diff: Option<(usize, String)> = None;
-                for (i, (a, b)) in prev.sections.iter().zip(snapshot.sections.iter()).enumerate() {
+                for (i, (a, b)) in prev
+                    .sections
+                    .iter()
+                    .zip(snapshot.sections.iter())
+                    .enumerate()
+                {
                     if a != b {
                         first_diff = Some((
                             i,
@@ -715,11 +717,7 @@ impl Linker {
                         {
                             continue; // dirty rlib → member is dirty
                         }
-                        let entry_id = obj
-                            .input
-                            .entry
-                            .as_ref()
-                            .map(|e| e.identifier.as_slice());
+                        let entry_id = obj.input.entry.as_ref().map(|e| e.identifier.as_slice());
                         clean_keys.insert(parsed_input_cache::bundle_key_for(path, entry_id));
                     }
                 }
@@ -735,8 +733,7 @@ impl Linker {
                     .filter(|(i, _)| !dirty.contains(i))
                     .map(|(_, s)| s.file_size)
                     .sum();
-                let total_bytes: u64 =
-                    prev_snap.sections.iter().map(|s| s.file_size).sum();
+                let total_bytes: u64 = prev_snap.sections.iter().map(|s| s.file_size).sum();
                 eprintln!(
                     "wild tier-3 probe: {clean_count}/{total_sections} sections \
                      reusable, {reusable_bytes} / {total_bytes} bytes ({pct:.1}%)",
@@ -770,11 +767,7 @@ impl Linker {
                         {
                             continue;
                         }
-                        let entry_id = obj
-                            .input
-                            .entry
-                            .as_ref()
-                            .map(|e| e.identifier.as_slice());
+                        let entry_id = obj.input.entry.as_ref().map(|e| e.identifier.as_slice());
                         clean_keys.insert(parsed_input_cache::bundle_key_for(path, entry_id));
                     }
                 }
@@ -817,47 +810,45 @@ impl Linker {
         // same for two byte-identical files).
         //
         // Cases this fires (where whole-link-skip wouldn't):
-        //   * args_hash differs slightly (e.g. wild upgrade) but
-        //     layout + content stayed stable.
+        //   * args_hash differs slightly (e.g. wild upgrade) but layout + content stayed stable.
         //   * output_size verification falsely failed (timing).
         //   * pre/post-load whole-link-skip explicitly disabled.
         // Saves the entire writer phase (~280 ms on bevy-dylib-class
         // outputs).
-        let did_speculative_skip =
-            if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
-                && tier3_fully_reusable
-                && let Some(prev_bytes) = prev_output_mmap
+        let did_speculative_skip = if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+            && tier3_fully_reusable
+            && let Some(prev_bytes) = prev_output_mmap
+        {
+            // mmap-COW path: tell `file_writer` to open the
+            // output `UpdateInPlace`. The file already contains
+            // prev's bytes, so no memcpy is needed — the writer
+            // closure becomes a no-op. Saves the 50 MB memcpy
+            // on bevy-class outputs.
+            tier3_skip::set(Some(tier3_skip::State {
+                reusable_ids: hashbrown::HashSet::new(),
+                ranges: Vec::new(),
+                prev_bytes,
+                use_in_place: true,
+            }));
+            output.set_size(prev_bytes.len() as u64);
+            output.write(&layout, |_sized_output, _| {
+                // Output file is already prev's bytes via
+                // UpdateInPlace; nothing to do.
+                Ok(())
+            })?;
+            tier3_skip::set(None);
+            if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+                || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
             {
-                // mmap-COW path: tell `file_writer` to open the
-                // output `UpdateInPlace`. The file already contains
-                // prev's bytes, so no memcpy is needed — the writer
-                // closure becomes a no-op. Saves the 50 MB memcpy
-                // on bevy-class outputs.
-                tier3_skip::set(Some(tier3_skip::State {
-                    reusable_ids: hashbrown::HashSet::new(),
-                    ranges: Vec::new(),
-                    prev_bytes,
-                    use_in_place: true,
-                }));
-                output.set_size(prev_bytes.len() as u64);
-                output.write(&layout, |_sized_output, _| {
-                    // Output file is already prev's bytes via
-                    // UpdateInPlace; nothing to do.
-                    Ok(())
-                })?;
-                tier3_skip::set(None);
-                if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
-                    || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
-                {
-                    eprintln!(
-                        "wild tier-3 skip: in-place reuse of {} bytes from prev output",
-                        prev_bytes.len()
-                    );
-                }
-                true
-            } else {
-                false
-            };
+                eprintln!(
+                    "wild tier-3 skip: in-place reuse of {} bytes from prev output",
+                    prev_bytes.len()
+                );
+            }
+            true
+        } else {
+            false
+        };
 
         if !did_speculative_skip {
             // Tier-3 phase 3: partial writer-skip. When some
@@ -871,54 +862,50 @@ impl Linker {
             // Saves writer work proportional to the reusable
             // fraction. Cleared after write returns so the global
             // state doesn't leak across links.
-            let installed_tier3_state =
-                if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
-                    && let Some((reusable, snap)) = tier3_canary_state.as_ref()
-                    && !reusable.is_empty()
-                    && reusable.len() < snap.sections.len()
-                    && let Some(prev_bytes) = prev_output_mmap
+            let installed_tier3_state = if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                && let Some((reusable, snap)) = tier3_canary_state.as_ref()
+                && !reusable.is_empty()
+                && reusable.len() < snap.sections.len()
+                && let Some(prev_bytes) = prev_output_mmap
+            {
+                // Build the OutputSectionId set + the file
+                // ranges to pre-fill, in one pass.
+                let mut reusable_ids: hashbrown::HashSet<
+                    crate::output_section_id::OutputSectionId,
+                > = hashbrown::HashSet::with_capacity(reusable.len());
+                let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(reusable.len());
+                for &i in reusable {
+                    let s = &snap.sections[i];
+                    reusable_ids.insert(crate::output_section_id::OutputSectionId::from_u32(
+                        i as u32,
+                    ));
+                    ranges.push((s.file_offset as usize, s.file_size as usize));
+                }
+                let total = snap.sections.len();
+                let n = reusable.len();
+                let bytes: u64 = ranges.iter().map(|&(_, sz)| sz as u64).sum();
+                if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+                    || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
                 {
-                    // Build the OutputSectionId set + the file
-                    // ranges to pre-fill, in one pass.
-                    let mut reusable_ids: hashbrown::HashSet<
-                        crate::output_section_id::OutputSectionId,
-                    > = hashbrown::HashSet::with_capacity(reusable.len());
-                    let mut ranges: Vec<(usize, usize)> =
-                        Vec::with_capacity(reusable.len());
-                    for &i in reusable {
-                        let s = &snap.sections[i];
-                        reusable_ids.insert(
-                            crate::output_section_id::OutputSectionId::from_u32(
-                                i as u32,
-                            ),
-                        );
-                        ranges.push((s.file_offset as usize, s.file_size as usize));
-                    }
-                    let total = snap.sections.len();
-                    let n = reusable.len();
-                    let bytes: u64 = ranges.iter().map(|&(_, sz)| sz as u64).sum();
-                    if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
-                        || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
-                    {
-                        eprintln!(
-                            "wild tier-3 partial-skip: pre-filling {n}/{total} \
+                    eprintln!(
+                        "wild tier-3 partial-skip: pre-filling {n}/{total} \
                              sections ({bytes} bytes) from prev output; writer \
                              will emit the remaining {} sections only",
-                            total - n
-                        );
-                    }
-                    tier3_skip::set(Some(tier3_skip::State {
-                        reusable_ids,
-                        ranges,
-                        prev_bytes,
-                        // mmap-COW: open the output `UpdateInPlace`
-                        // so prev's bytes ARE the pre-fill.
-                        use_in_place: true,
-                    }));
-                    true
-                } else {
-                    false
-                };
+                        total - n
+                    );
+                }
+                tier3_skip::set(Some(tier3_skip::State {
+                    reusable_ids,
+                    ranges,
+                    prev_bytes,
+                    // mmap-COW: open the output `UpdateInPlace`
+                    // so prev's bytes ARE the pre-fill.
+                    use_in_place: true,
+                }));
+                true
+            } else {
+                false
+            };
 
             let result = P::write_output_file::<A>(&mut output, &layout);
 
@@ -1000,9 +987,7 @@ impl Linker {
                 if let Some((idx, detail)) = first_diverged
                     && byte_matched != total_reusable
                 {
-                    eprintln!(
-                        "wild tier-3 canary: first divergence at section #{idx}: {detail}"
-                    );
+                    eprintln!("wild tier-3 canary: first divergence at section #{idx}: {detail}");
                 }
             }
         }
@@ -1372,11 +1357,7 @@ pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> 
 /// extend beyond `prev.len()` are emitted as zeros — a fresh tail page
 /// in a live process will read as zeros too, so the verification still
 /// works in the typical case.
-fn emit_patch_file(
-    prev: &[u8],
-    new: &[u8],
-    path: &std::path::Path,
-) -> std::io::Result<()> {
+fn emit_patch_file(prev: &[u8], new: &[u8], path: &std::path::Path) -> std::io::Result<()> {
     use std::fmt::Write as _;
 
     let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -1435,7 +1416,10 @@ struct PatchSymbolRange {
 }
 
 fn patch_symbol_ranges(bytes: &[u8]) -> Vec<PatchSymbolRange> {
-    use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+    use object::Object;
+    use object::ObjectSection;
+    use object::ObjectSymbol;
+    use object::SymbolKind;
 
     let Ok(file) = object::File::parse(bytes) else {
         return Vec::new();
@@ -1510,7 +1494,9 @@ fn patch_symbol_ranges(bytes: &[u8]) -> Vec<PatchSymbolRange> {
             .explicit_size
             .checked_add(candidate.file_start)
             .filter(|end| *end > candidate.file_start);
-        let file_end = explicit_end.unwrap_or(inferred_end).min(candidate.section_end);
+        let file_end = explicit_end
+            .unwrap_or(inferred_end)
+            .min(candidate.section_end);
         if file_end > candidate.file_start {
             ranges.push(PatchSymbolRange {
                 file_start: candidate.file_start,

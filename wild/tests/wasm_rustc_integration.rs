@@ -12,15 +12,11 @@
 //!
 //! The test driver:
 //!   1. Writes a trivial hello-world `main.rs` to a tempdir.
-//!   2. Builds it with `cargo build --release --target
-//!      wasm32-wasip2`, routing the link step through a capture
-//!      shim that forwards to rust-lld's `wasm-ld` so cargo's own
-//!      build succeeds but we also record the linker argv + input
-//!      files.
-//!   3. Replays the captured link with wild (invoked as
-//!      `wasm-ld` via a symlink — wild's arg parser detects wasm
-//!      mode from the filename) and validates the output with
-//!      wasmparser.
+//!   2. Builds it with `cargo build --release --target wasm32-wasip2`, routing the link step
+//!      through a capture shim that forwards to rust-lld's `wasm-ld` so cargo's own build succeeds
+//!      but we also record the linker argv + input files.
+//!   3. Replays the captured link with wild (invoked as `wasm-ld` via a symlink — wild's arg parser
+//!      detects wasm mode from the filename) and validates the output with wasmparser.
 //!
 //! Marked `#[ignore]` by default because it needs an installed
 //! `wasm32-wasip2` target and a rust-lld bundled with the
@@ -87,28 +83,21 @@ fn has_wasip2_target() -> bool {
 ///
 /// History — both sub-bugs now fixed:
 ///
-/// 1. **Element-segment init expr** — fixed in 08f3d02. Wild was
-///    emitting `global.get <__table_base>` even when __table_base
-///    is a defined (synth) global; spec §3.4.5 requires the
-///    referenced global to be imported. Static-PIC mode now folds
-///    to `i32.const 1` directly.
+/// 1. **Element-segment init expr** — fixed in 08f3d02. Wild was emitting `global.get
+///    <__table_base>` even when __table_base is a defined (synth) global; spec §3.4.5 requires the
+///    referenced global to be imported. Static-PIC mode now folds to `i32.const 1` directly.
 ///
-/// 2. **Per-input function-import-index → output-import-index
-///    remap missing** — fixed in this commit. Each input's bodies
-///    encode `call <input-import-idx>` (with a R_WASM_FUNCTION_INDEX_LEB
-///    reloc on the LEB), but pre-fix wild only had a name-based
-///    lookup keyed on rust-mangled symbol names — which never
-///    match wit-bindgen import field names like `output-stream`.
-///    The body then kept the input's local view, and the post-merge
-///    shift turned `call N` into `call N + num_imported_functions`
-///    landing on whatever defined function happened to sit there
-///    (e.g. `Error::_new` for what should have been `OutputStream::drop`).
-///    Now `per_obj_func_imp_remap` (built right before Pass 2 so
-///    `__wasm_call_ctors` is already in `function_name_map`) gives
-///    each input's import index the correct output index, and the
-///    post-shift fixup pass re-applies it via `import_call_fixups`.
-///    Recorded indices get +1'd when the ctor function is inserted
-///    at `functions[0]` — without that, every recorded fixup would
+/// 2. **Per-input function-import-index → output-import-index remap missing** — fixed in this
+///    commit. Each input's bodies encode `call <input-import-idx>` (with a
+///    R_WASM_FUNCTION_INDEX_LEB reloc on the LEB), but pre-fix wild only had a name-based lookup
+///    keyed on rust-mangled symbol names — which never match wit-bindgen import field names like
+///    `output-stream`. The body then kept the input's local view, and the post-merge shift turned
+///    `call N` into `call N + num_imported_functions` landing on whatever defined function happened
+///    to sit there (e.g. `Error::_new` for what should have been `OutputStream::drop`). Now
+///    `per_obj_func_imp_remap` (built right before Pass 2 so `__wasm_call_ctors` is already in
+///    `function_name_map`) gives each input's import index the correct output index, and the
+///    post-shift fixup pass re-applies it via `import_call_fixups`. Recorded indices get +1'd when
+///    the ctor function is inserted at `functions[0]` — without that, every recorded fixup would
 ///    overwrite the wrong body.
 #[test]
 #[ignore = "needs installed wasm32-wasip2 target + a bundled rust-lld"]
@@ -125,8 +114,8 @@ fn rustc_hello_produces_valid_wasm() {
     let td = tempfile::tempdir().expect("tempdir");
     let root = td.path();
 
-    // 1. Write a tiny cargo project. Standalone `[workspace]` so we
-    //    don't get dragged into wild's host workspace.
+    // 1. Write a tiny cargo project. Standalone `[workspace]` so we don't get dragged into wild's
+    //    host workspace.
     std::fs::write(
         root.join("Cargo.toml"),
         r#"[workspace]
@@ -150,9 +139,8 @@ panic = "abort"
     )
     .unwrap();
 
-    // 2. Build via cargo, capturing the link via our shim. Cargo's
-    //    own build uses wasm-ld so it succeeds — we just record the
-    //    argv + inputs for step 3.
+    // 2. Build via cargo, capturing the link via our shim. Cargo's own build uses wasm-ld so it
+    //    succeeds — we just record the argv + inputs for step 3.
     let capture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -189,11 +177,10 @@ panic = "abort"
         "capture-link.sh didn't produce a run-with — was cargo's link captured?"
     );
 
-    // 3. Replay the captured link with wild, via a `wasm-ld`
-    //    symlink so wild's arg parser picks wasm mode from the
-    //    invocation name. Our run-with template knows to skip the
-    //    `--target wasm32` injection when the linker's basename is
-    //    `wasm-ld`, so wild-as-wasm-ld behaves like wasm-ld here.
+    // 3. Replay the captured link with wild, via a `wasm-ld` symlink so wild's arg parser picks
+    //    wasm mode from the invocation name. Our run-with template knows to skip the `--target
+    //    wasm32` injection when the linker's basename is `wasm-ld`, so wild-as-wasm-ld behaves like
+    //    wasm-ld here.
     let wild = wild_binary_path();
     let shim = root.join("wasm-ld");
     #[cfg(unix)]

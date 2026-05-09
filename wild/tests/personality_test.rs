@@ -94,10 +94,7 @@ fn cie_personality_reloc_resolves_correctly() {
         .expect("invoke cargo");
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "build via wild failed:\n{text}"
-    );
+    assert!(out.status.success(), "build via wild failed:\n{text}");
 
     let bin = root.join("target/release/personality-test-fixture");
     let run = Command::new(&bin).output().expect("run linked binary");

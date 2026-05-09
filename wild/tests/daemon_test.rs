@@ -81,11 +81,7 @@ impl DaemonGuard {
         Self::start_with_env(wild, socket, &[("WILD_DAEMON_INPROCESS", "1")])
     }
 
-    fn start_with_env(
-        wild: &Path,
-        socket: PathBuf,
-        extra_env: &[(&str, &str)],
-    ) -> Option<Self> {
+    fn start_with_env(wild: &Path, socket: PathBuf, extra_env: &[(&str, &str)]) -> Option<Self> {
         let _ = std::fs::remove_file(&socket);
         let mut cmd = Command::new(wild);
         cmd.arg("--serve").arg(&socket);
@@ -235,10 +231,7 @@ fn run_link_via_daemon(in_process: bool) {
         }
     };
 
-    let rustflags = format!(
-        "-C link-arg=-fuse-ld={} --cfg daemon_test",
-        wild.display()
-    );
+    let rustflags = format!("-C link-arg=-fuse-ld={} --cfg daemon_test", wild.display());
     let out = Command::new("cargo")
         .current_dir(&root)
         .args(["build", "--release"])

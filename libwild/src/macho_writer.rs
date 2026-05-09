@@ -1546,16 +1546,13 @@ fn lib_ordinal_for_symbol(has_extra_dylibs: bool, flat_namespace: bool) -> u8 {
 ///
 /// Wild emits load commands as `[LibSystem, ExtraDylibs[0..N]]`, so the
 /// bind ordinals are:
-/// * `1` — libSystem (default for any symbol that isn't otherwise
-///   attributed to a specific dylib).
-/// * `i + 2` — `extra_dylibs[i]`, when `dylib_symbol_provenance` maps
-///   the symbol name there. The provenance map is populated when a
-///   .tbd / .dylib is resolved through `-l<lib>` /
-///   `-framework <name>` / positional input.
-/// * `0xFE` — `BIND_SPECIAL_DYLIB_FLAT_LOOKUP`. We fall back to flat
-///   lookup only when `-flat_namespace` is in effect; otherwise an
-///   uncategorised symbol is assigned to libSystem (matches ld64's
-///   default for most C/POSIX entries).
+/// * `1` — libSystem (default for any symbol that isn't otherwise attributed to a specific dylib).
+/// * `i + 2` — `extra_dylibs[i]`, when `dylib_symbol_provenance` maps the symbol name there. The
+///   provenance map is populated when a .tbd / .dylib is resolved through `-l<lib>` / `-framework
+///   <name>` / positional input.
+/// * `0xFE` — `BIND_SPECIAL_DYLIB_FLAT_LOOKUP`. We fall back to flat lookup only when
+///   `-flat_namespace` is in effect; otherwise an uncategorised symbol is assigned to libSystem
+///   (matches ld64's default for most C/POSIX entries).
 ///
 /// This replaces the old all-or-nothing `lib_ordinal_for_symbol`
 /// behaviour where any presence of `extra_dylibs` forced every bind
@@ -1576,13 +1573,10 @@ fn lib_ordinal_for_named_symbol(args: &crate::args::macho::MachOArgs, name: &[u8
     }
     // Symbol wasn't attributed to any specific extra dylib. We have
     // two safe defaults:
-    //   * libSystem (ordinal 1) — works for the C/POSIX entries, but
-    //     fails for libc++ entries like `___cxa_allocate_exception`
-    //     when the link doesn't separately flag libc++ as its
-    //     provider.
-    //   * BIND_SPECIAL_DYLIB_FLAT_LOOKUP (0xFE) — dyld searches every
-    //     loaded image, slower but always finds it (matches wild's
-    //     historical behaviour before two-level binds landed).
+    //   * libSystem (ordinal 1) — works for the C/POSIX entries, but fails for libc++ entries like
+    //     `___cxa_allocate_exception` when the link doesn't separately flag libc++ as its provider.
+    //   * BIND_SPECIAL_DYLIB_FLAT_LOOKUP (0xFE) — dyld searches every loaded image, slower but
+    //     always finds it (matches wild's historical behaviour before two-level binds landed).
     // Choose flat lookup when the link has any extra dylibs beyond
     // libSystem; otherwise libSystem is the only candidate anyway.
     if args.extra_dylibs.is_empty() {
@@ -5955,11 +5949,10 @@ fn apply_relocations(
                 // side treats as thread-local. ld64 reports the same
                 // wording the TLVP→non-TLS path uses, since the mismatch
                 // is symmetric. Two flavours to catch:
-                //   1. Dylib import: dylib's nlist places the symbol in an
-                //      S_THREAD_LOCAL_* section (`dylib_tls_symbols`).
-                //   2. Local definition pulled in from another object:
-                //      target_addr lands inside the executable's TLS
-                //      output sections (TDATA/TBSS/PREINIT_ARRAY).
+                //   1. Dylib import: dylib's nlist places the symbol in an S_THREAD_LOCAL_* section
+                //      (`dylib_tls_symbols`).
+                //   2. Local definition pulled in from another object: target_addr lands inside the
+                //      executable's TLS output sections (TDATA/TBSS/PREINIT_ARRAY).
                 if reloc.r_type == 5 && reloc.r_extern {
                     let sym_idx = object::SymbolIndex(reloc.r_symbolnum as usize);
                     let sym_id = obj.symbol_id_range.input_to_id(sym_idx);

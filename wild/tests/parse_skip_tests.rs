@@ -5,14 +5,12 @@
 //! These build a trivial C program, link it through wild under each
 //! gate in turn, and assert:
 //!
-//! 1. The write pass populates the on-disk cache without blowing up
-//!    or corrupting the output binary.
-//! 2. The canary pass (which builds a fresh cache AND compares it
-//!    against the one just written) does not panic. A lossy schema
-//!    or stale cache would panic here via
+//! 1. The write pass populates the on-disk cache without blowing up or corrupting the output
+//!    binary.
+//! 2. The canary pass (which builds a fresh cache AND compares it against the one just written)
+//!    does not panic. A lossy schema or stale cache would panic here via
 //!    `symbol_db::panic_canary_diff`.
-//! 3. The read pass reproduces a runnable binary whose exit code
-//!    matches the fresh-parse baseline.
+//! 3. The read pass reproduces a runnable binary whose exit code matches the fresh-parse baseline.
 //!
 //! Only runs on macOS. If `clang` isn't available the test is
 //! skipped — same policy as the existing macho integration harness.
@@ -255,17 +253,15 @@ fn parse_skip_gates_round_trip() {
     // skips the platform writer entirely and copies prev bytes
     // wholesale into the new output. Asserts:
     //   * stderr names the skip path,
-    //   * the resulting binary runs and exits 42 (functional
-    //     correctness of the byte-copy + codesign preservation).
+    //   * the resulting binary runs and exits 42 (functional correctness of the byte-copy +
+    //     codesign preservation).
     // Two cold runs of wild aren't necessarily byte-identical
     // (wild's writer has pre-existing non-determinism in
     // LC_UUID / timestamp regions), so we can't assert byte-
     // equivalence vs a fresh cold link — but the canary above
     // proved per-section bytes match, and the run + exit code
     // here proves codesign + load commands stayed valid.
-    let prev_size = std::fs::metadata(&write_out)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let prev_size = std::fs::metadata(&write_out).map(|m| m.len()).unwrap_or(0);
     let (ok, out) = link_with_wild(
         &obj,
         &write_out,
@@ -284,9 +280,7 @@ fn parse_skip_gates_round_trip() {
          …` (either `bypassed writer …` or `in-place reuse …`) in \
          stderr but got:\n{out}"
     );
-    let new_size = std::fs::metadata(&write_out)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let new_size = std::fs::metadata(&write_out).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
         prev_size, new_size,
         "tier-3 skip output size shifted — speculative copy is supposed to \

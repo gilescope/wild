@@ -8,13 +8,11 @@
 //! linker sees the new symbols.
 //!
 //! Failure modes if cache invalidation is wrong:
-//! * Stale parse of B → B's symbol table mentions methods that don't
-//!   match A's new vtable layout → undefined-symbol error or
-//!   miscompile.
-//! * Stale parse of A → trait impl points at the old method body's
-//!   address → run-time output reflects the old method, not the new
-//!   one. We catch this by asserting the binary's STDOUT changes
-//!   between the pre-change and post-change runs.
+//! * Stale parse of B → B's symbol table mentions methods that don't match A's new vtable layout →
+//!   undefined-symbol error or miscompile.
+//! * Stale parse of A → trait impl points at the old method body's address → run-time output
+//!   reflects the old method, not the new one. We catch this by asserting the binary's STDOUT
+//!   changes between the pre-change and post-change runs.
 //!
 //! Only runs on macOS (target host for tier-1 today). Skips cleanly
 //! if rustup / cargo aren't available.

@@ -34,6 +34,10 @@ use daemon_protocol::read_response;
 use daemon_protocol::write_request;
 
 fn main() -> ExitCode {
+    println!("Hellow world");
+    let mut c = vec!["a", "b", "C"];
+    c.pop();
+    c.pop();
     let socket_path = match std::env::var_os("WILD_SERVER") {
         Some(s) => PathBuf::from(s),
         None => {

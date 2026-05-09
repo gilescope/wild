@@ -392,10 +392,7 @@ const _: () = {
 
 /// Derive the bundle key for one input. Length-prefixed so
 /// `(path="ab", entry="c")` and `(path="a", entry="bc")` can't alias.
-pub(crate) fn bundle_key_for(
-    input: &Path,
-    entry_id: Option<&[u8]>,
-) -> [u8; BUNDLE_KEY_LEN] {
+pub(crate) fn bundle_key_for(input: &Path, entry_id: Option<&[u8]>) -> [u8; BUNDLE_KEY_LEN] {
     let mut h = blake3::Hasher::new();
     h.update(input.as_os_str().as_encoded_bytes());
     if let Some(id) = entry_id {
@@ -461,10 +458,7 @@ impl<'data> BundleView<'data> {
             return None;
         }
         let toc = unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr().add(toc_off) as *const BundleTocEntry,
-                n,
-            )
+            std::slice::from_raw_parts(bytes.as_ptr().add(toc_off) as *const BundleTocEntry, n)
         };
         let mut index = hashbrown::HashMap::with_capacity_and_hasher(n, Default::default());
         for entry in toc {
@@ -512,9 +506,7 @@ impl<'data> BundleView<'data> {
 /// Any I/O / validation failure → `None`; callers fall through to
 /// the re-parse path. Never returns an error: a stale or corrupt
 /// bundle MUST NOT prevent linking.
-pub(crate) fn try_load_bundle_view_mmap(
-    output: &Path,
-) -> Option<&'static BundleView<'static>> {
+pub(crate) fn try_load_bundle_view_mmap(output: &Path) -> Option<&'static BundleView<'static>> {
     let path = bundle_path_for_output(output);
     let file = std::fs::File::open(&path).ok()?;
     // SAFETY: opened read-only and immediately leaked, so the mapping
@@ -535,7 +527,9 @@ pub(crate) struct BundleBuilder {
 
 impl BundleBuilder {
     pub(crate) fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub(crate) fn push(&mut self, key: [u8; BUNDLE_KEY_LEN], blob: Vec<u8>) {
@@ -829,8 +823,8 @@ mod tests {
 
         // Write to a unique temp output path; bundle_path_for_output
         // appends `.wild-pi-cache`.
-        let tmp_out = std::env::temp_dir()
-            .join(format!("wild-bundle-rt-{}.bin", std::process::id()));
+        let tmp_out =
+            std::env::temp_dir().join(format!("wild-bundle-rt-{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&tmp_out);
         let bundle_path = bundle_path_for_output(&tmp_out);
         let _ = std::fs::remove_file(&bundle_path);

@@ -5,15 +5,12 @@
 //! [`SymbolSink::add_non_versioned`], [`SymbolSink::add_versioned`].
 //! This module provides the shims tier-1 needs:
 //!
-//! * [`TeeSink`] — forwards every op to an inner sink *and* records it
-//!   into a [`CacheBuilder`]. The write path uses this to snapshot the
-//!   parse of a clean input.
-//! * [`CaptureSink`] — records the op stream into a
-//!   `Vec<StreamOp>` without writing anywhere else. Used by the canary
-//!   to diff the re-parse against the cache replay.
-//! * [`replay_cached_symbols`] — reads a cached stream and replays it
-//!   back into a sink, reproducing the original `(shard, outputs)`
-//!   effects without re-iterating the object crate.
+//! * [`TeeSink`] — forwards every op to an inner sink *and* records it into a [`CacheBuilder`]. The
+//!   write path uses this to snapshot the parse of a clean input.
+//! * [`CaptureSink`] — records the op stream into a `Vec<StreamOp>` without writing anywhere else.
+//!   Used by the canary to diff the re-parse against the cache replay.
+//! * [`replay_cached_symbols`] — reads a cached stream and replays it back into a sink, reproducing
+//!   the original `(shard, outputs)` effects without re-iterating the object crate.
 //!
 //! ## What the v1 cache schema captures
 //!
@@ -21,8 +18,8 @@
 //! [`CachedSymbolKind::Defined`] tags a symbol by its sink-op shape:
 //! * `Undefined` — only a `set_next(flags, UNDEF, file_id)`; no adds.
 //! * `Local`     — only a `set_next(flags, symbol_id, file_id)`; no adds.
-//! * `Defined`   — an `add_non_versioned(name)` followed by a
-//!   `set_next(flags, symbol_id, file_id)`.
+//! * `Defined`   — an `add_non_versioned(name)` followed by a `set_next(flags, symbol_id,
+//!   file_id)`.
 //!
 //! Mach-O `RawSymbolName::version_name()` always returns `None` and
 //! `is_default()` always returns `true`, so the v1 schema is lossless
@@ -317,10 +314,8 @@ pub(crate) fn replay_cached_symbols<'data, S: SymbolSink<'data>>(
                 sink.set_next(flags, symbol_id, file_id);
             }
             CachedSymbolKind::Defined => {
-                let prehashed = crate::hash::PreHashed::new(
-                    UnversionedSymbolName::new(entry.name),
-                    entry.hash,
-                );
+                let prehashed =
+                    crate::hash::PreHashed::new(UnversionedSymbolName::new(entry.name), entry.hash);
                 sink.add_non_versioned(PendingSymbol::from_prehashed(symbol_id, prehashed));
                 sink.set_next(flags, symbol_id, file_id);
             }
@@ -428,11 +423,7 @@ mod tests {
         let mut tee = TeeSink::new(&mut inner, Some(CacheBuilder::default()));
 
         // Undefined: set_next with UNDEF resolution, no add.
-        tee.set_next(
-            ValueFlags::ABSOLUTE,
-            SymbolId::undefined(),
-            file_id_one(),
-        );
+        tee.set_next(ValueFlags::ABSOLUTE, SymbolId::undefined(), file_id_one());
         // Local: set_next with a real resolution but no preceding add.
         let sid = tee.next_symbol_id();
         tee.set_next(ValueFlags::empty(), sid, file_id_one());
@@ -514,7 +505,10 @@ mod tests {
         };
         let a = build();
         let b = build();
-        assert_eq!(a, b, "two identical parse streams produced different cache bytes");
+        assert_eq!(
+            a, b,
+            "two identical parse streams produced different cache bytes"
+        );
     }
 
     /// `clone_bytes` must agree with a fresh `finish()` on the same

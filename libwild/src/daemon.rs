@@ -89,9 +89,7 @@ pub fn serve(socket_path: &Path) -> Result<()> {
     );
 
     loop {
-        let (stream, _addr) = listener
-            .accept()
-            .context("daemon: accept failed")?;
+        let (stream, _addr) = listener.accept().context("daemon: accept failed")?;
         if let Err(e) = handle_one(stream) {
             // Per-connection errors are non-fatal — log and keep
             // serving so a buggy client can't take down the daemon.
@@ -118,9 +116,8 @@ fn handle_one(stream: UnixStream) -> Result<()> {
     // belt-and-braces isolation; the in-process path is now
     // correct under burnin (40+ consecutive calls) but still pays
     // a per-link rayon-pool spin-up that fork avoids implicitly.
-    let in_process = std::env::var_os("WILD_DAEMON_INPROCESS")
-        .as_deref()
-        == Some(std::ffi::OsStr::new("1"));
+    let in_process =
+        std::env::var_os("WILD_DAEMON_INPROCESS").as_deref() == Some(std::ffi::OsStr::new("1"));
     let resp = if in_process {
         run_link_in_process(&req)?
     } else {
@@ -162,7 +159,12 @@ fn run_link_in_child(req: &Request) -> Result<Response> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = std::io::Error::last_os_error();
-        for fd in [stderr_pipe[0], stderr_pipe[1], stdout_pipe[0], stdout_pipe[1]] {
+        for fd in [
+            stderr_pipe[0],
+            stderr_pipe[1],
+            stdout_pipe[0],
+            stdout_pipe[1],
+        ] {
             let _ = unsafe { libc::close(fd) };
         }
         return Err(err).context("daemon: fork failed");
@@ -222,9 +224,7 @@ fn drain_fd_in_thread(fd: libc::c_int) -> std::thread::JoinHandle<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let n = unsafe {
-                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -336,9 +336,7 @@ fn run_link_in_process(req: &Request) -> Result<Response> {
         libc::close(stdout_pipe[1]);
     }
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_link_directly(req)
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_link_directly(req)));
 
     // Restore daemon's stderr/stdout BEFORE draining so any
     // diagnostics from `drain_pipe` itself aren't lost into our
@@ -413,7 +411,6 @@ fn drain_fd_nonblocking(fd: libc::c_int) -> Vec<u8> {
     unsafe { libc::close(fd) };
     out
 }
-
 
 /// Client side: connect to `socket_path`, send the current process's
 /// argv/env/cwd as a [`Request`], read back the [`Response`], replay

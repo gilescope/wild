@@ -97,10 +97,7 @@ fn wild_links_zstd_dependent_binary_cleanly() {
         .expect("invoke cargo");
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "build via wild failed:\n{text}"
-    );
+    assert!(out.status.success(), "build via wild failed:\n{text}");
 
     let bin = root.join("target/release/wild-on-wild-trigger");
     let run = Command::new(&bin).output().expect("run linked binary");

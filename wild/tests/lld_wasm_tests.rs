@@ -770,9 +770,7 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
         if let Some(d) = &current_cwd {
             cmd.current_dir(d);
         }
-        let output = cmd
-            .output()
-            .map_err(|e| format!("sh exec: {e}"))?;
+        let output = cmd.output().map_err(|e| format!("sh exec: {e}"))?;
 
         if expect_failure {
             // Either path is acceptable: the pipeline failed (FileCheck

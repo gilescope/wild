@@ -14,11 +14,10 @@
 //!
 //! The algorithm is a near-port of `experiments/debug-line-rewrite/
 //! src/main.rs`'s phase 2b, adapted to:
-//!   * Operate on a `&mut SizedOutput` (mmap-backed) and
-//!     `set_final_size` rather than allocating a fresh `Vec<u8>`.
-//!     We do build the rewrite in a temporary `Vec<u8>` and memcpy
-//!     back, because the in-place arithmetic is gnarly when sections
-//!     both grow (new .debug_line_str) and shrink (.debug_line).
+//!   * Operate on a `&mut SizedOutput` (mmap-backed) and `set_final_size` rather than allocating a
+//!     fresh `Vec<u8>`. We do build the rewrite in a temporary `Vec<u8>` and memcpy back, because
+//!     the in-place arithmetic is gnarly when sections both grow (new .debug_line_str) and shrink
+//!     (.debug_line).
 //!   * Use `libwild::error::Result` + `bail!` / `ensure!`.
 //!   * Gimli 0.33 (workspace pin) instead of 0.31 (experiment pin).
 
@@ -362,10 +361,9 @@ fn emit_v5_line_program_pooled(out: &mut Vec<u8>, cu: &CuLineInfo, pool: &mut Li
 ///
 /// Four kinds of op drive the rewrite:
 ///   * replace: `delete > 0`, `insert.len() > 0` — op A (.debug_line).
-///   * pure insert: `delete = 0`, `insert.len() > 0` — op B (the new
-///     .debug_line_str) and op C (.shstrtab name append).
-///   * pure delete: `delete > 0`, `insert = []` — not currently used
-///     but the machinery handles it.
+///   * pure insert: `delete = 0`, `insert.len() > 0` — op B (the new .debug_line_str) and op C
+///     (.shstrtab name append).
+///   * pure delete: `delete > 0`, `insert = []` — not currently used but the machinery handles it.
 struct Op {
     position: usize,
     delete: usize,
@@ -696,9 +694,8 @@ mod tests {
     ///
     /// `layout` picks where the SHDR table lives in the file:
     ///   * `ShdrLate` — after all sections (gcc/ld convention).
-    ///   * `ShdrEarly` — right after PHDR, BEFORE section content
-    ///     (wild's own convention; exercises phase 4b's SHDR-move
-    ///     fix).
+    ///   * `ShdrEarly` — right after PHDR, BEFORE section content (wild's own convention; exercises
+    ///     phase 4b's SHDR-move fix).
     ///
     /// `extra_section_at_debug_line_end`: when true, add a 4th
     /// SHDR entry for a zero-size section whose `sh_offset` is
@@ -767,7 +764,8 @@ mod tests {
             file_size,
         ) = match layout {
             ShdrLayout::Late => {
-                // ehdr | phdr | PT_LOAD | .debug_info | .debug_line | [trail_edge] | .shstrtab | SHDR
+                // ehdr | phdr | PT_LOAD | .debug_info | .debug_line | [trail_edge] | .shstrtab |
+                // SHDR
                 let load_off = phdr_end;
                 let load_end = load_off + phdr_load_bytes.len();
                 let di = load_end;
@@ -787,7 +785,8 @@ mod tests {
                 (shoff, load_off, di, dl, sh, trail, total)
             }
             ShdrLayout::Early => {
-                // ehdr | phdr | SHDR | PT_LOAD | .debug_info | .debug_line | [trail_edge] | .shstrtab
+                // ehdr | phdr | SHDR | PT_LOAD | .debug_info | .debug_line | [trail_edge] |
+                // .shstrtab
                 let shoff = phdr_end;
                 let shdr_end = shoff + n_sections * ELF64_SHDR_SIZE;
                 let load_off = shdr_end;

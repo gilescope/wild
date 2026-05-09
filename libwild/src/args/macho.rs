@@ -661,8 +661,7 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
                                 }
                             }
                         }
-                        args.system_tbd_dir_walked =
-                            Some(Box::from(system_dir.as_path()));
+                        args.system_tbd_dir_walked = Some(Box::from(system_dir.as_path()));
                         crate::sdk_cache::save_sdk_symbols(sdk, &args.dylib_symbols);
                     }
                 }
@@ -772,8 +771,7 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             // (joined form) is handled by the generic `--key=value`
             // splitter higher up.
             if let Some(val) = input.next() {
-                args.common.incremental_cache =
-                    super::IncrementalCacheMode::parse(val.as_ref())?;
+                args.common.incremental_cache = super::IncrementalCacheMode::parse(val.as_ref())?;
             }
             return Ok(());
         }
@@ -935,7 +933,10 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             // link over a typo'd headerpad.
             if let Some(val) = input.next() {
                 let s = val.as_ref();
-                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                let s = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .unwrap_or(s);
                 if let Ok(n) = u64::from_str_radix(s, 16) {
                     args.headerpad = Some(n);
                 }
@@ -1894,8 +1895,7 @@ fn collect_tbd_symbols_impl(
 ///
 /// Format:
 ///   reexported-libraries:
-///     - targets:   [ arm64e-macos, ... ]
-///       libraries: [ '/System/Library/Frameworks/.../X', '...' ]
+///     - targets:   [ arm64e-macos, ... ] libraries: [ '/System/Library/Frameworks/.../X', '...' ]
 ///
 /// We don't filter by target: out-of-target re-exports resolve to
 /// .tbd files whose own target filter excludes their symbols, so the
@@ -2089,8 +2089,7 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
                         .entry(sym.as_ref().to_vec())
                         .or_insert(dylib_idx);
                 }
-                args.dylib_symbols
-                    .extend(symbols.iter().cloned());
+                args.dylib_symbols.extend(symbols.iter().cloned());
                 framework_session_insert(
                     session_key,
                     CachedFrameworkResolution {
@@ -2192,12 +2191,7 @@ fn handle_tbd_input(args: &mut MachOArgs, path: &Path) -> Result {
     let mut install_name = parse_tbd_install_name(path);
     let symbols_before: usize = args.dylib_symbols.len();
     let mut fresh: DylibSymbols = Default::default();
-    collect_tbd_symbols_with_directives(
-        path,
-        &mut fresh,
-        args.minos,
-        &mut install_name,
-    );
+    collect_tbd_symbols_with_directives(path, &mut fresh, args.minos, &mut install_name);
     // Check app-extension safety from .tbd flags.
     if let Ok(content) = std::fs::read_to_string(path) {
         if let Ok(records) = text_stub_library::parse_str(&content) {
@@ -2344,36 +2338,30 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
             // headers and collect each section's `flags` (the low
             // byte is the section type, e.g. S_THREAD_LOCAL_*).
             if cmd == 0x19 && cmdsize >= 72 {
-                let nsects = u32::from_le_bytes(
-                    data[offset + 64..offset + 68].try_into().unwrap(),
-                ) as usize;
+                let nsects =
+                    u32::from_le_bytes(data[offset + 64..offset + 68].try_into().unwrap()) as usize;
                 let mut sec_off = offset + 72;
                 for _ in 0..nsects {
                     if sec_off + 80 > data.len() || sec_off + 80 > offset + cmdsize {
                         break;
                     }
                     // section_64.flags is at offset 64 within the 80-byte struct.
-                    let flags = u32::from_le_bytes(
-                        data[sec_off + 64..sec_off + 68].try_into().unwrap(),
-                    );
+                    let flags =
+                        u32::from_le_bytes(data[sec_off + 64..sec_off + 68].try_into().unwrap());
                     section_types.push(flags);
                     sec_off += 80;
                 }
             }
             // LC_SYMTAB = 0x02
             if cmd == 0x02 && cmdsize >= 24 {
-                let symoff = u32::from_le_bytes(
-                    data[offset + 8..offset + 12].try_into().unwrap(),
-                ) as usize;
-                let nsyms = u32::from_le_bytes(
-                    data[offset + 12..offset + 16].try_into().unwrap(),
-                ) as usize;
-                let stroff = u32::from_le_bytes(
-                    data[offset + 16..offset + 20].try_into().unwrap(),
-                ) as usize;
-                let strsize = u32::from_le_bytes(
-                    data[offset + 20..offset + 24].try_into().unwrap(),
-                ) as usize;
+                let symoff =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                let nsyms =
+                    u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+                let stroff =
+                    u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
+                let strsize =
+                    u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap()) as usize;
                 symtab_info = Some((symoff, nsyms, stroff, strsize));
             }
             offset += cmdsize;
@@ -2394,8 +2382,7 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
             let strtab = &data[stroff..str_end];
             for i in 0..nsyms {
                 let off = symoff + i * NLIST_64_SIZE;
-                let n_strx =
-                    u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+                let n_strx = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
                 let n_type = data[off + 4];
                 let n_sect = data[off + 5] as usize;
                 // External, defined-in-section: N_EXT (0x01) set,

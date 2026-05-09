@@ -377,17 +377,13 @@ fn translate_incremental_flag(mode: IncrementalCacheMode) {
         {
             std::env::set_var("WILD_INCREMENTAL_PARSE_SKIP_WRITE", "1");
         }
-        if mode.reads_cache()
-            && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_none()
-        {
+        if mode.reads_cache() && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_none() {
             std::env::set_var("WILD_INCREMENTAL_PARSE_SKIP_READ", "1");
         }
         // ReadWrite implies the speculative writer-skip too — that's
         // the actual perf win. Users who only want parse-skip can
         // still force it off via `WILD_INCREMENTAL_TIER3_SKIP=0`.
-        if mode.reads_cache()
-            && std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_none()
-        {
+        if mode.reads_cache() && std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_none() {
             std::env::set_var("WILD_INCREMENTAL_TIER3_SKIP", "1");
         }
     }
