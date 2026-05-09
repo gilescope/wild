@@ -533,22 +533,24 @@ impl Linker {
         // correctly conservative — if every "reusable" section has
         // bytes byte-identical to those a cold writer just emitted,
         // tier-3 phase 2b's actual section-skip is empirically safe.
-        // Gated on WILD_INCREMENTAL_TIER3_CANARY=1 so cold/normal
-        // links stay zero-overhead.
-        let prev_output_mmap: Option<&'static [u8]> =
-            if std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
-                || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
-            {
-                std::fs::File::open(args.output())
-                    .ok()
-                    .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
-                    .map(|m| {
-                        let leaked: &'static memmap2::Mmap = Box::leak(Box::new(m));
-                        leaked.as_ref() as &'static [u8]
-                    })
-            } else {
-                None
-            };
+        // Also needed for `--emit-patch`, which diffs the previous
+        // output against the freshly-written one for edit-and-continue.
+        // Otherwise gated on WILD_INCREMENTAL_TIER3_CANARY=1 so
+        // cold/normal links stay zero-overhead.
+        let prev_output_capture = if args.common().emit_patch.is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+        {
+            mmap_previous_output(args.output(), args.common().emit_patch.is_some())
+        } else {
+            PreviousOutputCapture::default()
+        };
+        let prev_output_mmap = prev_output_capture.bytes;
+        let prev_output_for_in_place = if prev_output_capture.source_is_current_output {
+            prev_output_capture.bytes
+        } else {
+            None
+        };
 
         symbol_db.add_inputs(
             &mut per_symbol_flags,
@@ -817,7 +819,7 @@ impl Linker {
         // outputs).
         let did_speculative_skip = if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
             && tier3_fully_reusable
-            && let Some(prev_bytes) = prev_output_mmap
+            && let Some(prev_bytes) = prev_output_for_in_place
         {
             // mmap-COW path: tell `file_writer` to open the
             // output `UpdateInPlace`. The file already contains
@@ -866,7 +868,7 @@ impl Linker {
                 && let Some((reusable, snap)) = tier3_canary_state.as_ref()
                 && !reusable.is_empty()
                 && reusable.len() < snap.sections.len()
-                && let Some(prev_bytes) = prev_output_mmap
+                && let Some(prev_bytes) = prev_output_for_in_place
             {
                 // Build the OutputSectionId set + the file
                 // ranges to pre-fill, in one pass.
@@ -999,15 +1001,93 @@ impl Linker {
         // AOT edit-and-continue. Wild already has prev_output_mmap; we
         // re-mmap the new output and walk the two in parallel,
         // coalescing adjacent differing bytes into runs.
-        if let (Some(patch_path), Some(prev_bytes)) =
-            (args.common().emit_patch.as_ref(), prev_output_mmap)
-        {
-            let new_mmap = std::fs::File::open(args.output())
-                .ok()
-                .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok());
-            if let Some(new_mmap) = new_mmap {
-                if let Err(e) = emit_patch_file(prev_bytes, &new_mmap, patch_path) {
-                    eprintln!("wild --emit-patch failed: {e}");
+        if let Some(patch_path) = args.common().emit_patch.as_ref() {
+            if let Some(note) = prev_output_capture.note.as_deref() {
+                eprintln!("{note}");
+                write_emit_patch_diagnostic(patch_path, note);
+            }
+            match prev_output_mmap {
+                Some(prev_bytes) => match std::fs::File::open(args.output()) {
+                    Ok(file) => match unsafe { memmap2::Mmap::map(&file) } {
+                        Ok(new_mmap) => {
+                            let old_source = prev_output_capture
+                                .source
+                                .as_deref()
+                                .unwrap_or_else(|| args.output());
+                            let msg = format!(
+                                "wild --emit-patch: diffing old {} ({} bytes) against new {} ({} bytes) -> {}",
+                                old_source.display(),
+                                prev_bytes.len(),
+                                args.output().display(),
+                                new_mmap.len(),
+                                patch_path.display()
+                            );
+                            eprintln!("{msg}");
+                            write_emit_patch_diagnostic(patch_path, &msg);
+                            match emit_patch_file(prev_bytes, &new_mmap, patch_path) {
+                                Ok(()) => {
+                                    let msg = format!(
+                                        "wild --emit-patch: wrote {}",
+                                        patch_path.display()
+                                    );
+                                    eprintln!("{msg}");
+                                    write_emit_patch_diagnostic(patch_path, &msg);
+                                }
+                                Err(e) => {
+                                    let msg = format!("wild --emit-patch failed: {e}");
+                                    eprintln!("{msg}");
+                                    write_emit_patch_diagnostic(patch_path, &msg);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!(
+                                "wild --emit-patch skipped: failed to mmap new output {}: {e}",
+                                args.output().display()
+                            );
+                            eprintln!("{msg}");
+                            write_emit_patch_diagnostic(patch_path, &msg);
+                        }
+                    },
+                    Err(e) => {
+                        let msg = format!(
+                            "wild --emit-patch skipped: failed to open new output {}: {e}",
+                            args.output().display()
+                        );
+                        eprintln!("{msg}");
+                        write_emit_patch_diagnostic(patch_path, &msg);
+                    }
+                },
+                None => {
+                    let reason = prev_output_capture
+                        .missing_reason
+                        .as_deref()
+                        .unwrap_or("previous output unavailable");
+                    let msg = format!(
+                        "wild --emit-patch skipped: {reason}; \
+                     this link seeds the baseline and the next changed link can emit a patch to {}",
+                        patch_path.display()
+                    );
+                    eprintln!("{msg}");
+                    write_emit_patch_diagnostic(patch_path, &msg);
+                }
+            }
+            match refresh_emit_patch_baseline(args.output()) {
+                Ok(sidecar_path) => {
+                    let msg = format!(
+                        "wild --emit-patch: updated previous-output baseline at {}",
+                        sidecar_path.display()
+                    );
+                    eprintln!("{msg}");
+                    write_emit_patch_diagnostic(patch_path, &msg);
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "wild --emit-patch: failed to update previous-output baseline from {}: {e}",
+                        args.output().display()
+                    );
+                    eprintln!("{msg}");
+                    write_emit_patch_diagnostic(patch_path, &msg);
                 }
             }
         }
@@ -1321,6 +1401,77 @@ pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> 
     args.common_mut().activate_thread_pool()
 }
 
+#[derive(Default)]
+struct PreviousOutputCapture {
+    bytes: Option<&'static [u8]>,
+    source: Option<std::path::PathBuf>,
+    source_is_current_output: bool,
+    note: Option<String>,
+    missing_reason: Option<String>,
+}
+
+fn mmap_previous_output(output: &std::path::Path, allow_sidecar: bool) -> PreviousOutputCapture {
+    let mut attempts = Vec::new();
+    match mmap_existing_file(output) {
+        Ok(bytes) => {
+            return PreviousOutputCapture {
+                bytes: Some(bytes),
+                source: Some(output.to_path_buf()),
+                source_is_current_output: true,
+                ..PreviousOutputCapture::default()
+            };
+        }
+        Err(e) => attempts.push(format!("{}: {e}", output.display())),
+    }
+
+    if allow_sidecar {
+        let sidecar = emit_patch_baseline_path(output);
+        match mmap_existing_file(&sidecar) {
+            Ok(bytes) => {
+                return PreviousOutputCapture {
+                    bytes: Some(bytes),
+                    source: Some(sidecar.clone()),
+                    source_is_current_output: false,
+                    note: Some(format!(
+                        "wild --emit-patch: previous output at {} unavailable; using baseline {}",
+                        output.display(),
+                        sidecar.display()
+                    )),
+                    ..PreviousOutputCapture::default()
+                };
+            }
+            Err(e) => attempts.push(format!("{}: {e}", sidecar.display())),
+        }
+    }
+
+    PreviousOutputCapture {
+        missing_reason: Some(format!(
+            "no previous output available to diff against ({})",
+            attempts.join("; ")
+        )),
+        ..PreviousOutputCapture::default()
+    }
+}
+
+fn mmap_existing_file(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+    Ok(leaked.as_ref() as &'static [u8])
+}
+
+fn refresh_emit_patch_baseline(output: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let sidecar = emit_patch_baseline_path(output);
+    std::fs::copy(output, &sidecar)?;
+    Ok(sidecar)
+}
+
+fn emit_patch_baseline_path(output: &std::path::Path) -> std::path::PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".wild-prev-output");
+    std::path::PathBuf::from(path)
+}
+
 /// Write a wild-patch text file describing every byte run that differs
 /// between `prev` (the previous link's output) and `new` (this link's
 /// output). Adjacent differing bytes are coalesced into a single run.
@@ -1406,6 +1557,26 @@ fn emit_patch_file(prev: &[u8], new: &[u8], path: &std::path::Path) -> std::io::
     }
 
     std::fs::write(path, out)
+}
+
+fn write_emit_patch_diagnostic(patch_path: &std::path::Path, message: &str) {
+    use std::io::Write as _;
+
+    let path = emit_patch_diagnostic_path(patch_path);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{message}");
+}
+
+fn emit_patch_diagnostic_path(patch_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = patch_path.as_os_str().to_os_string();
+    path.push(".log");
+    std::path::PathBuf::from(path)
 }
 
 #[derive(Debug)]
