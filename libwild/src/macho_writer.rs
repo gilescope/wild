@@ -589,7 +589,7 @@ pub(crate) fn precount_symtab<'data>(layout: &Layout<'data, MachO>) -> MachOSymt
                         }
                         continue;
                     }
-                    if (n_type & 0x0F) != 0x0F {
+                    if n_type & object::macho::N_TYPE != object::macho::N_SECT {
                         continue;
                     }
                     let n_sect = sym.n_sect();
@@ -3130,10 +3130,13 @@ fn write_exe_symtab(
                                 ));
                                 continue;
                             }
-                            // Synthesize FUN stabs for defined external functions in __text.
-                            if (n_type & 0x0F) != 0x0F {
+                            // Synthesize FUN stabs for defined functions in __text.
+                            // Rust emits many user functions as local text symbols;
+                            // dsymutil needs them in the debug map to keep their line
+                            // tables when it builds the dSYM.
+                            if n_type & object::macho::N_TYPE != object::macho::N_SECT {
                                 continue;
-                            } // N_SECT | N_EXT
+                            }
                             let n_sect = sym.n_sect();
                             if n_sect == 0 {
                                 continue;
