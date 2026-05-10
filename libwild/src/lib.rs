@@ -1529,6 +1529,26 @@ fn emit_patch_file(prev: &[u8], new: &[u8], path: &std::path::Path) -> std::io::
         runs.push((prev.len(), new.len() - prev.len()));
     }
 
+    // Drop runs that fall in segments the consumer can never write
+    // to at runtime. On Mach-O that means any segment whose
+    // `maxprot` is read-only (typically `__LINKEDIT`, which holds
+    // the LC_CODE_SIGNATURE blob wild re-emits on every link).
+    // Emitting those bytes in the patch is pointless — the running
+    // process already validated the signature at load time, and the
+    // kernel refuses to let *anyone* modify those pages — and
+    // surfaces as a noisy `apply-patch` skip (or, before that fix,
+    // a hard `vm_write_word` failure).
+    let (runs, dropped_readonly) = filter_unpatchable_runs(runs, new);
+    if dropped_readonly > 0 {
+        write_emit_patch_diagnostic(
+            path,
+            &format!(
+                "wild --emit-patch: dropped {dropped_readonly} run(s) in read-only segments \
+                 (typically __LINKEDIT / codesign blob)"
+            ),
+        );
+    }
+
     let symbol_ranges = patch_symbol_ranges(new);
 
     let mut out = String::new();
@@ -1557,6 +1577,84 @@ fn emit_patch_file(prev: &[u8], new: &[u8], path: &std::path::Path) -> std::io::
     }
 
     std::fs::write(path, out)
+}
+
+/// Return file-offset ranges (`[start, end)`) of segments in a 64-bit
+/// Mach-O image whose `max_protection` permits neither write nor
+/// execute — i.e., regions the kernel will never let a debugger
+/// modify, even via `mach_vm_protect(VM_PROT_COPY)`.
+///
+/// On a typical macOS binary this is `__LINKEDIT` (`max_prot=0x1`);
+/// `__PAGEZERO` is also `max_prot=0x0` but has no file backing.
+/// Returns an empty vec for non-Mach-O inputs (ELF, raw binary,
+/// truncated data) — callers fall through to no filtering, which is
+/// correct since ELF runtime-immutability is a different question
+/// (handled at the consumer if at all).
+fn readonly_macho_segment_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
+    use object::macho;
+    use object::read::macho::MachHeader as _;
+
+    let le = object::Endianness::Little;
+    let Ok(header) = macho::MachHeader64::<object::Endianness>::parse(bytes, 0) else {
+        return Vec::new();
+    };
+    let Ok(mut cmds) = header.load_commands(le, bytes, 0) else {
+        return Vec::new();
+    };
+
+    const VM_PROT_WRITE: u32 = 0x2;
+    const VM_PROT_EXECUTE: u32 = 0x4;
+    const KERNEL_RESCUABLE: u32 = VM_PROT_WRITE | VM_PROT_EXECUTE;
+
+    let mut ranges = Vec::new();
+    while let Ok(Some(cmd)) = cmds.next() {
+        let Ok(Some((seg, _seg_data))) = cmd.segment_64() else {
+            continue;
+        };
+        let maxprot = seg.maxprot.get(le);
+        if maxprot & KERNEL_RESCUABLE != 0 {
+            // max_prot includes WRITE (we can write directly) or
+            // EXECUTE (we can VM_PROT_COPY → R+W → write → restore).
+            // Either way the consumer can patch this region.
+            continue;
+        }
+        let fileoff = seg.fileoff.get(le);
+        let filesize = seg.filesize.get(le);
+        if filesize == 0 {
+            // __PAGEZERO has filesize=0; nothing to filter.
+            continue;
+        }
+        ranges.push((fileoff, fileoff + filesize));
+    }
+    ranges
+}
+
+/// Drop any byte run that intersects a runtime-unwritable segment
+/// (per [`readonly_macho_segment_ranges`]). Returns the kept runs
+/// plus the count of dropped runs so the caller can report it.
+fn filter_unpatchable_runs(
+    runs: Vec<(usize, usize)>,
+    new: &[u8],
+) -> (Vec<(usize, usize)>, usize) {
+    let readonly = readonly_macho_segment_ranges(new);
+    if readonly.is_empty() {
+        return (runs, 0);
+    }
+    let mut kept = Vec::with_capacity(runs.len());
+    let mut dropped = 0usize;
+    for (off, len) in runs {
+        let run_start = off as u64;
+        let run_end = run_start + len as u64;
+        let intersects = readonly
+            .iter()
+            .any(|&(rs, re)| run_start < re && rs < run_end);
+        if intersects {
+            dropped += 1;
+        } else {
+            kept.push((off, len));
+        }
+    }
+    (kept, dropped)
 }
 
 fn write_emit_patch_diagnostic(patch_path: &std::path::Path, message: &str) {
@@ -1694,4 +1792,262 @@ fn sanitize_patch_comment(s: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod emit_patch_tests {
+    use super::*;
+
+    /// Build a minimal 64-bit Mach-O header + two LC_SEGMENT_64
+    /// commands. Returns the bytes; segments don't need to point at
+    /// real content — `readonly_macho_segment_ranges` only reads the
+    /// load-command headers.
+    ///
+    /// `segs`: list of `(name, fileoff, filesize, maxprot)`.
+    fn make_macho_with_segments(segs: &[(&[u8], u64, u64, u32)]) -> Vec<u8> {
+        const MH_MAGIC_64: u32 = 0xfeed_facf;
+        const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+        const MH_EXECUTE: u32 = 0x2;
+        const LC_SEGMENT_64: u32 = 0x19;
+        const SEGMENT_CMD_SIZE: u32 = 72;
+
+        let total_cmd_size = SEGMENT_CMD_SIZE * segs.len() as u32;
+        let mut out = Vec::with_capacity(32 + total_cmd_size as usize);
+
+        // mach_header_64 (32 bytes).
+        out.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+        out.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // cpusubtype
+        out.extend_from_slice(&MH_EXECUTE.to_le_bytes());
+        out.extend_from_slice(&(segs.len() as u32).to_le_bytes()); // ncmds
+        out.extend_from_slice(&total_cmd_size.to_le_bytes()); // sizeofcmds
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        // segment_command_64 (72 bytes each, 0 sections).
+        for (name, fileoff, filesize, maxprot) in segs {
+            out.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+            out.extend_from_slice(&SEGMENT_CMD_SIZE.to_le_bytes());
+            // segname [u8; 16] — zero-padded.
+            let mut padded = [0u8; 16];
+            padded[..name.len().min(16)].copy_from_slice(&name[..name.len().min(16)]);
+            out.extend_from_slice(&padded);
+            out.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+            out.extend_from_slice(&0u64.to_le_bytes()); // vmsize
+            out.extend_from_slice(&fileoff.to_le_bytes());
+            out.extend_from_slice(&filesize.to_le_bytes());
+            out.extend_from_slice(&maxprot.to_le_bytes());
+            out.extend_from_slice(&maxprot.to_le_bytes()); // initprot
+            out.extend_from_slice(&0u32.to_le_bytes()); // nsects
+            out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        }
+        out
+    }
+
+    #[test]
+    fn readonly_segments_only_includes_unwritable_unexecutable() {
+        // __TEXT (max_prot = R|X = 0x5) — patchable via VM_PROT_COPY.
+        // __LINKEDIT (max_prot = R = 0x1) — unpatchable.
+        // __DATA (max_prot = R|W = 0x3) — directly writable.
+        let bytes = make_macho_with_segments(&[
+            (b"__TEXT", 0x0000, 0x1000, 0x5),
+            (b"__DATA", 0x1000, 0x0100, 0x3),
+            (b"__LINKEDIT", 0x1100, 0x0200, 0x1),
+        ]);
+
+        let ranges = readonly_macho_segment_ranges(&bytes);
+        assert_eq!(ranges, vec![(0x1100, 0x1300)]);
+    }
+
+    #[test]
+    fn filter_drops_runs_in_linkedit_only() {
+        let bytes = make_macho_with_segments(&[
+            (b"__TEXT", 0x0000, 0x1000, 0x5),
+            (b"__LINKEDIT", 0x1000, 0x0100, 0x1),
+        ]);
+
+        // Three runs: one in __TEXT, one in __LINKEDIT, one
+        // straddling the boundary.
+        let runs = vec![
+            (0x0010, 4), // __TEXT only
+            (0x1020, 4), // __LINKEDIT only
+            (0x0ffe, 8), // straddles 0x1000 boundary
+        ];
+        let (kept, dropped) = filter_unpatchable_runs(runs, &bytes);
+
+        // Only the pure-__TEXT run survives. Both __LINKEDIT and
+        // the straddling run are dropped (the straddler intersects
+        // the read-only range so we err on the side of dropping —
+        // wild's tier-4 padding makes straddlers rare in practice).
+        assert_eq!(kept, vec![(0x0010, 4)]);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn non_macho_input_does_not_filter() {
+        // Random bytes — not a valid Mach-O. Falls back to the
+        // identity transform: every run is kept.
+        let bytes = vec![0xAAu8; 256];
+        let runs = vec![(0, 4), (32, 8), (200, 16)];
+        let (kept, dropped) = filter_unpatchable_runs(runs.clone(), &bytes);
+        assert_eq!(kept, runs);
+        assert_eq!(dropped, 0);
+    }
+
+    /// Build a Mach-O byte buffer with header+commands at the start
+    /// followed by the actual segment contents. Each segment's
+    /// `fileoff` points into the buffer; the buffer is sized to the
+    /// largest `fileoff + filesize`.
+    ///
+    /// `(name, content, maxprot)` triples; segments are laid out
+    /// contiguously after the load commands, page-aligned for
+    /// realism.
+    fn make_macho_with_content(
+        segs: &[(&[u8], &[u8], u32)],
+    ) -> (Vec<u8>, std::collections::HashMap<&'static str, std::ops::Range<usize>>) {
+        const PAGE: usize = 0x1000;
+        const SEGMENT_CMD_SIZE: usize = 72;
+        const HEADER_SIZE: usize = 32;
+
+        // Place segments at page-aligned file offsets after the
+        // header + load commands.
+        let cmd_block_end = HEADER_SIZE + SEGMENT_CMD_SIZE * segs.len();
+        let first_seg_offset = cmd_block_end.div_ceil(PAGE) * PAGE;
+
+        // Compute layout.
+        let mut layout = Vec::with_capacity(segs.len());
+        let mut offset = first_seg_offset;
+        let mut name_for_test: std::collections::HashMap<&'static str, std::ops::Range<usize>> =
+            std::collections::HashMap::new();
+        for (name, content, _maxprot) in segs {
+            let start = offset;
+            let end = start + content.len();
+            layout.push((start as u64, content.len() as u64));
+            // Stable test-key: leak the &str via a leak-free lookup
+            // (we can't `&str -> &'static str` without unsafe, so
+            // just key by the bytes).
+            let key: &'static str = match *name {
+                b"__TEXT" => "__TEXT",
+                b"__LINKEDIT" => "__LINKEDIT",
+                b"__DATA" => "__DATA",
+                _ => "__OTHER",
+            };
+            name_for_test.insert(key, start..end);
+            offset = end.div_ceil(PAGE) * PAGE;
+        }
+
+        // Header bytes via the simpler helper, but with our chosen
+        // file offsets / sizes.
+        let mut typed: Vec<(&[u8], u64, u64, u32)> = Vec::with_capacity(segs.len());
+        for ((name, _content, maxprot), &(off, size)) in segs.iter().zip(layout.iter()) {
+            typed.push((name, off, size, *maxprot));
+        }
+        let mut bytes = make_macho_with_segments(&typed);
+
+        // Pad to the first segment offset, then write each segment's
+        // content at its declared file offset.
+        bytes.resize(first_seg_offset, 0);
+        for ((_name, content, _maxprot), &(off, _)) in segs.iter().zip(layout.iter()) {
+            let off = off as usize;
+            if off + content.len() > bytes.len() {
+                bytes.resize(off + content.len(), 0);
+            }
+            bytes[off..off + content.len()].copy_from_slice(content);
+        }
+
+        (bytes, name_for_test)
+    }
+
+    #[test]
+    fn emit_patch_includes_text_drops_linkedit() {
+        // Build "prev" and "new" Mach-O fixtures that differ in BOTH
+        // __TEXT (codegen change — should appear in patch) and
+        // __LINKEDIT (codesign blob — should be filtered out).
+        let prev_text = b"old TEXT body, do not patch through";
+        let new_text = b"new TEXT body, please apply patch!!";
+        let prev_linkedit = b"old codesign blob aaaaaaaaaaaaaaaa";
+        let new_linkedit = b"new codesign blob bbbbbbbbbbbbbbbb";
+        assert_eq!(prev_text.len(), new_text.len());
+        assert_eq!(prev_linkedit.len(), new_linkedit.len());
+
+        let (prev_bytes, ranges) = make_macho_with_content(&[
+            (b"__TEXT", prev_text, 0x5),
+            (b"__LINKEDIT", prev_linkedit, 0x1),
+        ]);
+        let (new_bytes, _) = make_macho_with_content(&[
+            (b"__TEXT", new_text, 0x5),
+            (b"__LINKEDIT", new_linkedit, 0x1),
+        ]);
+
+        // Sanity: same overall layout, same total size.
+        assert_eq!(prev_bytes.len(), new_bytes.len());
+        let text_range = ranges["__TEXT"].clone();
+        let linkedit_range = ranges["__LINKEDIT"].clone();
+
+        // Emit the patch into a tempfile.
+        let tmpdir = std::env::temp_dir();
+        let patch_path =
+            tmpdir.join(format!("wild-emit-patch-test-{}.patch", std::process::id()));
+        let _ = std::fs::remove_file(&patch_path);
+        let _ = std::fs::remove_file(emit_patch_diagnostic_path(&patch_path));
+
+        emit_patch_file(&prev_bytes, &new_bytes, &patch_path).expect("emit_patch_file");
+        let patch = std::fs::read_to_string(&patch_path).expect("read patch");
+
+        // The patch must contain at least one entry whose offset
+        // falls inside __TEXT, AND no entries whose offset falls
+        // inside __LINKEDIT.
+        let mut text_entries = 0usize;
+        let mut linkedit_entries = 0usize;
+        for line in patch.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            // data lines are: "<hex offset> <length> <hex old> <hex new>"
+            let mut parts = line.split_whitespace();
+            let off_str = parts.next().expect("offset field");
+            let off = usize::from_str_radix(off_str, 16).expect("hex offset");
+            if text_range.contains(&off) {
+                text_entries += 1;
+            } else if linkedit_range.contains(&off) {
+                linkedit_entries += 1;
+            }
+        }
+        assert!(
+            text_entries > 0,
+            "expected at least one __TEXT entry in patch, got 0\npatch:\n{patch}"
+        );
+        assert_eq!(
+            linkedit_entries, 0,
+            "expected zero __LINKEDIT entries in patch (filter must drop them), got {linkedit_entries}\npatch:\n{patch}"
+        );
+
+        // The diagnostic .log sidecar should mention the drop.
+        let log_path = emit_patch_diagnostic_path(&patch_path);
+        let log = std::fs::read_to_string(&log_path).expect("read .log sidecar");
+        assert!(
+            log.contains("dropped") && log.contains("read-only"),
+            "expected drop-count message in .log; got:\n{log}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&patch_path);
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn pagezero_with_zero_filesize_is_skipped() {
+        // __PAGEZERO has max_prot = 0 but filesize = 0 — there are
+        // no file bytes to filter, so it must NOT generate a range
+        // (an empty range would exclude offset 0 incorrectly).
+        let bytes = make_macho_with_segments(&[
+            (b"__PAGEZERO", 0, 0, 0),
+            (b"__TEXT", 0, 0x1000, 0x5),
+        ]);
+        let ranges = readonly_macho_segment_ranges(&bytes);
+        assert!(
+            ranges.is_empty(),
+            "expected no read-only ranges, got {ranges:?}"
+        );
+    }
 }
