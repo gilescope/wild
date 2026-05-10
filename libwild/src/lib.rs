@@ -1632,10 +1632,7 @@ fn readonly_macho_segment_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
 /// Drop any byte run that intersects a runtime-unwritable segment
 /// (per [`readonly_macho_segment_ranges`]). Returns the kept runs
 /// plus the count of dropped runs so the caller can report it.
-fn filter_unpatchable_runs(
-    runs: Vec<(usize, usize)>,
-    new: &[u8],
-) -> (Vec<(usize, usize)>, usize) {
+fn filter_unpatchable_runs(runs: Vec<(usize, usize)>, new: &[u8]) -> (Vec<(usize, usize)>, usize) {
     let readonly = readonly_macho_segment_ranges(new);
     if readonly.is_empty() {
         return (runs, 0);
@@ -1904,7 +1901,10 @@ mod emit_patch_tests {
     /// realism.
     fn make_macho_with_content(
         segs: &[(&[u8], &[u8], u32)],
-    ) -> (Vec<u8>, std::collections::HashMap<&'static str, std::ops::Range<usize>>) {
+    ) -> (
+        Vec<u8>,
+        std::collections::HashMap<&'static str, std::ops::Range<usize>>,
+    ) {
         const PAGE: usize = 0x1000;
         const SEGMENT_CMD_SIZE: usize = 72;
         const HEADER_SIZE: usize = 32;
@@ -1986,8 +1986,7 @@ mod emit_patch_tests {
 
         // Emit the patch into a tempfile.
         let tmpdir = std::env::temp_dir();
-        let patch_path =
-            tmpdir.join(format!("wild-emit-patch-test-{}.patch", std::process::id()));
+        let patch_path = tmpdir.join(format!("wild-emit-patch-test-{}.patch", std::process::id()));
         let _ = std::fs::remove_file(&patch_path);
         let _ = std::fs::remove_file(emit_patch_diagnostic_path(&patch_path));
 
@@ -2040,10 +2039,8 @@ mod emit_patch_tests {
         // __PAGEZERO has max_prot = 0 but filesize = 0 — there are
         // no file bytes to filter, so it must NOT generate a range
         // (an empty range would exclude offset 0 incorrectly).
-        let bytes = make_macho_with_segments(&[
-            (b"__PAGEZERO", 0, 0, 0),
-            (b"__TEXT", 0, 0x1000, 0x5),
-        ]);
+        let bytes =
+            make_macho_with_segments(&[(b"__PAGEZERO", 0, 0, 0), (b"__TEXT", 0, 0x1000, 0x5)]);
         let ranges = readonly_macho_segment_ranges(&bytes);
         assert!(
             ranges.is_empty(),
