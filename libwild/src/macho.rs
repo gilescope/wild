@@ -465,6 +465,23 @@ pub(crate) fn compact_atom_managed_sections<'data>(
             },
         );
     for sec_idx in section_indices {
+        // `-order_file` reorder owns the section layout: `compute_atom_
+        // output_offsets` already assigned every atom (live or dormant)
+        // a fixed output slot, and `copy_section_with_atom_reorder` zeros
+        // dormant slots in place. Don't deletion-compact this section —
+        // shrinking `section.size` below the reorder total leaves the
+        // output buffer too small for the last live atom (atom-reorder
+        // copy fails with "exceeds out len"). Compaction is also
+        // redundant: the reorder layout doesn't read `section_relax_
+        // deltas` for input→output translation, so adding deletes here
+        // is wasted work even when sizes happen to align.
+        if object
+            .subsection_tracking
+            .get(&sec_idx)
+            .is_some_and(|t| t.atom_output_offsets.is_some())
+        {
+            continue;
+        }
         // Pull atoms/scanned out; we'll need to mutate
         // section_relax_deltas separately.
         let (deletions, total_deletion): (Vec<(u64, i32)>, u64) = {

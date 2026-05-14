@@ -4956,18 +4956,25 @@ fn split_output_for_objects<'a>(
             if sec_type == 0x01 || sec_type == 0x0C || sec_type == 0x12 {
                 continue;
             }
-            // Output size = max of input contribution + any padding
-            // layout reserved via section_relax_deltas. For sections
-            // without deltas, file_size == input_size.
+            // Output size: prefer the loaded `Section.size` set by layout —
+            // it already accounts for `-order_file` atom reorder
+            // (`atom_output_offsets` widens the section to fit the post-reorder
+            // total) and for subsection-padding deltas (negative-delta growth).
+            // Fall back to header size + relax-delta growth for slots that
+            // aren't `Loaded` (the legacy path; reorder/deltas can't apply).
             let input_size = input_section.size(le) as usize;
-            if input_size == 0 {
-                continue;
-            }
-            let padded = if let Some(deltas) = obj.section_relax_deltas.get(sec_idx) {
+            let padded = if let Some(crate::resolution::SectionSlot::Loaded(section)) =
+                obj.sections.get(sec_idx)
+            {
+                section.size as usize
+            } else if let Some(deltas) = obj.section_relax_deltas.get(sec_idx) {
                 (input_size as i64 - deltas.total_delta()) as usize
             } else {
                 input_size
             };
+            if padded == 0 {
+                continue;
+            }
             contribs.push((obj_idx, sec_idx, file_offset, padded, output_addr));
         }
     }
