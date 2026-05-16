@@ -1046,6 +1046,23 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
 
     parser
         .declare_with_param()
+        .long("emit-patch")
+        .help(
+            "Write a byte-level diff between the previous and new \
+             output files to <path>. The previous output is mmap'd \
+             before this link; the diff is emitted after the link \
+             completes. Consumers (BugStalker's `apply-patch`) read \
+             it to patch a running process in place — the AOT \
+             edit-and-continue pipeline. Linux + macOS both supported. \
+             File format: see `emit_patch_file` in `lib.rs`.",
+        )
+        .execute(|args, _modifier_stack, value| {
+            args.common.emit_patch = Some(std::path::PathBuf::from(value));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("dynamic-linker")
         .help("Set dynamic linker path")
         .execute(|args, _modifier_stack, value| {
