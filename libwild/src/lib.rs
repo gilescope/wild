@@ -1629,12 +1629,33 @@ fn readonly_macho_segment_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
     ranges
 }
 
-/// Drop any byte run that intersects a runtime-unwritable segment
-/// (per [`readonly_macho_segment_ranges`]). Returns the kept runs
-/// plus the count of dropped runs so the caller can report it.
+/// Drop any byte run that intersects a runtime-unpatchable
+/// region of the output. Two cases are filtered, depending on
+/// the image format:
+///
+/// * **Mach-O:** segments whose `max_protection` permits neither
+///   WRITE nor EXECUTE — i.e. `__LINKEDIT` and friends. See
+///   [`readonly_macho_segment_ranges`].
+/// * **ELF:** byte runs outside *every* `PT_LOAD` segment.
+///   `.debug_*`, `.symtab`, `.strtab`, `.shstrtab` and similar
+///   live in the on-disk file but are never mapped into the
+///   running process's address space, so a patch entry there
+///   can't be applied — `file_offset_to_runtime` translates the
+///   offset to *some* virtual address but the underlying page is
+///   unmapped, and the consumer's write either fails (EIO) or
+///   silently lands on a zero page that has no relation to the
+///   running code. Filtering at emit time prevents both the
+///   noise and the wasted patch size — for a typical Rust
+///   binary this drops the patch from megabytes (the file is
+///   dominated by debug info) to a few hundred bytes (the actual
+///   text-section diff).
+///
+/// Returns the kept runs plus the count of dropped runs so the
+/// caller can surface a diagnostic line.
 fn filter_unpatchable_runs(runs: Vec<(usize, usize)>, new: &[u8]) -> (Vec<(usize, usize)>, usize) {
-    let readonly = readonly_macho_segment_ranges(new);
-    if readonly.is_empty() {
+    let mut unpatchable: Vec<(u64, u64)> = readonly_macho_segment_ranges(new);
+    unpatchable.extend(elf_unloaded_ranges(new));
+    if unpatchable.is_empty() {
         return (runs, 0);
     }
     let mut kept = Vec::with_capacity(runs.len());
@@ -1642,7 +1663,7 @@ fn filter_unpatchable_runs(runs: Vec<(usize, usize)>, new: &[u8]) -> (Vec<(usize
     for (off, len) in runs {
         let run_start = off as u64;
         let run_end = run_start + len as u64;
-        let intersects = readonly
+        let intersects = unpatchable
             .iter()
             .any(|&(rs, re)| run_start < re && rs < run_end);
         if intersects {
@@ -1652,6 +1673,69 @@ fn filter_unpatchable_runs(runs: Vec<(usize, usize)>, new: &[u8]) -> (Vec<(usize
         }
     }
     (kept, dropped)
+}
+
+/// Return file-offset ranges (`[start, end)`) of regions in an
+/// ELF image that fall *outside* every `PT_LOAD` segment — i.e.
+/// the parts of the file (`.debug_*`, `.symtab`, `.strtab`,
+/// `.shstrtab`, section headers) that the loader never maps into
+/// runtime memory. Anything inside these ranges can't be patched
+/// at runtime — the bytes simply aren't there.
+///
+/// Returns an empty vec for non-ELF inputs (Mach-O, raw binary,
+/// truncated data) so the Mach-O path stays unaffected.
+fn elf_unloaded_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
+    use object::Object as _;
+    use object::ObjectSegment as _;
+
+    // Quick magic-byte check so we don't even try to parse Mach-O
+    // as ELF — `File::parse` would error, but the explicit check
+    // makes the intent obvious and saves an error allocation.
+    if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+        return Vec::new();
+    }
+    let Ok(file) = object::File::parse(bytes) else {
+        return Vec::new();
+    };
+    // Build the *loaded* file-offset ranges (file-backed portion
+    // of each PT_LOAD segment), then complement against the
+    // file's full length.
+    let mut loaded: Vec<(u64, u64)> = file
+        .segments()
+        .filter_map(|seg| {
+            let (off, size) = seg.file_range();
+            if size == 0 { None } else { Some((off, off + size)) }
+        })
+        .collect();
+    if loaded.is_empty() {
+        return Vec::new();
+    }
+    loaded.sort_by_key(|r| r.0);
+
+    // Merge overlapping / adjacent loaded ranges so the complement
+    // is a clean sequence of holes.
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(loaded.len());
+    for (s, e) in loaded {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+
+    // Holes between (and after) the loaded ranges.
+    let file_end = bytes.len() as u64;
+    let mut holes = Vec::with_capacity(merged.len() + 1);
+    let mut cursor = 0u64;
+    for &(s, e) in &merged {
+        if s > cursor {
+            holes.push((cursor, s));
+        }
+        cursor = e;
+    }
+    if cursor < file_end {
+        holes.push((cursor, file_end));
+    }
+    holes
 }
 
 fn write_emit_patch_diagnostic(patch_path: &std::path::Path, message: &str) {
