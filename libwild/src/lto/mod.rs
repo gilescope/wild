@@ -369,6 +369,8 @@ mod tests {
     /// runs. With the feature on, the in-process path (P5b) runs; if
     /// libLLVM can't be located at runtime the dispatcher falls back
     /// to P5a automatically.
+    // wasi can't host `tempfile::tempdir()`.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn lower_per_module_dispatcher_produces_one_wasm_per_input() {
         let Some(llvm_as) = crate::llvm_tools::find_by_name("llvm-as") else {

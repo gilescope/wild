@@ -301,6 +301,8 @@ define i32 @f_c(i32 %x) { %r = sub i32 %x, 1 ret i32 %r }
     /// P6 end-to-end: running the same bitcode through the pipeline
     /// twice must hit the cache on the second call, shaving wall time
     /// because opt + llc aren't invoked.
+    // wasi can't host `tempfile::tempdir()`.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn second_run_hits_the_cache_and_skips_opt_and_llc() {
         let Some(bc) = assemble_bc(

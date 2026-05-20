@@ -174,6 +174,8 @@ fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    // wasi can't host `tempfile::tempdir()` (panics in `std::env::temp_dir`).
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn env_override_takes_precedence_when_path_exists() {
         let td = tempfile::tempdir().unwrap();
