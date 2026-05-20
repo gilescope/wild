@@ -874,6 +874,8 @@ mod tests {
         assert_eq!(h, "ab".repeat(32));
     }
 
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn cache_file_roundtrips_mixed_variants() {
         let tmp = std::env::temp_dir().join("wild-incremental-test.wild-hashes");
@@ -923,6 +925,7 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn corrupt_cache_returns_none() {
         let tmp = std::env::temp_dir().join("wild-incremental-corrupt.wild-hashes");
@@ -1141,6 +1144,7 @@ mod tests {
     /// test locks in that behaviour so a future refactor can't
     /// silently regress it (which would defeat any downstream
     /// cache-diffing tool and break deterministic-build guarantees).
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn link_cache_write_is_deterministic() {
         let mut inputs: HashMap<PathBuf, InputHash> = HashMap::new();

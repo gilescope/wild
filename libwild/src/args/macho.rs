@@ -2726,6 +2726,8 @@ exports:
         assert_eq!(libs, vec!["/A".to_owned(), "/B".to_owned()]);
     }
 
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn resolve_tbd_for_install_name_derives_sdk_root() {
         // Synthesise an SDK-like tree under tempdir.
@@ -2757,6 +2759,7 @@ exports:
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn resolve_tbd_for_install_name_bails_when_no_marker() {
         // Origin path with no /System/Library/ or /usr/lib/ marker

@@ -1955,6 +1955,8 @@ mod emit_patch_tests {
         (bytes, name_for_test)
     }
 
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn emit_patch_includes_text_drops_linkedit() {
         // Build "prev" and "new" Mach-O fixtures that differ in BOTH

@@ -570,6 +570,8 @@ mod tests {
         assert_eq!(p, Path::new("/tmp/myapp.dylib.wild-layout"));
     }
 
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn write_then_read_round_trip_on_disk() {
         let s = fixture();

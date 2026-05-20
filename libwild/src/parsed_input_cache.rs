@@ -805,6 +805,8 @@ mod tests {
         assert_eq!(view.iter().count(), 0);
     }
 
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn bundle_round_trip_persists_and_reloads() {
         // End-to-end: build two blobs, push them into a bundle, write
