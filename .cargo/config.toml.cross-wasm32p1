@@ -1,2 +1,6 @@
 [target.wasm32-wasip1]
-runner = "wasmtime --dir . --dir src --dir /"
+# `--env TMPDIR=/tmp` so tests calling `std::env::temp_dir()` get a
+# usable path. Without it, the wasi backend has no default and `temp_dir`
+# panics (and aborts the wasm binary) — observed in `libwild`'s args /
+# parsed_input_cache / incremental_cache test modules.
+runner = "wasmtime --dir . --dir src --dir / --env TMPDIR=/tmp"
