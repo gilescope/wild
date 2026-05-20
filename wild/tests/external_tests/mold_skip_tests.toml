@@ -10,6 +10,7 @@ tests = [
   "depaudit.sh",
   "depaudit2.sh",
   "dynamic-list-data.sh",
+  "dynamic-list4.sh",                  # --dynamic-list on `-shared` outputs; wild reports `Undefined symbol print` because b.so localises symbols not on the list, while mold/ld still resolve them when referenced via `-no-as-needed`.
   "emit-relocs-cpp.sh",
   "emit-relocs-dead-sections.sh",
   "emit-relocs.sh",
