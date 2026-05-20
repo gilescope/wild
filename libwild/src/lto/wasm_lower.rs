@@ -114,6 +114,8 @@ mod tests {
     /// Skip-if-not-available smoke test: if llc is installed, lower a
     /// tiny bitcode blob produced by llvm-as and check the output has
     /// the wasm magic.
+    // wasi can't host `tempfile::tempdir()`.
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn lowers_trivial_bitcode_when_tools_present() {
         let Some(llvm_as) = crate::llvm_tools::find_by_name("llvm-as") else {
