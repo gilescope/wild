@@ -2,10 +2,14 @@ formatter:
   retain_line_breaks: true
   eof_newline: true
 
+# Per yamlfmt docs/paths.md: standard mode (default) treats `*` literally —
+# patterns like `wild/tests/lld-wasm/**/*.yaml` only match a file literally
+# called `**/*.yaml`. Switch to doublestar mode so the `**` patterns below
+# match across arbitrary depth.
+match_type: doublestar
+
 # LLVM `obj2yaml` outputs used as wasm-link test fixtures — these need to
 # round-trip byte-exact, so we don't let yamlfmt rewrite them.
 exclude:
-  - "wild/tests/lld-wasm/*.yaml"
-  - "wild/tests/lld-wasm/*.yml"
   - "wild/tests/lld-wasm/**/*.yaml"
   - "wild/tests/lld-wasm/**/*.yml"

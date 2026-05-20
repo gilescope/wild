@@ -21,5 +21,5 @@ gimli = { version = "0.33", default-features = false, features = ["read", "write
 wasmparser = "0.221"
 wat = "1.221"
 wasm-smith = "0.221"
-arbitrary = "1"
+arbitrary = "1.1.0"
 proptest = "1"
