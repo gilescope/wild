@@ -2744,13 +2744,24 @@ fn macho_header_bytes(
     total_sizes: &crate::output_section_part_map::OutputSectionPartMap<u64>,
 ) -> u64 {
     use crate::output_section_id;
-    use macho_layout::{
-        DEFAULT_HEADERPAD_BYTES, DYLD_PATH_LEN, DYLIB_COMMAND_FIXED_BYTES,
-        DYLINKER_COMMAND_FIXED_BYTES, LC_BUILD_VERSION_BYTES, LC_CODE_SIGNATURE_BYTES,
-        LC_DYSYMTAB_BYTES, LC_LINKEDIT_DATA_BYTES, LC_LINKEDIT_TABLE_BYTES, LC_MAIN_BYTES,
-        LC_SEGMENT_64_HEADER_BYTES, LC_SOURCE_VERSION_BYTES, LC_SYMTAB_BYTES, LC_UUID_BYTES,
-        LIBSYSTEM_PATH_LEN, MACH_HEADER_64_BYTES, SECTION_64_BYTES, TEXT_ALIGNMENT_BYTES,
-    };
+    use macho_layout::DEFAULT_HEADERPAD_BYTES;
+    use macho_layout::DYLD_PATH_LEN;
+    use macho_layout::DYLIB_COMMAND_FIXED_BYTES;
+    use macho_layout::DYLINKER_COMMAND_FIXED_BYTES;
+    use macho_layout::LC_BUILD_VERSION_BYTES;
+    use macho_layout::LC_CODE_SIGNATURE_BYTES;
+    use macho_layout::LC_DYSYMTAB_BYTES;
+    use macho_layout::LC_LINKEDIT_DATA_BYTES;
+    use macho_layout::LC_LINKEDIT_TABLE_BYTES;
+    use macho_layout::LC_MAIN_BYTES;
+    use macho_layout::LC_SEGMENT_64_HEADER_BYTES;
+    use macho_layout::LC_SOURCE_VERSION_BYTES;
+    use macho_layout::LC_SYMTAB_BYTES;
+    use macho_layout::LC_UUID_BYTES;
+    use macho_layout::LIBSYSTEM_PATH_LEN;
+    use macho_layout::MACH_HEADER_64_BYTES;
+    use macho_layout::SECTION_64_BYTES;
+    use macho_layout::TEXT_ALIGNMENT_BYTES;
 
     // Only sections with accumulated content are counted — the writer
     // drops zero-size sections in its iteration loop, so including them
