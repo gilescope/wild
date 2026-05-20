@@ -1896,6 +1896,10 @@ mod emit_patch_tests {
     /// `(name, content, maxprot)` triples; segments are laid out
     /// contiguously after the load commands, page-aligned for
     /// realism.
+    ///
+    /// Only used by the temp_dir-gated `emit_patch_includes_text_drops_linkedit`
+    /// test, so silenced on wasi (where that test is cfg'd out).
+    #[cfg_attr(target_os = "wasi", allow(dead_code))]
     fn make_macho_with_content(
         segs: &[(&[u8], &[u8], u32)],
     ) -> (
