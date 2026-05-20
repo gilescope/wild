@@ -17,7 +17,7 @@ fn assemble(name: &str) -> Vec<u8> {
         env!("CARGO_MANIFEST_DIR"),
         name,
     );
-    wat::parse_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    wat::parse_str(std::fs::read_to_string(&path).unwrap()).unwrap()
 }
 
 fn validates(b: &[u8]) -> bool {

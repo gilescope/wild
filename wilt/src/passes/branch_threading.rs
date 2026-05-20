@@ -31,8 +31,8 @@ fn has_if(body: &[u8]) -> bool {
     let Some(start) = opc::skip_locals(body) else {
         return false;
     };
-    let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
+    let iter = InstrIter::new(body, start);
+    for (p, _) in iter {
         if body[p] == OP_IF {
             return true;
         }
@@ -160,14 +160,14 @@ fn rewrite_body_with_edits(body: &[u8]) -> Option<(Vec<u8>, crate::provenance::B
     deletes.sort_by_key(|&(s, _)| s);
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (s, e) in deletes {
-        if let Some(last) = merged.last_mut() {
-            if s < last.1 {
-                // Overlap — extend.
-                if e > last.1 {
-                    last.1 = e;
-                }
-                continue;
+        if let Some(last) = merged.last_mut()
+            && s < last.1
+        {
+            // Overlap — extend.
+            if e > last.1 {
+                last.1 = e;
             }
+            continue;
         }
         merged.push((s, e));
     }
@@ -195,7 +195,7 @@ fn range_contains_branch(ir: &BodyIr, start: usize, end: usize) -> bool {
         if k >= ir.instrs().len() {
             break;
         }
-        if matches!(ir.instrs()[k].op, 0x0C | 0x0D | 0x0E) {
+        if matches!(ir.instrs()[k].op, 0x0C..=0x0E) {
             return true;
         }
     }
@@ -213,12 +213,12 @@ fn match_structural(
     let mut stack: Vec<usize> = Vec::new();
     for (i, it) in ir.instrs().iter().enumerate() {
         match it.op {
-            0x02 | 0x03 | 0x04 => stack.push(i),
+            0x02..=0x04 => stack.push(i),
             0x05 => {
-                if let Some(&top) = stack.last() {
-                    if ir.instrs()[top].op == 0x04 {
-                        elses.insert(top, i);
-                    }
+                if let Some(&top) = stack.last()
+                    && ir.instrs()[top].op == 0x04
+                {
+                    elses.insert(top, i);
                 }
             }
             0x0B => {

@@ -132,7 +132,7 @@ pub fn rewrite_v3_with_shifts(
     }
     let shifts = build_shifts(remap, input_fn_offsets, output_fn_offsets)?;
     let mappings = extract_mappings(json)?;
-    let new_mappings = transform_mappings(&mappings, &shifts)?;
+    let new_mappings = transform_mappings(mappings, &shifts)?;
     Some(replace_mappings(json, &new_mappings))
 }
 

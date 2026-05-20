@@ -73,9 +73,10 @@ pub(crate) fn lower_per_module_parallel(
 
     // Version the cache keys against the actual llc we'll invoke, so
     // a toolchain upgrade invalidates stale entries.
-    let llvm_version = version_of(&llc_bin)
-        .map(|(ma, mi, pa)| format!("{ma}.{mi}.{pa}"))
-        .unwrap_or_else(|| "unknown".to_string());
+    let llvm_version = version_of(&llc_bin).map_or_else(
+        || "unknown".to_string(),
+        |(ma, mi, pa)| format!("{ma}.{mi}.{pa}"),
+    );
     let cache = CacheDir::resolve();
     let opt_flag_str = opt_level.opt_flag().unwrap_or("-O0");
 
@@ -347,9 +348,7 @@ define i32 @cached_fn(i32 %x) { %r = add i32 %x, 42 ret i32 %r }
                 assert!(
                     warm * 2 < cold,
                     "P6 cache should be ≥2× faster on warm run: \
-                     cold={:?} warm={:?}",
-                    cold,
-                    warm
+                     cold={cold:?} warm={warm:?}"
                 );
             }
             (Err(e), _) | (_, Err(e)) => {

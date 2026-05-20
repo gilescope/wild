@@ -153,7 +153,7 @@ impl<'a, 'f, 'r> Iterator for BlockWalker<'a, 'f, 'r> {
 
         match op {
             // Control flow — block open.
-            0x02 | 0x03 | 0x04 => {
+            0x02..=0x04 => {
                 let kind = match op {
                     0x02 => BlockKind::Block,
                     0x03 => BlockKind::Loop,
@@ -188,12 +188,12 @@ impl<'a, 'f, 'r> Iterator for BlockWalker<'a, 'f, 'r> {
             }
             // else: reset stack to if-entry + in_arity; reachable resets.
             0x05 => {
-                if let Some(top) = self.frames.last_mut() {
-                    if matches!(top.kind, BlockKind::If) {
-                        top.kind = BlockKind::Else;
-                        self.stack_depth = top.entry_depth + top.in_arity as i32;
-                        self.reachable = top.reachable_at_entry;
-                    }
+                if let Some(top) = self.frames.last_mut()
+                    && matches!(top.kind, BlockKind::If)
+                {
+                    top.kind = BlockKind::Else;
+                    self.stack_depth = top.entry_depth + top.in_arity as i32;
+                    self.reachable = top.reachable_at_entry;
                 }
             }
             // end: close current block.

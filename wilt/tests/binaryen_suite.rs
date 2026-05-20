@@ -37,10 +37,10 @@ fn walk(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             walk(&p, exts, out);
-        } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if exts.contains(&ext) {
-                out.push(p);
-            }
+        } else if let Some(ext) = p.extension().and_then(|e| e.to_str())
+            && exts.contains(&ext)
+        {
+            out.push(p);
         }
     }
 }

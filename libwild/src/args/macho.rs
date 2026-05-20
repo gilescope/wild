@@ -502,10 +502,11 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     // cooks in a `-syslibroot` argument; the gap is the rustc path
     // which passes `-lc++` with no syslibroot.
     let t = stage("pre-scan args", t);
-    if !has_syslibroot && !has_no_default_search {
-        if let Some(sdk) = discover_sdk_path() {
-            args.syslibroot = Some(sdk);
-        }
+    if !has_syslibroot
+        && !has_no_default_search
+        && let Some(sdk) = discover_sdk_path()
+    {
+        args.syslibroot = Some(sdk);
     }
     let t = stage("discover_sdk_path", t);
 
@@ -520,7 +521,7 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     // That was the source of wild's 3× live-code bloat on
     // rust-linked binaries before this expansion landed.
     let mut expanded: Vec<String> = Vec::with_capacity(all_args.len());
-    for a in all_args.iter() {
+    for a in &all_args {
         if let Some(rest) = a.strip_prefix("-Wl,") {
             for piece in rest.split(',') {
                 if !piece.is_empty() {
@@ -564,13 +565,13 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
                 "-F<path>"
             } else if arg.starts_with("-framework") {
                 "-framework"
-            } else if arg.ends_with(".rlib") {
+            } else if arg.to_ascii_lowercase().ends_with(".rlib") {
                 "*.rlib"
-            } else if arg.ends_with(".o") {
+            } else if arg.to_ascii_lowercase().ends_with(".o") {
                 "*.o"
-            } else if arg.ends_with(".tbd") {
+            } else if arg.to_ascii_lowercase().ends_with(".tbd") {
                 "*.tbd"
-            } else if arg.ends_with(".dylib") {
+            } else if arg.to_ascii_lowercase().ends_with(".dylib") {
                 "*.dylib"
             } else if arg.starts_with("-") {
                 "<flag>"
@@ -584,7 +585,7 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     }
     if debug {
         for (k, (ms, n)) in &bucket {
-            eprintln!("wild args.parse:   {:>5.1} ms  {:>4} × {}", ms, n, k);
+            eprintln!("wild args.parse:   {ms:>5.1} ms  {n:>4} × {k}");
         }
     }
     let t = stage("main parse loop", t);
@@ -592,7 +593,7 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     // Resolve deferred .tbd inputs now that -platform_version is known.
     let pending_tbds = std::mem::take(&mut args.pending_tbd_inputs);
     for path in &pending_tbds {
-        handle_tbd_input(args, path)?;
+        handle_tbd_input(args, path);
     }
     let t = stage("pending tbd inputs", t);
 
@@ -703,11 +704,11 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     Ok(())
 }
 
-fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
+fn parse_one_arg<S: AsRef<str>, I: Iterator<Item = S>>(
     args: &mut MachOArgs,
     arg: &str,
     input: &mut I,
-    modifier_stack: &mut Vec<Modifiers>,
+    modifier_stack: &mut [Modifiers],
 ) -> Result {
     // Flags that take a following argument (must be checked before prefix matching)
     match arg {
@@ -825,8 +826,8 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
         "-reexport_library" => {
             if let Some(val) = input.next() {
                 let path = Path::new(val.as_ref());
-                if path.extension().map_or(false, |e| e == "tbd") {
-                    handle_tbd_input(args, path)?;
+                if path.extension().is_some_and(|e| e == "tbd") {
+                    handle_tbd_input(args, path);
                     // Override kind to Reexport
                     if let Some(last) = args.extra_dylibs.last_mut() {
                         last.1 = DylibLoadKind::Reexport;
@@ -843,8 +844,8 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
         "-weak_library" => {
             if let Some(val) = input.next() {
                 let path = Path::new(val.as_ref());
-                if path.extension().map_or(false, |e| e == "tbd") {
-                    handle_tbd_input(args, path)?;
+                if path.extension().is_some_and(|e| e == "tbd") {
+                    handle_tbd_input(args, path);
                 } else {
                     handle_dylib_input(args, path)?;
                 }
@@ -1397,13 +1398,12 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
                             let already_walked = args
                                 .system_tbd_dir_walked
                                 .as_deref()
-                                .map(|p| p == system_dir.as_path())
-                                .unwrap_or(false);
+                                .is_some_and(|p| p == system_dir.as_path());
                             if !already_walked {
                                 if let Ok(entries) = std::fs::read_dir(&system_dir) {
                                     for entry in entries.flatten() {
                                         let p = entry.path();
-                                        if p.extension().map_or(false, |e| e == "tbd") {
+                                        if p.extension().is_some_and(|e| e == "tbd") {
                                             collect_tbd_symbols(&p, &mut args.dylib_symbols);
                                         }
                                     }
@@ -1427,11 +1427,11 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
             let mut found = false;
             let extensions = [".tbd", ".dylib", ".a"];
             let mut search_paths: Vec<Box<Path>> = args.lib_search_paths.clone();
-            if !args.no_default_search_paths {
-                if let Some(ref root) = args.syslibroot {
-                    search_paths.push(Box::from(root.join("usr/lib")));
-                    search_paths.push(Box::from(root.join("usr/lib/swift")));
-                }
+            if !args.no_default_search_paths
+                && let Some(ref root) = args.syslibroot
+            {
+                search_paths.push(Box::from(root.join("usr/lib")));
+                search_paths.push(Box::from(root.join("usr/lib/swift")));
             }
             // search_paths_first (default): try all extensions per dir.
             // search_dylibs_first: try each extension across all dirs.
@@ -1455,10 +1455,10 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
                         // Parse exports trie + install name from the dylib.
                         handle_dylib_input(args, &path)?;
                         // Override the load kind if a prefix modifier was used.
-                        if dylib_kind != DylibLoadKind::Normal {
-                            if let Some(last) = args.extra_dylibs.last_mut() {
-                                last.1 = dylib_kind;
-                            }
+                        if dylib_kind != DylibLoadKind::Normal
+                            && let Some(last) = args.extra_dylibs.last_mut()
+                        {
+                            last.1 = dylib_kind;
                         }
                     } else {
                         args.common.inputs.push(Input {
@@ -1470,24 +1470,25 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
                     // -hidden-l: add archive global symbols to unexport list.
                     if is_hidden && ext == ".a" {
                         // Scan archive for global symbols to hide from dylib exports.
-                        if let Ok(data) = std::fs::read(&path) {
-                            if let Ok(archive) = object::read::archive::ArchiveFile::parse(&*data) {
-                                for member in archive.members() {
-                                    let Ok(member) = member else { continue };
-                                    let Ok(member_data) = member.data(&*data) else {
-                                        continue;
-                                    };
-                                    let Ok(obj) = object::File::parse(member_data) else {
-                                        continue;
-                                    };
-                                    use object::Object;
-                                    use object::ObjectSymbol;
-                                    for sym in obj.symbols() {
-                                        if sym.is_global() && sym.is_definition() {
-                                            if let Ok(name) = sym.name() {
-                                                args.unexported_symbols.push(name.to_string());
-                                            }
-                                        }
+                        if let Ok(data) = std::fs::read(&path)
+                            && let Ok(archive) = object::read::archive::ArchiveFile::parse(&*data)
+                        {
+                            for member in archive.members() {
+                                let Ok(member) = member else { continue };
+                                let Ok(member_data) = member.data(&*data) else {
+                                    continue;
+                                };
+                                let Ok(obj) = object::File::parse(member_data) else {
+                                    continue;
+                                };
+                                use object::Object;
+                                use object::ObjectSymbol;
+                                for sym in obj.symbols() {
+                                    if sym.is_global()
+                                        && sym.is_definition()
+                                        && let Ok(name) = sym.name()
+                                    {
+                                        args.unexported_symbols.push(name.to_string());
                                     }
                                 }
                             }
@@ -1519,10 +1520,10 @@ fn parse_one_arg<'a, S: AsRef<str>, I: Iterator<Item = S>>(
     // Check if it's a dylib/bundle -- if so, treat like a .tbd (extract install name
     // and symbols, emit LC_LOAD_DYLIB) rather than passing through object pipeline.
     let path = Path::new(arg);
-    if path.extension().map_or(false, |e| e == "tbd") {
+    if path.extension().is_some_and(|e| e == "tbd") {
         // Defer: $ld$ directives depend on -platform_version which may come later.
         args.pending_tbd_inputs.push(path.to_path_buf());
-    } else if path.extension().map_or(false, |e| e == "dylib") || is_macho_dylib(path) {
+    } else if path.extension().is_some_and(|e| e == "dylib") || is_macho_dylib(path) {
         handle_dylib_input(args, path)?;
     } else {
         args.common.save_dir.handle_file(arg);
@@ -1744,10 +1745,10 @@ fn process_tbd_symbol(
         // $ld$add$os<ver>$_<sym> — add symbol if target >= ver
         if let Some((ver_str, _real_sym)) = rest.split_once('$') {
             let ver = parse_macho_version(ver_str);
-            if target_version >= ver {
-                if let Some(real) = rest.rsplit_once('$') {
-                    symbols.insert(std::sync::Arc::<[u8]>::from(real.1.as_bytes()));
-                }
+            if target_version >= ver
+                && let Some(real) = rest.rsplit_once('$')
+            {
+                symbols.insert(std::sync::Arc::<[u8]>::from(real.1.as_bytes()));
             }
         }
     } else if let Some(rest) = sym.strip_prefix("$ld$hide$os") {
@@ -2112,7 +2113,7 @@ fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
             // ordinal rather than collapsing onto the libSystem
             // catch-all (`lib_ordinal_for_named_symbol`).
             let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
-            for sym in fresh_symbols.iter() {
+            for sym in &fresh_symbols {
                 args.dylib_symbol_provenance
                     .entry(sym.as_ref().to_vec())
                     .or_insert(dylib_idx);
@@ -2187,23 +2188,23 @@ fn is_macho_dylib(path: &Path) -> bool {
 
 /// Handle a .tbd file as a positional input: extract install-name and symbols, register as dylib
 /// dep.
-fn handle_tbd_input(args: &mut MachOArgs, path: &Path) -> Result {
+fn handle_tbd_input(args: &mut MachOArgs, path: &Path) {
     let mut install_name = parse_tbd_install_name(path);
     let symbols_before: usize = args.dylib_symbols.len();
     let mut fresh: DylibSymbols = Default::default();
     collect_tbd_symbols_with_directives(path, &mut fresh, args.minos, &mut install_name);
     // Check app-extension safety from .tbd flags.
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(records) = text_stub_library::parse_str(&content) {
-            for record in &records {
-                if let text_stub_library::TbdVersionedRecord::V4(v4) = record {
-                    if v4.flags.iter().any(|f| f == "not_app_extension_safe") {
-                        let display = path.file_name().unwrap_or(path.as_os_str());
-                        args.non_extension_safe_dylibs
-                            .push(display.to_string_lossy().into_owned());
-                    }
-                    break;
+    if let Ok(content) = std::fs::read_to_string(path)
+        && let Ok(records) = text_stub_library::parse_str(&content)
+    {
+        for record in &records {
+            if let text_stub_library::TbdVersionedRecord::V4(v4) = record {
+                if v4.flags.iter().any(|f| f == "not_app_extension_safe") {
+                    let display = path.file_name().unwrap_or(path.as_os_str());
+                    args.non_extension_safe_dylibs
+                        .push(display.to_string_lossy().into_owned());
                 }
+                break;
             }
         }
     }
@@ -2213,14 +2214,13 @@ fn handle_tbd_input(args: &mut MachOArgs, path: &Path) -> Result {
     // Track which dylib provided each symbol so two-level-namespace
     // binds get the right LC_LOAD_DYLIB ordinal at write time.
     let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
-    for sym in fresh.iter() {
+    for sym in &fresh {
         args.dylib_symbol_provenance
             .entry(sym.as_ref().to_vec())
             .or_insert(dylib_idx);
     }
-    args.dylib_symbols.extend(fresh.into_iter());
+    args.dylib_symbols.extend(fresh);
     let _ = symbols_before;
-    Ok(())
 }
 
 /// Handle a .dylib input: extract install name and exported symbols, register as dylib dep.
@@ -2274,8 +2274,7 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
                     let name_end = data[name_start..]
                         .iter()
                         .position(|&b| b == 0)
-                        .map(|p| name_start + p)
-                        .unwrap_or(offset + cmdsize);
+                        .map_or(offset + cmdsize, |p| name_start + p);
                     install_name = Some(data[name_start..name_end].to_vec());
                 }
             }
@@ -2288,8 +2287,7 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
                     let name_end = data[name_start..]
                         .iter()
                         .position(|&b| b == 0)
-                        .map(|p| name_start + p)
-                        .unwrap_or(offset + cmdsize);
+                        .map_or(offset + cmdsize, |p| name_start + p);
                     if let Ok(s) = std::str::from_utf8(&data[name_start..name_end]) {
                         reexported_dylib_paths.push(s.to_string());
                     }
@@ -2314,8 +2312,7 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
                     let e = data[s..]
                         .iter()
                         .position(|&b| b == 0)
-                        .map(|p| s + p)
-                        .unwrap_or(offset + cmdsize);
+                        .map_or(offset + cmdsize, |p| s + p);
                     if let Ok(rp) = std::str::from_utf8(&data[s..e]) {
                         dylib_rpaths.push(PathBuf::from(rp));
                     }
@@ -2405,8 +2402,7 @@ fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
                 let name_end = strtab[n_strx..]
                     .iter()
                     .position(|&b| b == 0)
-                    .map(|p| n_strx + p)
-                    .unwrap_or(strtab.len());
+                    .map_or(strtab.len(), |p| n_strx + p);
                 if name_end > n_strx {
                     args.dylib_tls_symbols
                         .insert(strtab[n_strx..name_end].to_vec());
@@ -2532,8 +2528,7 @@ fn collect_dylib_reexport_symbols(
                     let e = data[s..]
                         .iter()
                         .position(|&b| b == 0)
-                        .map(|p| s + p)
-                        .unwrap_or(off + sz);
+                        .map_or(off + sz, |p| s + p);
                     if let Ok(name) = std::str::from_utf8(&data[s..e]) {
                         nested_reexports.push(name.to_string());
                     }
@@ -2548,8 +2543,7 @@ fn collect_dylib_reexport_symbols(
                     let e = data[s..]
                         .iter()
                         .position(|&b| b == 0)
-                        .map(|p| s + p)
-                        .unwrap_or(off + sz);
+                        .map_or(off + sz, |p| s + p);
                     if let Ok(rp) = std::str::from_utf8(&data[s..e]) {
                         nested_rpaths.push(PathBuf::from(rp));
                     }
@@ -2584,10 +2578,10 @@ fn collect_dylib_reexport_symbols(
         let mut combined_rpaths = rpaths.to_vec();
         combined_rpaths.extend(nested_rpaths);
         let mut dirs = search_dirs.to_vec();
-        if let Some(parent) = candidate.parent() {
-            if !dirs.contains(&parent.to_path_buf()) {
-                dirs.push(parent.to_path_buf());
-            }
+        if let Some(parent) = candidate.parent()
+            && !dirs.contains(&parent.to_path_buf())
+        {
+            dirs.push(parent.to_path_buf());
         }
         let nested_loader = candidate.parent();
         for nested in nested_reexports {
@@ -2656,7 +2650,7 @@ fn read_uleb128(data: &[u8]) -> (u64, usize) {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
-        result |= ((byte & 0x7f) as u64) << shift;
+        result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return (result, i + 1);
         }

@@ -187,11 +187,11 @@ impl CfgIr {
                     // is wrong — execution jumps past the else body to
                     // the matching if's post-end.
                     let else_bb = bb_of(i as u32);
-                    if let Some(prev) = else_bb.checked_sub(1) {
-                        if let Some(frame) = frames.last() {
-                            suppress_fallthrough.insert(prev);
-                            extra_branches.push((prev, frame.branch_target_bb));
-                        }
+                    if let Some(prev) = else_bb.checked_sub(1)
+                        && let Some(frame) = frames.last()
+                    {
+                        suppress_fallthrough.insert(prev);
+                        extra_branches.push((prev, frame.branch_target_bb));
                     }
                 }
                 0x0B => {
@@ -199,10 +199,7 @@ impl CfgIr {
                 }
                 0x0C => {
                     // br L: unconditional branch.
-                    let label = match decode_label(ir, i) {
-                        Some(l) => l,
-                        None => return None,
-                    };
+                    let label = decode_label(ir, i)?;
                     let target = label_target_bb(&frames, label)?;
                     let bb = bb_of(i as u32);
                     blocks[bb as usize].successors.push(BlockEdge {
@@ -212,10 +209,7 @@ impl CfgIr {
                 }
                 0x0D => {
                     // br_if L: conditional. Two successors: branch target + fallthrough.
-                    let label = match decode_label(ir, i) {
-                        Some(l) => l,
-                        None => return None,
-                    };
+                    let label = decode_label(ir, i)?;
                     let target = label_target_bb(&frames, label)?;
                     let bb = bb_of(i as u32);
                     blocks[bb as usize].successors.push(BlockEdge {
@@ -308,12 +302,12 @@ fn match_structural(
     let mut stack: Vec<usize> = Vec::new();
     for (i, it) in ir.instrs().iter().enumerate() {
         match it.op {
-            0x02 | 0x03 | 0x04 => stack.push(i),
+            0x02..=0x04 => stack.push(i),
             0x05 => {
-                if let Some(&top) = stack.last() {
-                    if ir.instrs()[top].op == 0x04 {
-                        elses.insert(top, i);
-                    }
+                if let Some(&top) = stack.last()
+                    && ir.instrs()[top].op == 0x04
+                {
+                    elses.insert(top, i);
                 }
             }
             0x0B => {

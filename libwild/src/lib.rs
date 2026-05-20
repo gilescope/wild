@@ -153,10 +153,9 @@ pub fn run(mut args: Args) -> error::Result {
 ///
 /// Gated on `WILD_INCREMENTAL_DEBUG=1`; with the env var unset,
 /// returns `false` without reading any files.
+#[must_use]
 pub fn try_early_skip_from_argv() -> Option<std::path::PathBuf> {
-    if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_none() {
-        return None;
-    }
+    std::env::var_os("WILD_INCREMENTAL_DEBUG")?;
     if std::env::var_os("WILD_INCREMENTAL_NO_EARLY_SKIP").as_deref()
         == Some(std::ffi::OsStr::new("1"))
     {
@@ -166,15 +165,11 @@ pub fn try_early_skip_from_argv() -> Option<std::path::PathBuf> {
     let output = incremental_cache::extract_output_path(&argv);
     let args_hash = incremental_cache::compute_args_hash(&argv);
     let hashes_path = incremental_cache::hashes_path_for_output(&output);
-    let Some(cached) = incremental_cache::read_link_cache(&hashes_path) else {
-        return None;
-    };
+    let cached = incremental_cache::read_link_cache(&hashes_path)?;
     if cached.wild_version != incremental_cache::WILD_VERSION || cached.args_hash != args_hash {
         return None;
     }
-    if incremental_cache::verify_cached_inputs_unchanged(&cached.inputs).is_none() {
-        return None;
-    }
+    incremental_cache::verify_cached_inputs_unchanged(&cached.inputs)?;
     match std::fs::metadata(&output) {
         Ok(m) if m.len() == cached.output_size => {
             eprintln!(
@@ -787,14 +782,14 @@ impl Linker {
             }
 
             // Persist the fresh snapshot for the next link.
-            if let Err(e) = layout_snapshot::write_snapshot(args.output(), snapshot) {
-                if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
-                    eprintln!(
-                        "wild layout-snapshot: write to {} failed: {}",
-                        args.output().display(),
-                        e
-                    );
-                }
+            if let Err(e) = layout_snapshot::write_snapshot(args.output(), snapshot)
+                && std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+            {
+                eprintln!(
+                    "wild layout-snapshot: write to {} failed: {}",
+                    args.output().display(),
+                    e
+                );
             }
         }
 
@@ -1229,7 +1224,7 @@ fn try_whole_link_skip<P: Platform>(file_loader: &FileLoader<'_>, args: &P::Args
             false
         }
         incremental_cache::SignatureVerdict::Mismatch(why) => {
-            eprintln!("wild incremental: link signature mismatch: {:?}", why);
+            eprintln!("wild incremental: link signature mismatch: {why:?}");
             false
         }
     }
@@ -1515,14 +1510,14 @@ fn emit_patch_file(prev: &[u8], new: &[u8], path: &std::path::Path) -> std::io::
     let common = prev.len().min(new.len());
     let mut i = 0;
     while i < common {
-        if prev[i] != new[i] {
+        if prev[i] == new[i] {
+            i += 1;
+        } else {
             let start = i;
             while i < common && prev[i] != new[i] {
                 i += 1;
             }
             runs.push((start, i - start));
-        } else {
-            i += 1;
         }
     }
     if new.len() > prev.len() {
@@ -1754,8 +1749,7 @@ fn patch_symbol_ranges(bytes: &[u8]) -> Vec<PatchSymbolRange> {
             .iter()
             .skip(idx + 1)
             .find(|next| next.file_start > candidate.file_start)
-            .map(|next| next.file_start)
-            .unwrap_or(candidate.section_end);
+            .map_or(candidate.section_end, |next| next.file_start);
         let explicit_end = candidate
             .explicit_size
             .checked_add(candidate.file_start)

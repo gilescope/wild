@@ -36,6 +36,7 @@ pub enum Tool {
 impl Tool {
     /// The standard executable name (no `.exe` — wild's current
     /// target set is Unix-only).
+    #[must_use]
     pub fn exe_name(self) -> &'static str {
         match self {
             Tool::Llc => "llc",
@@ -50,6 +51,7 @@ impl Tool {
 
     /// Name of the env var users can set to override discovery. The
     /// override is absolute-path-or-command and not further searched.
+    #[must_use]
     pub fn env_var(self) -> &'static str {
         match self {
             Tool::Llc => "WILD_LLC",
@@ -68,14 +70,14 @@ impl Tool {
 /// diagnose that.
 #[must_use]
 pub fn find(tool: Tool) -> Option<PathBuf> {
-    if let Ok(v) = std::env::var(tool.env_var()) {
-        if !v.is_empty() {
-            let p = PathBuf::from(&v);
-            if p.is_absolute() || p.components().count() > 1 {
-                return p.exists().then_some(p);
-            }
-            return which::which(&v).ok();
+    if let Ok(v) = std::env::var(tool.env_var())
+        && !v.is_empty()
+    {
+        let p = PathBuf::from(&v);
+        if p.is_absolute() || p.components().count() > 1 {
+            return p.exists().then_some(p);
         }
+        return which::which(&v).ok();
     }
     find_by_name(tool.exe_name())
 }
@@ -225,8 +227,8 @@ mod tests {
         ];
         let mut seen = std::collections::HashSet::new();
         for t in tools {
-            assert!(seen.insert(t.env_var()), "duplicate env var: {:?}", t);
-            assert!(seen.insert(t.exe_name()), "duplicate exe name: {:?}", t);
+            assert!(seen.insert(t.env_var()), "duplicate env var: {t:?}");
+            assert!(seen.insert(t.exe_name()), "duplicate exe name: {t:?}");
         }
     }
 

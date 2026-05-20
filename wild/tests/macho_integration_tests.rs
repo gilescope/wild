@@ -181,11 +181,11 @@ fn parse_config(test_dir: &Path, primary: &Path) -> Result<TestConfig, Box<dyn s
         if obj_path.exists() {
             let obj_src = std::fs::read_to_string(&obj_path)?;
             for line in obj_src.lines() {
-                if let Some(directive) = line.strip_prefix("//#") {
-                    if let Some(("CompArgs", v)) = directive.split_once(':').map(|(k, v)| (k, v)) {
-                        // CompArgs in extra objects only apply to that object — ignored here.
-                        let _ = v;
-                    }
+                if let Some(directive) = line.strip_prefix("//#")
+                    && let Some(("CompArgs", v)) = directive.split_once(':')
+                {
+                    // CompArgs in extra objects only apply to that object — ignored here.
+                    let _ = v;
                 }
             }
         }
@@ -214,9 +214,9 @@ fn run_test(
 
     // Compile all source files.
     let mut objects = Vec::new();
-    let is_cpp = primary.extension().map_or(false, |e| e == "cc");
+    let is_cpp = primary.extension().is_some_and(|e| e == "cc");
 
-    let is_rust = primary.extension().map_or(false, |e| e == "rs");
+    let is_rust = primary.extension().is_some_and(|e| e == "rs");
 
     if is_rust {
         // Rust files: compile + link via rustc with wild as linker.
@@ -279,7 +279,7 @@ fn run_test(
             objects.push(PathBuf::from(obj_name));
             continue;
         }
-        let extra_cpp = src.extension().map_or(false, |e| e == "cc");
+        let extra_cpp = src.extension().is_some_and(|e| e == "cc");
         compile_source(&src, &build_dir, &config.comp_args, extra_cpp)?;
         objects.push(object_path(&build_dir, &src));
     }
@@ -289,7 +289,7 @@ fn run_test(
         let mut member_objs = Vec::new();
         for src_name in sources {
             let src = test_dir.join(src_name);
-            let src_cpp = src.extension().map_or(false, |e| e == "cc");
+            let src_cpp = src.extension().is_some_and(|e| e == "cc");
             compile_source(&src, &build_dir, &config.comp_args, src_cpp)?;
             member_objs.push(object_path(&build_dir, &src));
         }
@@ -314,12 +314,12 @@ fn run_test(
         let mut member_objs = Vec::new();
         for src_name in sources {
             let src = test_dir.join(src_name);
-            let src_cpp = src.extension().map_or(false, |e| e == "cc");
+            let src_cpp = src.extension().is_some_and(|e| e == "cc");
             compile_source(&src, &build_dir, &config.comp_args, src_cpp)?;
             member_objs.push(object_path(&build_dir, &src));
         }
         let reloc_path = build_dir.join(format!("relocatable{group_idx}.o"));
-        let mut reloc_cmd = Command::new(&wild_bin);
+        let mut reloc_cmd = Command::new(wild_bin);
         reloc_cmd.arg("-r");
         for obj in &member_objs {
             reloc_cmd.arg(obj);
@@ -339,7 +339,7 @@ fn run_test(
         let src = test_dir.join(lib_src_name);
         let stem = src.file_stem().unwrap().to_string_lossy().to_string();
         let dylib_path = build_dir.join(format!("lib{stem}.dylib"));
-        let src_cpp = src.extension().map_or(false, |e| e == "cc");
+        let src_cpp = src.extension().is_some_and(|e| e == "cc");
         let compiler = if src_cpp { "clang++" } else { "clang" };
         let mut dylib_cmd = Command::new(compiler);
         dylib_cmd
@@ -574,16 +574,18 @@ fn verify_macho_invariants(binary: &[u8], path: &std::path::Path) -> Result<(), 
                     // Invariant: section file offset must be within the segment.
                     let sec_type = sec.flags(le) & 0xFF;
                     let is_zerofill = sec_type == 0x01 || sec_type == 0x0C;
-                    if sec_size > 0 && !is_zerofill && sec_offset > 0 {
-                        if sec_offset < file_off || sec_offset + sec_size > file_off + file_size {
-                            return Err(format!(
-                                "{}: section {segname},{sect_name} file range \
+                    if sec_size > 0
+                        && !is_zerofill
+                        && sec_offset > 0
+                        && (sec_offset < file_off || sec_offset + sec_size > file_off + file_size)
+                    {
+                        return Err(format!(
+                            "{}: section {segname},{sect_name} file range \
                                  [{sec_offset:#x}..{:#x}) outside segment [{file_off:#x}..{:#x})",
-                                path.display(),
-                                sec_offset + sec_size,
-                                file_off + file_size
-                            ));
-                        }
+                            path.display(),
+                            sec_offset + sec_size,
+                            file_off + file_size
+                        ));
                     }
 
                     // Invariant: section must respect its alignment.

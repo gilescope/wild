@@ -117,9 +117,7 @@ fn rewrite_body_with_edits(
     for &(s, e, n) in &edits {
         out.extend_from_slice(&body[cursor..s]);
         let out_start = out.len() as u32;
-        for _ in 0..n {
-            out.push(OP_DROP);
-        }
+        out.extend(std::iter::repeat_n(OP_DROP, n as usize));
         let out_len = out.len() as u32 - out_start;
         let in_len = (e - s) as u32;
         body_edits.push(

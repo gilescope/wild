@@ -412,7 +412,7 @@ mod tests {
         let header = FileHeader64::<Endianness>::parse(&*buf).expect("parse shrunk");
         let sections = header.sections(endian, &*buf).expect("sections");
         let mut found_compressed = false;
-        for (_, sect) in sections.iter().enumerate() {
+        for sect in sections.iter() {
             let name = sections.section_name(endian, sect).unwrap();
             if name == b".debug_foo" {
                 let flags = sect.sh_flags(endian);

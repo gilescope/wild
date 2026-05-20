@@ -48,6 +48,7 @@ fn validates(bytes: &[u8]) -> bool {
 }
 
 struct Row {
+    #[allow(dead_code)]
     name: String,
     input: usize,
     wilt_out: Option<usize>,

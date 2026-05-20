@@ -39,7 +39,7 @@ fn rewrite_body(body: &[u8], hints: &dyn LinkerHints) -> Option<Vec<u8>> {
     let start = opcode::skip_locals(body)?;
     let mut iter = InstrIter::new(body, start);
     let mut edits: Vec<(usize, usize)> = Vec::new();
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter.by_ref() {
         if body[p] != OP_GLOBAL_SET {
             continue;
         }

@@ -220,8 +220,7 @@ pub(crate) fn save_sdk_symbols(sysroot: &Path, symbols: &crate::args::macho::Dyl
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos() as i128);
     // Sorted symbols → determinism. Byte-equal cache across runs
     // makes CI diff-tooling possible and enables future content-hash
     // caching of the cache itself.
@@ -419,8 +418,7 @@ pub(crate) fn save_tbd_symbols(
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos() as i128);
     let mut sorted: Vec<&[u8]> = symbols.iter().map(|s| s.as_ref()).collect();
     sorted.sort();
     let inst_bytes = install_name.unwrap_or(&[]);

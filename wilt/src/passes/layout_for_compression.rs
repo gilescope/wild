@@ -67,8 +67,8 @@ fn any_body_has_advanced_features(module: &WasmModule<'_>) -> bool {
         let Some(start) = opcode::skip_locals(b) else {
             return true;
         };
-        let mut iter = InstrIter::new(b, start);
-        while let Some((p, _)) = iter.next() {
+        let iter = InstrIter::new(b, start);
+        for (p, _) in iter {
             match b[p] {
                 0xFB | 0xFD | 0xFE | 0x06 | 0x07 | 0x08 | 0x09 | 0x18 | 0x1F => return true,
                 _ => {}

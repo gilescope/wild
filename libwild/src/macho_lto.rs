@@ -74,28 +74,66 @@ impl LibLto {
             };
 
             Ok(Self {
-                module_create_from_memory: std::mem::transmute(get(
+                module_create_from_memory: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(*const u8, usize) -> LtoModuleT,
+                >(get(
                     b"lto_module_create_from_memory\0",
                 )?),
-                module_dispose: std::mem::transmute(get(b"lto_module_dispose\0")?),
-                module_get_num_symbols: std::mem::transmute(get(b"lto_module_get_num_symbols\0")?),
-                module_get_symbol_name: std::mem::transmute(get(b"lto_module_get_symbol_name\0")?),
-                module_get_symbol_attribute: std::mem::transmute(get(
+                module_dispose: std::mem::transmute::<*const (), unsafe extern "C" fn(LtoModuleT)>(
+                    get(b"lto_module_dispose\0")?,
+                ),
+                module_get_num_symbols: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoModuleT) -> u32,
+                >(get(b"lto_module_get_num_symbols\0")?),
+                module_get_symbol_name: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoModuleT, u32) -> *const std::ffi::c_char,
+                >(get(b"lto_module_get_symbol_name\0")?),
+                module_get_symbol_attribute: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoModuleT, u32) -> u32,
+                >(get(
                     b"lto_module_get_symbol_attribute\0",
                 )?),
-                codegen_create: std::mem::transmute(get(b"lto_codegen_create\0")?),
-                codegen_dispose: std::mem::transmute(get(b"lto_codegen_dispose\0")?),
-                codegen_add_module: std::mem::transmute(get(b"lto_codegen_add_module\0")?),
-                codegen_add_must_preserve_symbol: std::mem::transmute(get(
+                codegen_create: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn() -> LtoCodeGenT,
+                >(get(b"lto_codegen_create\0")?),
+                codegen_dispose: std::mem::transmute::<*const (), unsafe extern "C" fn(LtoCodeGenT)>(
+                    get(b"lto_codegen_dispose\0")?,
+                ),
+                codegen_add_module: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoCodeGenT, LtoModuleT) -> bool,
+                >(get(b"lto_codegen_add_module\0")?),
+                codegen_add_must_preserve_symbol: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoCodeGenT, *const std::ffi::c_char),
+                >(get(
                     b"lto_codegen_add_must_preserve_symbol\0",
                 )?),
-                codegen_set_pic_model: std::mem::transmute(get(b"lto_codegen_set_pic_model\0")?),
-                codegen_compile: std::mem::transmute(get(b"lto_codegen_compile\0")?),
-                get_error_message: std::mem::transmute(get(b"lto_get_error_message\0")?),
-                codegen_compile_to_file: std::mem::transmute(get(
-                    b"lto_codegen_compile_to_file\0",
-                )?),
-                codegen_debug_options: std::mem::transmute(get(b"lto_codegen_debug_options\0")?),
+                codegen_set_pic_model: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoCodeGenT, u32) -> bool,
+                >(get(b"lto_codegen_set_pic_model\0")?),
+                codegen_compile: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoCodeGenT, *mut usize) -> *const u8,
+                >(get(b"lto_codegen_compile\0")?),
+                get_error_message: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn() -> *const std::ffi::c_char,
+                >(get(b"lto_get_error_message\0")?),
+                codegen_compile_to_file: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoCodeGenT, *mut *const std::ffi::c_char) -> bool,
+                >(get(b"lto_codegen_compile_to_file\0")?),
+                codegen_debug_options: std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(LtoCodeGenT, *const std::ffi::c_char),
+                >(get(b"lto_codegen_debug_options\0")?),
                 _lib: lib,
             })
         }

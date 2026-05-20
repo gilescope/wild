@@ -64,7 +64,6 @@ pub(crate) fn estimate_unwind_info_entries(
     symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
 ) -> usize {
     use object::read::macho::MachHeader as _;
-    use object::read::macho::Section as _;
     use object::read::macho::Segment as _;
     let le = object::Endianness::Little;
     let mut total = 0usize;
@@ -151,6 +150,7 @@ pub(crate) fn estimate_unwind_info_entries(
 ///   header(28) + common_enc(4) + pers(n_pers*4)
 ///   + top_idx((pages+1)*12) + lsda(k*8)
 ///   + sl_pages(pages * (8 + per_page_entries*8))
+///
 /// Assumptions: 4 personalities, every entry has an LSDA descriptor
 /// (8-byte pair), 500 entries per 2nd-level page. Overshoots but
 /// never undershoots. Returns 0 when no unwind entries exist, so the
@@ -239,6 +239,7 @@ impl<'data> File<'data> {
 /// * the first atom always starts at `0` regardless of whether a symbol is defined there — ld64
 ///   treats the head of the section as an atom anchored on the first-declared symbol (or an
 ///   anonymous one if none covers offset 0).
+///
 /// After atom GC completes, reclaim the bytes held by dormant atoms
 /// in atom-managed sections (`__text`, `__const` in `__TEXT` and
 /// `__DATA`, `__gcc_except_tab`) and the FDEs that don't survive the
@@ -329,7 +330,7 @@ pub(crate) fn compact_atom_managed_sections<'data>(
                 // `build_lsda_map` merges duplicates by priority, but
                 // here only the extern=1, r_type=0 entry matters and
                 // a single address can only carry one reloc anyway.
-                m.insert(ri.r_address as u32, ri);
+                m.insert(ri.r_address, ri);
             }
             m
         };
@@ -505,10 +506,10 @@ pub(crate) fn compact_atom_managed_sections<'data>(
                 // skip the delta if an entry is already there —
                 // the savings are smaller than the correctness
                 // risk of stomping a padding insertion.
-                if let Some(existing) = object.section_relax_deltas.get(sec_idx) {
-                    if existing.has_delta_at(atom.input_start) {
-                        continue;
-                    }
+                if let Some(existing) = object.section_relax_deltas.get(sec_idx)
+                    && existing.has_delta_at(atom.input_start)
+                {
+                    continue;
                 }
                 out.push((atom.input_start, size as i32));
                 total += size;
@@ -555,26 +556,26 @@ pub(crate) fn compact_atom_managed_sections<'data>(
         // pre-existing subsection-padding delta that happens to
         // land mid-atom both get caught.
         #[cfg(debug_assertions)]
-        if let Some(tracking) = object.subsection_tracking.get(&sec_idx) {
-            if let Some(deltas) = object.section_relax_deltas.get(sec_idx) {
-                for d in deltas.deltas() {
-                    if d.bytes_delta <= 0 {
-                        continue; // insertion (padding); not an atom delete
-                    }
-                    let lo = d.input_offset;
-                    let hi = lo + d.bytes_delta as u64;
-                    let matches_atom = tracking.atoms.iter().enumerate().any(|(i, atom)| {
-                        atom.input_start == lo && atom.input_end == hi && !tracking.scanned[i]
-                    });
-                    debug_assert!(
-                        matches_atom,
-                        "compact_atom_managed_sections: deletion delta \
+        if let Some(tracking) = object.subsection_tracking.get(&sec_idx)
+            && let Some(deltas) = object.section_relax_deltas.get(sec_idx)
+        {
+            for d in deltas.deltas() {
+                if d.bytes_delta <= 0 {
+                    continue; // insertion (padding); not an atom delete
+                }
+                let lo = d.input_offset;
+                let hi = lo + d.bytes_delta as u64;
+                let matches_atom = tracking.atoms.iter().enumerate().any(|(i, atom)| {
+                    atom.input_start == lo && atom.input_end == hi && !tracking.scanned[i]
+                });
+                debug_assert!(
+                    matches_atom,
+                    "compact_atom_managed_sections: deletion delta \
                          [{lo:#x}..{hi:#x}) in sec_idx={sec_idx} does not \
                          match any dormant atom's input range — \
                          input_to_output_offset will corrupt VMs of live \
                          symbols whose offsets fall in this range"
-                    );
-                }
+                );
             }
         }
     }
@@ -793,8 +794,7 @@ pub(crate) fn compute_atoms(
         let (start, anchor) = boundaries[i];
         let end = boundaries
             .get(i + 1)
-            .map(|(next_off, _)| *next_off)
-            .unwrap_or(section_size);
+            .map_or(section_size, |(next_off, _)| *next_off);
         if end <= start {
             continue;
         }
@@ -849,8 +849,7 @@ pub(crate) fn build_lsda_map(file: &File<'_>) -> LsdaMap {
         .filter(|&i| {
             file.sections
                 .get(i)
-                .map(|s| trim_nul(s.sectname()) == b"__gcc_except_tab")
-                .unwrap_or(false)
+                .is_some_and(|s| trim_nul(s.sectname()) == b"__gcc_except_tab")
         })
         .fold(std::collections::HashSet::with_capacity(2), |mut s, i| {
             s.insert(i);
@@ -893,7 +892,7 @@ pub(crate) fn build_lsda_map(file: &File<'_>) -> LsdaMap {
                 // For SUBTRACTOR+UNSIGNED pairs at the same
                 // r_address, the UNSIGNED half names the real
                 // target — keep that one.
-                let addr = ri.r_address as u32;
+                let addr = ri.r_address;
                 match relocs_by_off.get(&addr) {
                     Some(existing) if existing.r_type == 1 => {
                         relocs_by_off.insert(addr, ri);
@@ -917,7 +916,7 @@ pub(crate) fn build_lsda_map(file: &File<'_>) -> LsdaMap {
                 let n_entries = sec_size / 32;
                 for i in 0..n_entries {
                     let entry_base = (i as u32) * 32;
-                    let entry_off = (i * 32) as usize;
+                    let entry_off = i * 32;
 
                     let Some(fn_reloc) = relocs_by_off.get(&entry_base) else {
                         continue;
@@ -1152,7 +1151,7 @@ pub(crate) fn decode_pending_page21(
     let pc = source_section
         .addr
         .get(LE)
-        .wrapping_add(reloc.r_address as u64);
+        .wrapping_add(u64::from(reloc.r_address));
     let target_page = decode_adrp_target_page(insn, pc)?;
     Some((
         object::SectionIndex(sec_num - 1),
@@ -1269,8 +1268,8 @@ pub(crate) fn decode_adrp_target_page(insn: u32, pc: u64) -> Option<u64> {
     if (insn >> 24) & 0x1f != 0x10 {
         return None;
     }
-    let immlo = ((insn >> 29) & 0x3) as u64;
-    let immhi = ((insn >> 5) & 0x7_FFFF) as u64;
+    let immlo = u64::from((insn >> 29) & 0x3);
+    let immhi = u64::from((insn >> 5) & 0x7_FFFF);
     let imm21 = (immhi << 2) | immlo;
     // Sign-extend from 21 bits. Bit 20 of imm21 is the sign bit.
     let imm21_signed = if imm21 & (1 << 20) != 0 {
@@ -1525,7 +1524,7 @@ fn scan_reloc_range_for_atom_impl<'data, 'scope, A: platform::Arch<Platform = Ma
         let buckets = tracking.reloc_buckets.get_or_init(|| {
             let mut b: Vec<Vec<u32>> = vec![Vec::new(); tracking.atoms.len()];
             for (idx, r) in relocs.iter().enumerate() {
-                let r_addr = r.info(le).r_address as u64;
+                let r_addr = u64::from(r.info(le).r_address);
                 if let Some(atom_idx) = tracking.atom_index_for_offset(r_addr) {
                     b[atom_idx].push(idx as u32);
                 }
@@ -1556,7 +1555,7 @@ fn scan_reloc_range_for_atom_impl<'data, 'scope, A: platform::Arch<Platform = Ma
             let reloc_raw: &macho::Relocation<object::Endianness> = $reloc_raw;
             let reloc = reloc_raw.info(le);
             // `r_address` is the offset within the containing section.
-            let r_addr = reloc.r_address as u64;
+            let r_addr = u64::from(reloc.r_address);
             if atom_bucket.is_none() && (r_addr < range.start || r_addr >= range.end) {
                 // Meta relocs (ADDEND / SUBTRACTOR) can't straddle the
                 // atom boundary meaningfully — if the primary is out of
@@ -1576,7 +1575,7 @@ fn scan_reloc_range_for_atom_impl<'data, 'scope, A: platform::Arch<Platform = Ma
                         if let Some((tgt_sec, tgt_off)) =
                             decode_non_extern_target(state.object, input_section, &reloc)
                         {
-                            if state.subsection_tracking_has(&tgt_sec.0) {
+                            if state.subsection_tracking_has(tgt_sec.0) {
                                 queue.push_section_activation(state.file_id, tgt_sec, tgt_off);
                             }
                             mark_merge_ref(state, resources, tgt_sec, tgt_off);
@@ -1592,13 +1591,13 @@ fn scan_reloc_range_for_atom_impl<'data, 'scope, A: platform::Arch<Platform = Ma
                                 decode_pageoff12_reloc(state.object, input_section, &reloc)
                             && let Some(target_sec_hdr) = state.object.sections.get(tgt_sec.0)
                         {
-                            let tgt_vm = tgt_page.wrapping_add(byte_off as u64);
+                            let tgt_vm = tgt_page.wrapping_add(u64::from(byte_off));
                             let tgt_addr = target_sec_hdr.addr.get(le);
                             let tgt_size = target_sec_hdr.size.get(le);
                             if tgt_vm >= tgt_addr {
                                 let tgt_off = tgt_vm - tgt_addr;
                                 if tgt_off < tgt_size {
-                                    if state.subsection_tracking_has(&tgt_sec.0) {
+                                    if state.subsection_tracking_has(tgt_sec.0) {
                                         queue.push_section_activation(
                                             state.file_id,
                                             tgt_sec,
@@ -1670,7 +1669,7 @@ fn scan_reloc_range_for_atom_impl<'data, 'scope, A: platform::Arch<Platform = Ma
                     .ok()
                     .map_or(false, |n| n.bytes().starts_with(b"_objc_msgSend$"));
             let flags_to_add = match reloc.r_type {
-                5 | 6 | 7 => crate::value_flags::ValueFlags::GOT,
+                5..=7 => crate::value_flags::ValueFlags::GOT,
                 // ARM64_RELOC_TLVP_LOAD_PAGE21 (8) / TLVP_LOAD_PAGEOFF12 (9):
                 // for an undefined extern (i.e. TLV var imported from a
                 // dylib) we need a GOT-like slot that dyld binds to the
@@ -2745,7 +2744,13 @@ fn macho_header_bytes(
     total_sizes: &crate::output_section_part_map::OutputSectionPartMap<u64>,
 ) -> u64 {
     use crate::output_section_id;
-    use macho_layout::*;
+    use macho_layout::{
+        DEFAULT_HEADERPAD_BYTES, DYLD_PATH_LEN, DYLIB_COMMAND_FIXED_BYTES,
+        DYLINKER_COMMAND_FIXED_BYTES, LC_BUILD_VERSION_BYTES, LC_CODE_SIGNATURE_BYTES,
+        LC_DYSYMTAB_BYTES, LC_LINKEDIT_DATA_BYTES, LC_LINKEDIT_TABLE_BYTES, LC_MAIN_BYTES,
+        LC_SEGMENT_64_HEADER_BYTES, LC_SOURCE_VERSION_BYTES, LC_SYMTAB_BYTES, LC_UUID_BYTES,
+        LIBSYSTEM_PATH_LEN, MACH_HEADER_64_BYTES, SECTION_64_BYTES, TEXT_ALIGNMENT_BYTES,
+    };
 
     // Only sections with accumulated content are counted — the writer
     // drops zero-size sections in its iteration loop, so including them
@@ -2877,7 +2882,7 @@ fn macho_header_bytes(
     for (segname, _) in &args.empty_sections {
         *empty_by_seg.entry(*segname).or_insert(0) += 1;
     }
-    for (_, n) in &empty_by_seg {
+    for n in empty_by_seg.values() {
         sz += seg_lc(*n);
     }
 
@@ -2895,7 +2900,7 @@ fn macho_header_bytes(
     sz += LC_SOURCE_VERSION_BYTES;
 
     if args.is_dylib {
-        let name_len = args.install_name.as_ref().map(|n| n.len()).unwrap_or(0) as u64;
+        let name_len = args.install_name.as_ref().map_or(0, |n| n.len()) as u64;
         sz += align8(DYLIB_COMMAND_FIXED_BYTES + name_len + 1); // LC_ID_DYLIB
     } else if !args.is_bundle {
         sz += LC_MAIN_BYTES;
@@ -2930,8 +2935,7 @@ fn macho_header_bytes(
     // re-collide with codesign post-link, so floor it.
     sz += args
         .headerpad
-        .map(|n| n.max(DEFAULT_HEADERPAD_BYTES))
-        .unwrap_or(DEFAULT_HEADERPAD_BYTES);
+        .map_or(DEFAULT_HEADERPAD_BYTES, |n| n.max(DEFAULT_HEADERPAD_BYTES));
 
     // __text must start on a 4-byte boundary (ARM64 instructions).
     (sz + TEXT_ALIGNMENT_BYTES - 1) & !(TEXT_ALIGNMENT_BYTES - 1)
@@ -3380,8 +3384,7 @@ impl platform::Platform for MachO {
             .object
             .sections
             .get(section.index.0)
-            .map(|s| crate::macho::trim_nul(s.sectname()))
-            .unwrap_or(&[]);
+            .map_or::<&[u8], _>(&[], |s| crate::macho::trim_nul(s.sectname()));
         let is_eh_frame = sectname_bytes == b"__eh_frame";
 
         // Under `.subsections_via_symbols`, wild defers the main
@@ -3389,7 +3392,7 @@ impl platform::Platform for MachO {
         // for which `compute_atoms` returned atoms — today that's
         // pure-text, `__const`, and `__gcc_except_tab`. The
         // `__compact_unwind` pass below still runs unconditionally.
-        let atom_managed = state.subsection_tracking_has(&section.index.0);
+        let atom_managed = state.subsection_tracking_has(section.index.0);
         if !atom_managed && !is_eh_frame {
             scan_reloc_range_for_atom::<A>(state, queue, resources, section, 0..u64::MAX, scope)?;
         }
@@ -3429,74 +3432,72 @@ impl platform::Platform for MachO {
         // UNSIGNED pair pattern here when both members are extern
         // and the UNSIGNED targets an `eh_personality`-shaped
         // symbol. Until then the breakage is contained but real.
-        if is_eh_frame {
-            if let Some(sec_obj) = state.object.sections.get(section.index.0) {
-                if let Ok(relocs) = sec_obj.relocations(le, state.object.data) {
-                    // First pass: ARM64_RELOC_POINTER_TO_GOT — the
-                    // historical encoding used by clang-emitted CIEs
-                    // (SDK / system libraries).
-                    //
-                    // Second pass: ARM64_RELOC_SUBTRACTOR (5) +
-                    // ARM64_RELOC_UNSIGNED (0) pair — the encoding
-                    // rustc emits for `_rust_eh_personality`. The
-                    // SUBTRACTOR comes first naming the subtrahend
-                    // (typically an `ltmp*` local section anchor),
-                    // the UNSIGNED follows at the same r_address
-                    // naming the target (the personality fn). Both
-                    // r_length=3, !pcrel. The two members must be
-                    // adjacent and share an r_address — that's how
-                    // ld64 has parsed them since at least 2010.
-                    //
-                    // For wild's purposes the only thing the scan
-                    // needs to do is request the personality symbol
-                    // so it acquires a resolution. The reloc-write
-                    // path then computes `target - subtrahend` and
-                    // patches the CIE field in `__eh_frame`. No GOT
-                    // slot is needed (the encoding is direct, not
-                    // GOT-indirect), so we do NOT set the GOT flag
-                    // for the pair case — only send the symbol
-                    // request.
-                    let relocs: Vec<object::macho::Relocation<object::Endianness>> =
-                        relocs.iter().copied().collect();
-                    for (idx, r) in relocs.iter().enumerate() {
-                        let ri = r.info(le);
-                        if ri.r_type == 7 && ri.r_length == 2 && ri.r_pcrel && ri.r_extern {
-                            let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
-                            let local_id = state.symbol_id_range.input_to_id(sym_idx);
-                            let sym_id = resources.symbol_db.definition(local_id);
-                            let atomic = resources.per_symbol_flags.get_atomic(sym_id);
-                            let prev = atomic.fetch_or(crate::value_flags::ValueFlags::GOT);
-                            if !prev.has_resolution() {
-                                queue.send_symbol_request::<A>(sym_id, resources, scope);
-                            }
-                            continue;
-                        }
-                        // SUBTRACTOR + UNSIGNED pair: SUBTRACTOR
-                        // first at index `idx`, UNSIGNED at idx+1.
-                        // Both r_length=3, both r_extern=true,
-                        // sharing r_address. The UNSIGNED's symbol
-                        // is the target we care about.
-                        if ri.r_type == 5
-                            && ri.r_length == 3
-                            && !ri.r_pcrel
-                            && ri.r_extern
-                            && idx + 1 < relocs.len()
-                        {
-                            let next = relocs[idx + 1].info(le);
-                            if next.r_type == 0
-                                && next.r_length == 3
-                                && !next.r_pcrel
-                                && next.r_extern
-                                && next.r_address == ri.r_address
-                            {
-                                let sym_idx = object::SymbolIndex(next.r_symbolnum as usize);
-                                let local_id = state.symbol_id_range.input_to_id(sym_idx);
-                                let sym_id = resources.symbol_db.definition(local_id);
-                                let prev = resources.per_symbol_flags.get_atomic(sym_id).get();
-                                if !prev.has_resolution() {
-                                    queue.send_symbol_request::<A>(sym_id, resources, scope);
-                                }
-                            }
+        if is_eh_frame
+            && let Some(sec_obj) = state.object.sections.get(section.index.0)
+            && let Ok(relocs) = sec_obj.relocations(le, state.object.data)
+        {
+            // First pass: ARM64_RELOC_POINTER_TO_GOT — the
+            // historical encoding used by clang-emitted CIEs
+            // (SDK / system libraries).
+            //
+            // Second pass: ARM64_RELOC_SUBTRACTOR (5) +
+            // ARM64_RELOC_UNSIGNED (0) pair — the encoding
+            // rustc emits for `_rust_eh_personality`. The
+            // SUBTRACTOR comes first naming the subtrahend
+            // (typically an `ltmp*` local section anchor),
+            // the UNSIGNED follows at the same r_address
+            // naming the target (the personality fn). Both
+            // r_length=3, !pcrel. The two members must be
+            // adjacent and share an r_address — that's how
+            // ld64 has parsed them since at least 2010.
+            //
+            // For wild's purposes the only thing the scan
+            // needs to do is request the personality symbol
+            // so it acquires a resolution. The reloc-write
+            // path then computes `target - subtrahend` and
+            // patches the CIE field in `__eh_frame`. No GOT
+            // slot is needed (the encoding is direct, not
+            // GOT-indirect), so we do NOT set the GOT flag
+            // for the pair case — only send the symbol
+            // request.
+            let relocs: Vec<object::macho::Relocation<object::Endianness>> = relocs.to_vec();
+            for (idx, r) in relocs.iter().enumerate() {
+                let ri = r.info(le);
+                if ri.r_type == 7 && ri.r_length == 2 && ri.r_pcrel && ri.r_extern {
+                    let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
+                    let local_id = state.symbol_id_range.input_to_id(sym_idx);
+                    let sym_id = resources.symbol_db.definition(local_id);
+                    let atomic = resources.per_symbol_flags.get_atomic(sym_id);
+                    let prev = atomic.fetch_or(crate::value_flags::ValueFlags::GOT);
+                    if !prev.has_resolution() {
+                        queue.send_symbol_request::<A>(sym_id, resources, scope);
+                    }
+                    continue;
+                }
+                // SUBTRACTOR + UNSIGNED pair: SUBTRACTOR
+                // first at index `idx`, UNSIGNED at idx+1.
+                // Both r_length=3, both r_extern=true,
+                // sharing r_address. The UNSIGNED's symbol
+                // is the target we care about.
+                if ri.r_type == 5
+                    && ri.r_length == 3
+                    && !ri.r_pcrel
+                    && ri.r_extern
+                    && idx + 1 < relocs.len()
+                {
+                    let next = relocs[idx + 1].info(le);
+                    if next.r_type == 0
+                        && next.r_length == 3
+                        && !next.r_pcrel
+                        && next.r_extern
+                        && next.r_address == ri.r_address
+                    {
+                        let sym_idx = object::SymbolIndex(next.r_symbolnum as usize);
+                        let local_id = state.symbol_id_range.input_to_id(sym_idx);
+                        let sym_id = resources.symbol_db.definition(local_id);
+                        let prev = resources.per_symbol_flags.get_atomic(sym_id).get();
+                        if !prev.has_resolution() {
+                            queue.send_symbol_request::<A>(sym_id, resources, scope);
                         }
                     }
                 }
@@ -3522,76 +3523,74 @@ impl platform::Platform for MachO {
             use object::read::macho::Segment as _;
             if let Ok(header) =
                 object::macho::MachHeader64::<object::Endianness>::parse(state.object.data, 0)
+                && let Ok(mut cmds) = header.load_commands(le, state.object.data, 0)
             {
-                if let Ok(mut cmds) = header.load_commands(le, state.object.data, 0) {
-                    while let Ok(Some(cmd)) = cmds.next() {
-                        let Ok(Some((seg, seg_data))) = cmd.segment_64() else {
+                while let Ok(Some(cmd)) = cmds.next() {
+                    let Ok(Some((seg, seg_data))) = cmd.segment_64() else {
+                        continue;
+                    };
+                    let Ok(sections) = seg.sections(le, seg_data) else {
+                        continue;
+                    };
+                    for sec in sections {
+                        let sec_segname = crate::macho::trim_nul(&sec.segname);
+                        let sectname = crate::macho::trim_nul(&sec.sectname);
+                        if sec_segname != b"__LD" || sectname != b"__compact_unwind" {
                             continue;
+                        }
+                        let relocs = match sec.relocations(le, state.object.data) {
+                            Ok(r) => r,
+                            Err(_) => continue,
                         };
-                        let Ok(sections) = seg.sections(le, seg_data) else {
-                            continue;
-                        };
-                        for sec in sections {
-                            let sec_segname = crate::macho::trim_nul(&sec.segname);
-                            let sectname = crate::macho::trim_nul(&sec.sectname);
-                            if sec_segname != b"__LD" || sectname != b"__compact_unwind" {
+                        // Compute the __compact_unwind data slice
+                        // once — used when decoding non-extern
+                        // personality refs (which encode the
+                        // target VM address inline at offset 16).
+                        let cu_off = sec.offset.get(le) as usize;
+                        let cu_size = sec.size.get(le) as usize;
+                        let cu_data = state
+                            .object
+                            .data
+                            .get(cu_off..cu_off.checked_add(cu_size).unwrap_or(0));
+                        for r in relocs {
+                            let ri = r.info(le);
+                            if ri.r_type != 0 {
                                 continue;
                             }
-                            let relocs = match sec.relocations(le, state.object.data) {
-                                Ok(r) => r,
-                                Err(_) => continue,
-                            };
-                            // Compute the __compact_unwind data slice
-                            // once — used when decoding non-extern
-                            // personality refs (which encode the
-                            // target VM address inline at offset 16).
-                            let cu_off = sec.offset.get(le) as usize;
-                            let cu_size = sec.size.get(le) as usize;
-                            let cu_data = state
-                                .object
-                                .data
-                                .get(cu_off..cu_off.checked_add(cu_size).unwrap_or(0));
-                            for r in relocs {
-                                let ri = r.info(le);
-                                if ri.r_type != 0 {
-                                    continue;
+                            // Personality is at offset 16 within each 32-byte entry.
+                            if ri.r_address as usize % 32 != 16 {
+                                continue;
+                            }
+                            if ri.r_extern {
+                                // Extern personality reference —
+                                // ask the resolver and ensure the
+                                // GOT flag is set so a slot is
+                                // allocated during layout.
+                                let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
+                                let local_id = state.symbol_id_range.input_to_id(sym_idx);
+                                let sym_id = resources.symbol_db.definition(local_id);
+                                let atomic = &resources.per_symbol_flags.get_atomic(sym_id);
+                                let prev = atomic.fetch_or(crate::value_flags::ValueFlags::GOT);
+                                if !prev.has_resolution() {
+                                    queue.send_symbol_request::<A>(sym_id, resources, scope);
                                 }
-                                // Personality is at offset 16 within each 32-byte entry.
-                                if ri.r_address as usize % 32 != 16 {
-                                    continue;
-                                }
-                                if ri.r_extern {
-                                    // Extern personality reference —
-                                    // ask the resolver and ensure the
-                                    // GOT flag is set so a slot is
-                                    // allocated during layout.
-                                    let sym_idx = object::SymbolIndex(ri.r_symbolnum as usize);
-                                    let local_id = state.symbol_id_range.input_to_id(sym_idx);
-                                    let sym_id = resources.symbol_db.definition(local_id);
-                                    let atomic = &resources.per_symbol_flags.get_atomic(sym_id);
-                                    let prev = atomic.fetch_or(crate::value_flags::ValueFlags::GOT);
-                                    if !prev.has_resolution() {
-                                        queue.send_symbol_request::<A>(sym_id, resources, scope);
-                                    }
-                                } else if let Some(cu_data) = cu_data
-                                    && let Some((tgt_sec, tgt_off)) =
-                                        decode_non_extern_section_offset(
-                                            state.object,
-                                            cu_data,
-                                            &ri,
-                                            ri.r_address as usize,
-                                        )
-                                {
-                                    // Non-extern personality: the
-                                    // personality function is defined
-                                    // in this same object (e.g.
-                                    // `_rust_eh_personality` in
-                                    // libstd's CGU). Queue its atom
-                                    // activation so the text atom
-                                    // lights up and the resolver can
-                                    // give it a GOT slot.
-                                    queue.push_section_activation(state.file_id, tgt_sec, tgt_off);
-                                }
+                            } else if let Some(cu_data) = cu_data
+                                && let Some((tgt_sec, tgt_off)) = decode_non_extern_section_offset(
+                                    state.object,
+                                    cu_data,
+                                    &ri,
+                                    ri.r_address as usize,
+                                )
+                            {
+                                // Non-extern personality: the
+                                // personality function is defined
+                                // in this same object (e.g.
+                                // `_rust_eh_personality` in
+                                // libstd's CGU). Queue its atom
+                                // activation so the text atom
+                                // lights up and the resolver can
+                                // give it a GOT slot.
+                                queue.push_section_activation(state.file_id, tgt_sec, tgt_off);
                             }
                         }
                     }
@@ -4286,17 +4285,16 @@ impl platform::Platform for MachO {
         // landed yet — this is a guard rail.
         if std::env::var_os("WILD_DEBUG_GOT_SPILL").is_some() {
             use std::io::Write as _;
-            if let Some(addr) = got_address {
-                if let Ok(mut log) = std::fs::OpenOptions::new()
+            if let Some(addr) = got_address
+                && let Ok(mut log) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open("/tmp/wild-got-spill.log")
-                {
-                    let _ = writeln!(
-                        log,
-                        "got_alloc addr=0x{addr:x} flags={flags:?} raw_value=0x{raw_value:x}"
-                    );
-                }
+            {
+                let _ = writeln!(
+                    log,
+                    "got_alloc addr=0x{addr:x} flags={flags:?} raw_value=0x{raw_value:x}"
+                );
             }
         }
 
@@ -4561,7 +4559,7 @@ mod adrp_tests {
         let min = -(1i32 << 20);
         let insn = encode_adrp(min, 0);
         let pc = 1u64 << 32;
-        let expected = pc.wrapping_add(((min as i64) << 12) as u64) & !0xFFF;
+        let expected = pc.wrapping_add((i64::from(min) << 12) as u64) & !0xFFF;
         assert_eq!(decode_adrp_target_page(insn, pc).unwrap(), expected);
     }
 
@@ -4601,7 +4599,7 @@ mod adrp_tests {
         // This is the same encoding as `encode_adrp(1, 0)` but spelled
         // out as a literal to catch any bit-position regressions in the
         // encoder helper itself.
-        let insn: u32 = 0x90000000 | (0u32 << 29) | (0u32 << 5) | 0 // imm21=0
+        let insn: u32 = 0x90000000 // imm21=0
             | (1u32 << 29); // immlo bit 0 set -> imm21 = 1
         assert_eq!(decode_adrp_target_page(insn, 0).unwrap(), 0x1000);
     }

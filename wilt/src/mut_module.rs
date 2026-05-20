@@ -234,13 +234,13 @@ impl<'a> MutModule<'a> {
                 continue;
             }
 
-            if section.id == module::SECTION_CODE {
-                if let Some(buf) = &code_payload {
-                    out.push(section.id);
-                    leb128::write_u32(&mut out, buf.len() as u32);
-                    out.extend_from_slice(buf);
-                    continue;
-                }
+            if section.id == module::SECTION_CODE
+                && let Some(buf) = &code_payload
+            {
+                out.push(section.id);
+                leb128::write_u32(&mut out, buf.len() as u32);
+                out.extend_from_slice(buf);
+                continue;
             }
             if let Some(buf) = &self.section_overrides[idx] {
                 out.push(section.id);

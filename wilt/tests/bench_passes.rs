@@ -28,12 +28,11 @@ fn collect_wasm_files() -> Vec<Vec<u8>> {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, out);
-            } else if p.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                if let Ok(b) = std::fs::read(&p) {
-                    if WasmModule::parse(&b).is_ok() {
-                        out.push(b);
-                    }
-                }
+            } else if p.extension().and_then(|s| s.to_str()) == Some("wasm")
+                && let Ok(b) = std::fs::read(&p)
+                && WasmModule::parse(&b).is_ok()
+            {
+                out.push(b);
             }
         }
     }

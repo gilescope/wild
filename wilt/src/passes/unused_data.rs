@@ -146,12 +146,8 @@ fn collect_referenced(module: &WasmModule<'_>) -> Option<std::collections::HashS
     let data = module.data();
     for body in module.function_bodies() {
         let b = body.body.slice(data);
-        let Some(start) = opcode::skip_locals(b) else {
-            return None;
-        };
-        let Some(instrs) = opcode::walk(b, start) else {
-            return None;
-        };
+        let start = opcode::skip_locals(b)?;
+        let instrs = opcode::walk(b, start)?;
         for (p, _) in instrs {
             if b[p] == OP_PREFIX_FC {
                 let (sub, c) = leb128::read_u32(&b[p + 1..])?;
@@ -236,24 +232,22 @@ fn rewrite_body_dataidx(body: &[u8], seg_map: &[Option<u32>]) -> Vec<u8> {
     let mut cursor = start;
 
     for (p, len) in &instrs {
-        if body[*p] == OP_PREFIX_FC {
-            if let Some((sub, c)) = leb128::read_u32(&body[p + 1..]) {
-                if sub == SUB_MEMORY_INIT || sub == SUB_DATA_DROP {
-                    if let Some((idx, ci)) = leb128::read_u32(&body[p + 1 + c..]) {
-                        let new_idx = seg_map.get(idx as usize).copied().flatten().unwrap_or(idx);
-                        if new_idx != idx {
-                            out.extend_from_slice(&body[cursor..*p]);
-                            out.push(OP_PREFIX_FC);
-                            leb128::write_u32(&mut out, sub);
-                            leb128::write_u32(&mut out, new_idx);
-                            // memory.init has a trailing memidx byte; data.drop doesn't.
-                            let consumed = 1 + c + ci;
-                            let trailing = *len - consumed;
-                            out.extend_from_slice(&body[*p + consumed..*p + consumed + trailing]);
-                            cursor = *p + *len;
-                        }
-                    }
-                }
+        if body[*p] == OP_PREFIX_FC
+            && let Some((sub, c)) = leb128::read_u32(&body[p + 1..])
+            && (sub == SUB_MEMORY_INIT || sub == SUB_DATA_DROP)
+            && let Some((idx, ci)) = leb128::read_u32(&body[p + 1 + c..])
+        {
+            let new_idx = seg_map.get(idx as usize).copied().flatten().unwrap_or(idx);
+            if new_idx != idx {
+                out.extend_from_slice(&body[cursor..*p]);
+                out.push(OP_PREFIX_FC);
+                leb128::write_u32(&mut out, sub);
+                leb128::write_u32(&mut out, new_idx);
+                // memory.init has a trailing memidx byte; data.drop doesn't.
+                let consumed = 1 + c + ci;
+                let trailing = *len - consumed;
+                out.extend_from_slice(&body[*p + consumed..*p + consumed + trailing]);
+                cursor = *p + *len;
             }
         }
     }

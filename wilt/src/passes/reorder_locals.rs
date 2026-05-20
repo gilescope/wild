@@ -202,36 +202,36 @@ fn reorder_body_with_edits(
     let mut iter = opcode::InstrIter::new(body, instrs_start);
     for (p, len) in &mut iter {
         let op = body[p];
-        if matches!(op, OP_LOCAL_GET | OP_LOCAL_SET | OP_LOCAL_TEE) {
-            if let Some((idx, c)) = leb128::read_u32(&body[p + 1..]) {
-                // Defensive: if the body references a local index beyond what
-                // the locals header declares, skip this body rather than
-                // panic. The scan pass bounds-checked (line ~124); reaching
-                // here with an out-of-range index means the body is malformed
-                // relative to its header — upstream linker bug.
-                if (idx as usize) >= remap.len() {
-                    return None;
-                }
-                let new_idx = remap[idx as usize];
-                if new_idx != idx {
-                    out.extend_from_slice(&body[cursor..p]);
-                    let out_opcode_pos = out.len() as u32;
-                    out.push(op);
-                    leb128::write_u32(&mut out, new_idx);
-                    // Replaces the full opcode+LEB instruction.
-                    let full_in_len = (1 + c) as u32;
-                    let full_out_len = out.len() as u32 - out_opcode_pos;
-                    edits.push(
-                        crate::provenance::Edit::subst(
-                            p as u32,
-                            full_in_len,
-                            out_opcode_pos,
-                            full_out_len,
-                        ),
-                        None,
-                    );
-                    cursor = p + 1 + c;
-                }
+        if matches!(op, OP_LOCAL_GET | OP_LOCAL_SET | OP_LOCAL_TEE)
+            && let Some((idx, c)) = leb128::read_u32(&body[p + 1..])
+        {
+            // Defensive: if the body references a local index beyond what
+            // the locals header declares, skip this body rather than
+            // panic. The scan pass bounds-checked (line ~124); reaching
+            // here with an out-of-range index means the body is malformed
+            // relative to its header — upstream linker bug.
+            if (idx as usize) >= remap.len() {
+                return None;
+            }
+            let new_idx = remap[idx as usize];
+            if new_idx != idx {
+                out.extend_from_slice(&body[cursor..p]);
+                let out_opcode_pos = out.len() as u32;
+                out.push(op);
+                leb128::write_u32(&mut out, new_idx);
+                // Replaces the full opcode+LEB instruction.
+                let full_in_len = (1 + c) as u32;
+                let full_out_len = out.len() as u32 - out_opcode_pos;
+                edits.push(
+                    crate::provenance::Edit::subst(
+                        p as u32,
+                        full_in_len,
+                        out_opcode_pos,
+                        full_out_len,
+                    ),
+                    None,
+                );
+                cursor = p + 1 + c;
             }
         }
         let _ = len;

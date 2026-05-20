@@ -140,7 +140,7 @@ fn rewrite_buffer(elf: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         let version = u16::from_le_bytes(elf[pos + 4..pos + 6].try_into().unwrap());
         let abbrev_field_pos = match version {
-            2 | 3 | 4 => pos + 6,
+            2..=4 => pos + 6,
             5 => pos + 8,
             _ => return Ok(None), // unknown DWARF version → bail out of the pass
         };
@@ -287,7 +287,7 @@ fn read_uleb(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     loop {
         let b = *data.get(pos + i)?;
         i += 1;
-        result |= ((b & 0x7f) as u64) << shift;
+        result |= u64::from(b & 0x7f) << shift;
         if b & 0x80 == 0 {
             return Some((result, i));
         }

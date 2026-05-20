@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use wilt::module::WasmModule;
 
-fn sections_bodies<'a>(bytes: &'a [u8]) -> Vec<&'a [u8]> {
+fn sections_bodies(bytes: &[u8]) -> Vec<&[u8]> {
     let Ok(mut m) = WasmModule::parse(bytes) else {
         return Vec::new();
     };
@@ -32,16 +32,16 @@ fn canonical_body(body: &[u8]) -> Option<Vec<u8>> {
     let mut map: HashMap<u32, u32> = HashMap::new();
     let mut next_id: u32 = 0;
     let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter.by_ref() {
         let op = body[p];
-        if matches!(op, 0x20 | 0x21 | 0x22) {
-            if let Some((idx, _)) = leb128::read_u32(&body[p + 1..]) {
-                map.entry(idx).or_insert_with(|| {
-                    let i = next_id;
-                    next_id += 1;
-                    i
-                });
-            }
+        if matches!(op, 0x20..=0x22)
+            && let Some((idx, _)) = leb128::read_u32(&body[p + 1..])
+        {
+            map.entry(idx).or_insert_with(|| {
+                let i = next_id;
+                next_id += 1;
+                i
+            });
         }
     }
     if iter.failed() {
@@ -54,20 +54,19 @@ fn canonical_body(body: &[u8]) -> Option<Vec<u8>> {
     // bodies pick the same canonical index for the same usage slot).
     let mut out = Vec::with_capacity(body.len());
     out.extend_from_slice(&body[..start]);
-    let mut iter = InstrIter::new(body, start);
+    let iter = InstrIter::new(body, start);
     let mut cursor = start;
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter {
         out.extend_from_slice(&body[cursor..p]);
         let op = body[p];
-        if matches!(op, 0x20 | 0x21 | 0x22) {
-            if let Some((idx, _)) = leb128::read_u32(&body[p + 1..]) {
-                if let Some(&new_idx) = map.get(&idx) {
-                    out.push(op);
-                    leb128::write_u32(&mut out, new_idx);
-                    cursor = p + len;
-                    continue;
-                }
-            }
+        if matches!(op, 0x20..=0x22)
+            && let Some((idx, _)) = leb128::read_u32(&body[p + 1..])
+            && let Some(&new_idx) = map.get(&idx)
+        {
+            out.push(op);
+            leb128::write_u32(&mut out, new_idx);
+            cursor = p + len;
+            continue;
         }
         out.extend_from_slice(&body[p..p + len]);
         cursor = p + len;
@@ -138,12 +137,12 @@ fn count_callsites(bytes: &[u8]) -> HashMap<u32, u32> {
         let Some(start) = opc::skip_locals(b) else {
             continue;
         };
-        let mut iter = InstrIter::new(b, start);
-        while let Some((p, _)) = iter.next() {
-            if b[p] == 0x10 {
-                if let Some((c, _)) = leb128::read_u32(&b[p + 1..]) {
-                    *counts.entry(c).or_insert(0) += 1;
-                }
+        let iter = InstrIter::new(b, start);
+        for (p, _) in iter {
+            if b[p] == 0x10
+                && let Some((c, _)) = leb128::read_u32(&b[p + 1..])
+            {
+                *counts.entry(c).or_insert(0) += 1;
             }
         }
     }

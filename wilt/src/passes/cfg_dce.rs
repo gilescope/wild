@@ -45,7 +45,7 @@ fn rewrite_body_with_edits(body: &[u8]) -> Option<(Vec<u8>, crate::provenance::B
     let mut dead_start: Option<usize> = None;
     let mut has_gc = false;
 
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter.by_ref() {
         let op = body[p];
         // GC-prefixed opcodes (0xFB) introduce sub-opcodes whose
         // structural semantics we don't fully model — `br_on_cast` /

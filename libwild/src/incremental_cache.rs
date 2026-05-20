@@ -227,10 +227,10 @@ impl InputHash {
 fn file_metadata_signature(path: &Path) -> Option<(u64, i128)> {
     let md = std::fs::metadata(path).ok()?;
     let mtime = md.modified().ok()?;
-    let since_epoch = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or_else(|e| -(e.duration().as_nanos() as i128));
+    let since_epoch = mtime.duration_since(std::time::UNIX_EPOCH).map_or_else(
+        |e| -(e.duration().as_nanos() as i128),
+        |d| d.as_nanos() as i128,
+    );
     Some((md.len(), since_epoch))
 }
 
@@ -544,10 +544,10 @@ pub(crate) fn read_link_cache(path: &Path) -> Option<LinkCache> {
 }
 
 /// Write the link cache alongside the output binary. Uses a tiny
-/// binary format (magic + schema + count + args_hash + wild_version
-/// + entries) rather than JSON so the read path is a straight
-/// slice-and-copy with no parser. Atomicity via `<file>.tmp` +
-/// rename — readers never see a half-written cache.
+/// binary format (`magic`, `schema`, `count`, `args_hash`,
+/// `wild_version`, then entries) rather than JSON so the read path
+/// is a straight slice-and-copy with no parser. Atomicity via
+/// `<file>.tmp` then `rename` — readers never see a half-written cache.
 ///
 /// See [`read_link_cache`] for the on-disk layout.
 ///
@@ -794,18 +794,18 @@ pub(crate) fn verify_cached_inputs_unchanged(cached: &HashMap<PathBuf, InputHash
                 // re-reading the file. `(0, 0)` in the cache means
                 // the previous link couldn't stat the file — treat
                 // as "unknown" and fall through to the slow path.
-                if (*size, *mtime_ns) != (0, 0) {
-                    if let Some((cur_size, cur_mtime)) = file_metadata_signature(path) {
-                        if cur_size == *size && cur_mtime == *mtime_ns {
-                            return true;
-                        }
-                        // mtime moved but content may still match
-                        // (e.g. `touch` without edit). Re-hash to
-                        // confirm; a true content change forces the
-                        // dev-loop relink, a spurious mtime bump
-                        // still skips.
-                    }
+                if (*size, *mtime_ns) != (0, 0)
+                    && let Some((cur_size, cur_mtime)) = file_metadata_signature(path)
+                    && cur_size == *size
+                    && cur_mtime == *mtime_ns
+                {
+                    return true;
                 }
+                // mtime moved but content may still match
+                // (e.g. `touch` without edit). Re-hash to
+                // confirm; a true content change forces the
+                // dev-loop relink, a spurious mtime bump
+                // still skips.
                 match std::fs::read(path) {
                     Ok(bytes) => blake3::hash(&bytes).as_bytes() == hash,
                     Err(_) => false,

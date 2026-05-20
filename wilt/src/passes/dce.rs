@@ -73,10 +73,10 @@ pub fn scan_const_expr(bytes: &[u8], start: usize) -> Option<(usize, Vec<u32>)> 
             return Some((off + 1, targets));
         }
         let len = opcode::instr_len(bytes, off)?;
-        if op == opcode::OP_REF_FUNC {
-            if let Some((t, _)) = leb128::read_u32(&bytes[off + 1..]) {
-                targets.push(t);
-            }
+        if op == opcode::OP_REF_FUNC
+            && let Some((t, _)) = leb128::read_u32(&bytes[off + 1..])
+        {
+            targets.push(t);
         }
         off += len;
     }
@@ -381,17 +381,16 @@ pub fn analyse(module: &mut WasmModule<'_>) -> DceResult {
         for (p, _) in instrs {
             let op = body_bytes[p];
             if op == opcode::OP_CALL {
-                if let Some((target, _)) = leb128::read_u32(&body_bytes[p + 1..]) {
-                    if target < total {
-                        graph[abs_idx as usize].push(target);
-                    }
+                if let Some((target, _)) = leb128::read_u32(&body_bytes[p + 1..])
+                    && target < total
+                {
+                    graph[abs_idx as usize].push(target);
                 }
-            } else if op == opcode::OP_REF_FUNC {
-                if let Some((target, _)) = leb128::read_u32(&body_bytes[p + 1..]) {
-                    if target < total {
-                        extra_roots.push(target);
-                    }
-                }
+            } else if op == opcode::OP_REF_FUNC
+                && let Some((target, _)) = leb128::read_u32(&body_bytes[p + 1..])
+                && target < total
+            {
+                extra_roots.push(target);
             }
         }
     }
@@ -558,19 +557,19 @@ pub fn rewrite_body(body: &[u8], index_map: &[Option<u32>]) -> Option<Vec<u8>> {
 
     for (p, _len) in &instrs {
         let op = body[*p];
-        if op == opcode::OP_CALL || op == opcode::OP_REF_FUNC {
-            if let Some((target, c)) = leb128::read_u32(&body[p + 1..]) {
-                let new_target = index_map
-                    .get(target as usize)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(target);
-                if new_target != target {
-                    out.extend_from_slice(&body[cursor..*p]);
-                    out.push(op);
-                    leb128::write_u32(&mut out, new_target);
-                    cursor = p + 1 + c;
-                }
+        if (op == opcode::OP_CALL || op == opcode::OP_REF_FUNC)
+            && let Some((target, c)) = leb128::read_u32(&body[p + 1..])
+        {
+            let new_target = index_map
+                .get(target as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(target);
+            if new_target != target {
+                out.extend_from_slice(&body[cursor..*p]);
+                out.push(op);
+                leb128::write_u32(&mut out, new_target);
+                cursor = p + 1 + c;
             }
         }
     }
@@ -812,14 +811,14 @@ pub fn rewrite_const_expr(bytes: &[u8], index_map: &[Option<u32>]) -> Vec<u8> {
             out.extend_from_slice(&bytes[off..]);
             return out;
         };
-        if op == opcode::OP_REF_FUNC {
-            if let Some((t, c)) = leb128::read_u32(&bytes[off + 1..]) {
-                let new_t = index_map.get(t as usize).copied().flatten().unwrap_or(t);
-                out.push(op);
-                leb128::write_u32(&mut out, new_t);
-                off += 1 + c;
-                continue;
-            }
+        if op == opcode::OP_REF_FUNC
+            && let Some((t, c)) = leb128::read_u32(&bytes[off + 1..])
+        {
+            let new_t = index_map.get(t as usize).copied().flatten().unwrap_or(t);
+            out.push(op);
+            leb128::write_u32(&mut out, new_t);
+            off += 1 + c;
+            continue;
         }
         out.extend_from_slice(&bytes[off..off + len]);
         off += len;

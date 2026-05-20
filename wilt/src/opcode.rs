@@ -53,7 +53,7 @@ pub fn instr_len(body: &[u8], pos: usize) -> Option<usize> {
         // zero-immediate
         0x00 | 0x01 | 0x05 | 0x0B | 0x0F | 0x1A | 0x1B | 0x45..=0xC4 | 0xD1 | 0xD3 | 0xD4 => 0, /* ref.eq, ref.as_non_null */
         // blocktype (signed LEB s33; we over-read as u32 — only the length matters)
-        0x02 | 0x03 | 0x04 => leb128::read_u32(rest)?.1,
+        0x02..=0x04 => leb128::read_u32(rest)?.1,
         // single u32 LEB
         0x0C | 0x0D | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 | 0xD2 | 0xD5
         | 0xD6 => leb128::read_u32(rest)?.1, // br_on_null / non_null
@@ -161,7 +161,7 @@ pub fn instr_len(body: &[u8], pos: usize) -> Option<usize> {
                 // array.len — no immediate
                 0x0F => 0,
                 // ref.test / ref.cast variants — heap-type LEB
-                0x14 | 0x15 | 0x16 | 0x17 => leb128::read_u32(after_sub)?.1,
+                0x14..=0x17 => leb128::read_u32(after_sub)?.1,
                 // br_on_cast / br_on_cast_fail: flags byte + labelidx + 2 heap-types
                 0x18 | 0x19 => {
                     // flags (1 byte)

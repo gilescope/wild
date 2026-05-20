@@ -202,11 +202,11 @@ impl LtoConfig {
             self.opt_level = wasm_batch::OptLevel::None;
             return true;
         }
-        if let Some(n) = arg.strip_prefix("--lto-partitions=") {
-            if let Ok(v) = n.parse::<u32>() {
-                self.partitions = v.max(1);
-                return true;
-            }
+        if let Some(n) = arg.strip_prefix("--lto-partitions=")
+            && let Ok(v) = n.parse::<u32>()
+        {
+            self.partitions = v.max(1);
+            return true;
         }
         false
     }

@@ -233,7 +233,7 @@ impl BodyEdits {
                 // up to be.out_start. Emit it as an input→output edit
                 // translating the mid_cursor offset via b's identity.
                 let delta_in_out =
-                    out_cursor_for_mid(be, ae.out_start, &b, &mut mid_cursor, &mut out_cursor);
+                    out_cursor_for_mid(be, ae.out_start, b, &mut mid_cursor, &mut out_cursor);
                 out_edits.push(Edit {
                     in_start: ae.in_start,
                     in_len: ae.in_len,

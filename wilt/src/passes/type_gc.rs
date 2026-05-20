@@ -110,19 +110,19 @@ pub fn analyse(module: &WasmModule<'_>) -> TypeGcResult {
                 i += 1;
                 // block/loop/if/try/try_table/legacy-catch: blocktype follows.
                 // blocktype is a signed-LEB (s33) — if non-negative, it's a type idx.
-                if matches!(op, 0x02 | 0x03 | 0x04 | 0x06 | 0x1f) {
-                    if let Some((val, _)) = leb128::read_u32(&bytes[i..]) {
-                        // 0x40 = empty; 0x6F..=0x7F = valtypes. Otherwise treat as type idx.
-                        if val != 0x40 && !matches!(val as u8, 0x6F..=0x7F) {
-                            mark(val);
-                        }
+                if matches!(op, 0x02 | 0x03 | 0x04 | 0x06 | 0x1f)
+                    && let Some((val, _)) = leb128::read_u32(&bytes[i..])
+                {
+                    // 0x40 = empty; 0x6F..=0x7F = valtypes. Otherwise treat as type idx.
+                    if val != 0x40 && !matches!(val as u8, 0x6F..=0x7F) {
+                        mark(val);
                     }
                 }
                 // call_indirect: type idx follows.
-                if op == 0x11 {
-                    if let Some((val, _)) = leb128::read_u32(&bytes[i..]) {
-                        mark(val);
-                    }
+                if op == 0x11
+                    && let Some((val, _)) = leb128::read_u32(&bytes[i..])
+                {
+                    mark(val);
                 }
             }
         }
@@ -184,10 +184,10 @@ pub fn analyse(module: &WasmModule<'_>) -> TypeGcResult {
                         if let Some((_, c)) = leb128::read_u32(&payload[off..]) {
                             off += c;
                         }
-                        if flags & 1 != 0 {
-                            if let Some((_, c)) = leb128::read_u32(&payload[off..]) {
-                                off += c;
-                            }
+                        if flags & 1 != 0
+                            && let Some((_, c)) = leb128::read_u32(&payload[off..])
+                        {
+                            off += c;
                         }
                     }
                     0x02 => {
@@ -197,10 +197,10 @@ pub fn analyse(module: &WasmModule<'_>) -> TypeGcResult {
                         if let Some((_, c)) = leb128::read_u32(&payload[off..]) {
                             off += c;
                         }
-                        if flags & 1 != 0 {
-                            if let Some((_, c)) = leb128::read_u32(&payload[off..]) {
-                                off += c;
-                            }
+                        if flags & 1 != 0
+                            && let Some((_, c)) = leb128::read_u32(&payload[off..])
+                        {
+                            off += c;
                         }
                     }
                     0x03 => {
@@ -452,11 +452,11 @@ fn rewrite_body_type_refs(body: &[u8], map: &[Option<u32>]) -> Option<Vec<u8>> {
 
     let mut cursor = instrs_start;
     let mut iter = opcode::InstrIter::new(body, instrs_start);
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter.by_ref() {
         let op = body[p];
         let imm_off = p + 1;
 
-        if matches!(op, 0x02 | 0x03 | 0x04) {
+        if matches!(op, 0x02..=0x04) {
             // Blocktype: 0x40 (empty), single-byte valtype (0x6F..=0x7F),
             // or non-negative s33 type index. u32 LEB-decodes identically
             // to positive s33, so we can reuse read_u32.

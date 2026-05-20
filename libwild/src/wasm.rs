@@ -1316,14 +1316,15 @@ fn parse_comdat_symbol_names(data: &[u8]) -> std::collections::HashSet<&[u8]> {
         if section_id == 0 {
             // Custom section — check if it's "linking".
             let payload = &data[pos..pos + size];
-            if let Some((name_len, c)) = read_leb(payload, 0) {
-                if c + name_len <= payload.len() && &payload[c..c + name_len] == b"linking" {
-                    let link_data = &payload[c + name_len..];
-                    let mut names = Vec::new();
-                    parse_linking_for_comdat(link_data, &mut names);
-                    for name in names {
-                        result.insert(name);
-                    }
+            if let Some((name_len, c)) = read_leb(payload, 0)
+                && c + name_len <= payload.len()
+                && &payload[c..c + name_len] == b"linking"
+            {
+                let link_data = &payload[c + name_len..];
+                let mut names = Vec::new();
+                parse_linking_for_comdat(link_data, &mut names);
+                for name in names {
+                    result.insert(name);
                 }
             }
         }

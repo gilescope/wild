@@ -90,7 +90,7 @@ fn rewrite_body_with_edits(
     let mut w = BlockWalker::with_resolver(body, instrs_start, frames_buf, Some(sigs));
     while let Some(step) = w.next() {
         match step.op {
-            0x02 | 0x03 | 0x04 => {
+            0x02..=0x04 => {
                 let kind = w.frames().last()?.kind;
                 let stack_idx = w.frames().len() - 1;
                 active.push(frame_infos.len());
@@ -145,12 +145,9 @@ fn rewrite_body_with_edits(
 
     // Pick the first block whose label is never branched to.
     // Require end_pos > 0 (we must have seen its end during the walk).
-    let Some(removed) = frame_infos
+    let removed = frame_infos
         .iter()
-        .find(|f| matches!(f.kind, BlockKind::Block) && !f.targeted && f.end_pos > 0)
-    else {
-        return None;
-    };
+        .find(|f| matches!(f.kind, BlockKind::Block) && !f.targeted && f.end_pos > 0)?;
 
     // Collect edits.
     // Deletion ranges: open instruction + end instruction.

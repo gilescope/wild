@@ -220,7 +220,7 @@ fn classify(body: &[u8], sig: (u32, u32), n_callers: u32, internal: bool) -> Opt
                         return Some(Trivial::DeleteCall);
                     }
                 }
-                0x41 | 0x42 | 0x43 | 0x44 => {
+                0x41..=0x44 => {
                     if sig.0 == 0 && sig.1 == 1 {
                         return Some(Trivial::ReplaceWithConst(body[op_start..op_end].to_vec()));
                     }
@@ -304,11 +304,11 @@ fn parse_locals_header(body: &[u8]) -> Option<(usize, Vec<u8>)> {
 /// verbatim is then trivially correct.
 fn safe_to_inline_no_locals(body: &[u8], instrs_start: usize) -> bool {
     let mut iter = InstrIter::new(body, instrs_start);
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter.by_ref() {
         match body[p] {
-            0x20 | 0x21 | 0x22 => return false,
+            0x20..=0x22 => return false,
             0x0F => return false,
-            0x0C | 0x0D | 0x0E => return false,
+            0x0C..=0x0E => return false,
             0x11 => return false,
             _ => {}
         }
@@ -329,10 +329,10 @@ fn safe_to_inline_with_param_locals_v3(
 ) -> (bool, bool) {
     let mut iter = InstrIter::new(body, instrs_start);
     let mut needs_wrap = false;
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter.by_ref() {
         let op = body[p];
         match op {
-            0x20 | 0x21 | 0x22 => {
+            0x20..=0x22 => {
                 let Some((k, _)) = leb128::read_u32(&body[p + 1..]) else {
                     return (false, false);
                 };
@@ -340,7 +340,7 @@ fn safe_to_inline_with_param_locals_v3(
                     return (false, false);
                 }
             }
-            0x0F | 0x0C | 0x0D | 0x0E => needs_wrap = true,
+            0x0C..=0x0F => needs_wrap = true,
             _ => {}
         }
     }
@@ -359,10 +359,10 @@ fn rewrite_returns_to_br(body: &[u8]) -> Option<Vec<u8>> {
     let mut iter = InstrIter::new(body, 0);
     let mut cursor = 0;
     let mut depth: u32 = 0;
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter.by_ref() {
         let op = body[p];
         match op {
-            0x02 | 0x03 | 0x04 => depth += 1,
+            0x02..=0x04 => depth += 1,
             0x0B => depth = depth.saturating_sub(1),
             0x0F => {
                 out.extend_from_slice(&body[cursor..p]);
@@ -386,9 +386,9 @@ fn rebase_locals(body: &[u8], delta: u32) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len());
     let mut iter = InstrIter::new(body, 0);
     let mut cursor = 0;
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter.by_ref() {
         let op = body[p];
-        if matches!(op, 0x20 | 0x21 | 0x22) {
+        if matches!(op, 0x20..=0x22) {
             let (k, c) = leb128::read_u32(&body[p + 1..])?;
             out.extend_from_slice(&body[cursor..p]);
             out.push(op);
@@ -499,17 +499,17 @@ fn count_call_sites(m: &MutModule<'_>, num_imports: u32, num_bodies: usize) -> V
         let Some(start) = opcode::skip_locals(body) else {
             continue;
         };
-        let mut iter = InstrIter::new(body, start);
-        while let Some((p, _)) = iter.next() {
+        let iter = InstrIter::new(body, start);
+        for (p, _) in iter {
             if body[p] != 0x10 {
                 continue;
             }
-            if let Some((f, _)) = leb128::read_u32(&body[p + 1..]) {
-                if f >= num_imports {
-                    let local_idx = (f - num_imports) as usize;
-                    if local_idx < counts.len() {
-                        counts[local_idx] += 1;
-                    }
+            if let Some((f, _)) = leb128::read_u32(&body[p + 1..])
+                && f >= num_imports
+            {
+                let local_idx = (f - num_imports) as usize;
+                if local_idx < counts.len() {
+                    counts[local_idx] += 1;
                 }
             }
         }
@@ -539,7 +539,7 @@ fn rewrite_body(
     let mut new_local_types: Vec<u8> = Vec::new();
 
     let mut iter = InstrIter::new(body, instrs_start);
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter.by_ref() {
         if body[p] != 0x10 {
             continue;
         }
@@ -935,9 +935,7 @@ mod tests {
         // inlined_size = 33 + 4 + 2 = 39. added_per_site = 37.
         // total_added = 5 * 37 = 185. callee_savings = 39. NOT profitable.
         let mut body = vec![0]; // 0 locals
-        for _ in 0..32 {
-            body.push(0x01);
-        } // 32 nops
+        body.extend(std::iter::repeat_n(0x01u8, 32)); // 32 nops
         body.push(0x0B); // end
         match classify(&body, (2, 0), 5, true) {
             None => {}

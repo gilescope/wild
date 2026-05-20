@@ -33,7 +33,9 @@ pub(crate) struct BenchConfig {
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub(crate) enum Platform {
+    #[default]
     Elf,
     Macho,
     /// `wasm32` (and `wasm64`) outputs. Linked by either `wild
@@ -42,12 +44,6 @@ pub(crate) enum Platform {
     /// linker invocation works from a Linux or macOS box — so wasm
     /// benches are NOT subject to the `Platform::host()` filter.
     Wasm,
-}
-
-impl Default for Platform {
-    fn default() -> Self {
-        Platform::Elf
-    }
 }
 
 impl Platform {

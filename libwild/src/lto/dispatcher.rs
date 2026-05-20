@@ -26,10 +26,10 @@ use crate::platform::Platform;
 /// The ordering of `drivers` is the dispatch preference: callers
 /// register faster/preferred drivers first (e.g. in-process
 /// libLLVM before subprocess-llc).
-pub(crate) fn pick_driver<'a, P: Platform>(
-    drivers: &'a mut [Box<dyn LtoDriver<P>>],
+pub(crate) fn pick_driver<P: Platform>(
+    drivers: &mut [Box<dyn LtoDriver<P>>],
     ir: Ir,
-) -> Option<&'a mut dyn LtoDriver<P>> {
+) -> Option<&mut dyn LtoDriver<P>> {
     for d in drivers.iter_mut() {
         if d.handles(ir) {
             debug_assert!(

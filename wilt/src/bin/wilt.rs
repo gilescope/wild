@@ -275,83 +275,80 @@ fn main() -> ExitCode {
     // - When --source-map-in/out supplied: rewrite through (step 2 — today the rewrite is
     //   pipe-through when code is unchanged; otherwise we strip with warning).
     // - When neither supplied: strip the reference from output and warn.
-    if let Ok(input_m) = wilt::WasmModule::parse(&input_bytes) {
-        if let Some(in_url) = wilt::passes::source_map::detect_url(&input_m) {
-            match (
-                args.source_map_in.as_deref(),
-                args.source_map_out.as_deref(),
-            ) {
-                (Some(in_path), Some(out_path)) => {
-                    let in_json = match std::fs::read_to_string(in_path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("wilt: could not read {}: {e}", in_path.display());
+    if let Ok(input_m) = wilt::WasmModule::parse(&input_bytes)
+        && let Some(in_url) = wilt::passes::source_map::detect_url(&input_m)
+    {
+        match (
+            args.source_map_in.as_deref(),
+            args.source_map_out.as_deref(),
+        ) {
+            (Some(in_path), Some(out_path)) => {
+                let in_json = match std::fs::read_to_string(in_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("wilt: could not read {}: {e}", in_path.display());
+                        return ExitCode::from(1);
+                    }
+                };
+                // Use the full-pipeline entry point: it threads
+                // the real FuncRemap + per-function offsets into
+                // the VLQ rewriter.
+                let (new_bytes, maybe_new_map) =
+                    wilt::optimise_with_source_map(&input_bytes, Some(&in_json));
+                output_bytes = new_bytes;
+                match maybe_new_map {
+                    Some(new_json) => {
+                        if let Err(e) = std::fs::write(out_path, new_json) {
+                            eprintln!("wilt: could not write {}: {e}", out_path.display());
                             return ExitCode::from(1);
                         }
-                    };
-                    // Use the full-pipeline entry point: it threads
-                    // the real FuncRemap + per-function offsets into
-                    // the VLQ rewriter.
-                    let (new_bytes, maybe_new_map) =
-                        wilt::optimise_with_source_map(&input_bytes, Some(&in_json));
-                    output_bytes = new_bytes;
-                    match maybe_new_map {
-                        Some(new_json) => {
-                            if let Err(e) = std::fs::write(out_path, new_json) {
-                                eprintln!("wilt: could not write {}: {e}", out_path.display());
-                                return ExitCode::from(1);
-                            }
-                            let out_url = out_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(&in_url);
-                            output_bytes =
-                                wilt::passes::source_map::set_url(&output_bytes, out_url);
-                            if args.verbose {
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "wilt: rewrote source map → {}",
-                                    out_path.display(),
-                                );
-                            }
-                        }
-                        None => {
-                            output_bytes = wilt::passes::source_map::strip_url(&output_bytes);
+                        let out_url = out_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&in_url);
+                        output_bytes = wilt::passes::source_map::set_url(&output_bytes, out_url);
+                        if args.verbose {
                             let _ = writeln!(
                                 std::io::stderr(),
-                                "wilt: source map {in_url:?} stripped — bodies modified beyond \
-                                 what the source-map rewriter handles today",
+                                "wilt: rewrote source map → {}",
+                                out_path.display(),
                             );
                         }
                     }
+                    None => {
+                        output_bytes = wilt::passes::source_map::strip_url(&output_bytes);
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "wilt: source map {in_url:?} stripped — bodies modified beyond \
+                                 what the source-map rewriter handles today",
+                        );
+                    }
                 }
-                _ => {
-                    // User didn't supply paths → strip + warn.
-                    output_bytes = wilt::passes::source_map::strip_url(&output_bytes);
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "wilt: input references external source map {in_url:?} — dropping \
+            }
+            _ => {
+                // User didn't supply paths → strip + warn.
+                output_bytes = wilt::passes::source_map::strip_url(&output_bytes);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "wilt: input references external source map {in_url:?} — dropping \
                          reference from output. Pass --source-map-in <path> --source-map-out \
                          <path> to maintain consistency.",
-                    );
-                }
+                );
             }
         }
     }
 
-    if partial_strip {
-        if let Ok(m) = wilt::WasmModule::parse(&output_bytes) {
-            use wilt::passes::strip::StripConfig;
-            let cfg = StripConfig {
-                dwarf: args.strip_debug,
-                source_maps: args.strip_debug,
-                producers: args.strip_producers,
-                ..StripConfig::default()
-            };
-            let stripped = wilt::passes::strip::apply(&m, cfg);
-            if stripped.len() < output_bytes.len() {
-                output_bytes = stripped;
-            }
+    if partial_strip && let Ok(m) = wilt::WasmModule::parse(&output_bytes) {
+        use wilt::passes::strip::StripConfig;
+        let cfg = StripConfig {
+            dwarf: args.strip_debug,
+            source_maps: args.strip_debug,
+            producers: args.strip_producers,
+            ..StripConfig::default()
+        };
+        let stripped = wilt::passes::strip::apply(&m, cfg);
+        if stripped.len() < output_bytes.len() {
+            output_bytes = stripped;
         }
     }
 

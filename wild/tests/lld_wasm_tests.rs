@@ -402,15 +402,15 @@ fn should_skip(content: &str, path: &Path) -> bool {
     } else {
         KNOWN_PASSING
     };
-    if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
-        if known.contains(&file_name) {
-            return false;
-        }
+    if let Some(file_name) = path.file_name().and_then(|s| s.to_str())
+        && known.contains(&file_name)
+    {
+        return false;
     }
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        if known.contains(&stem) {
-            return false;
-        }
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && known.contains(&stem)
+    {
+        return false;
     }
     if content.contains("REQUIRES: x86") {
         return true;
@@ -420,8 +420,8 @@ fn should_skip(content: &str, path: &Path) -> bool {
     }
     // split-file now handled natively in the test runner
     // .ll / .test files that need features we don't support yet
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        if matches!(
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && matches!(
             stem,
             "debuginfo"
                 // export-all now passes
@@ -444,9 +444,9 @@ fn should_skip(content: &str, path: &Path) -> bool {
                 | "call-indirect" // type dedup across indirect calls
                 | "command-exports" // needs __indirect_function_table + complex exports
                 | "multi-table" // needs reference-types tables
-        ) {
-            return true;
-        }
+        )
+    {
+        return true;
     }
     // Skip tests for features not yet implemented in wild's WASM support.
     // LTO bitcode inputs (need llvm-as/opt and LTO support)

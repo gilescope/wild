@@ -122,7 +122,7 @@ fn rewrite_buffer(elf: &[u8]) -> Result<Option<Vec<u8>>> {
     let mut pool = LineStrPool::default();
     let mut cu_offsets: Vec<(u64, u32)> = Vec::with_capacity(cus.len());
     let mut owned_cus = cus;
-    for cu in owned_cus.iter_mut() {
+    for cu in &mut owned_cus {
         let new_off = new_debug_line.len() as u32;
         cu.new_line_offset = new_off;
         emit_v5_line_program_pooled(&mut new_debug_line, cu, &mut pool);
@@ -146,19 +146,17 @@ fn rewrite_buffer(elf: &[u8]) -> Result<Option<Vec<u8>>> {
 fn read_cus(elf: &[u8]) -> Result<Option<Vec<CuLineInfo>>> {
     let obj = object::File::parse(elf).map_err(|e| crate::error!("elf_line_v5: parse: {e:?}"))?;
     let load = |id: gimli::SectionId| -> std::result::Result<Slice<'_>, gimli::Error> {
-        let data = obj
+        let data: &[u8] = obj
             .section_by_name(id.name())
-            .map(|s| s.data().unwrap_or(&[]))
-            .unwrap_or(&[]);
+            .map_or(&[], |s| s.data().unwrap_or(&[]));
         Ok(EndianSlice::new(data, LittleEndian))
     };
     let dwarf =
         gimli::Dwarf::load(load).map_err(|e| crate::error!("elf_line_v5: dwarf load: {e:?}"))?;
 
-    let debug_line_bytes = obj
+    let debug_line_bytes: &[u8] = obj
         .section_by_name(".debug_line")
-        .map(|s| s.data().unwrap_or(&[]))
-        .unwrap_or(&[]);
+        .map_or(&[], |s| s.data().unwrap_or(&[]));
     if debug_line_bytes.is_empty() {
         return Ok(None);
     }
@@ -320,8 +318,8 @@ fn emit_v5_line_program_pooled(out: &mut Vec<u8>, cu: &CuLineInfo, pool: &mut Li
     out.extend_from_slice(&cu.std_opcode_lengths);
 
     out.push(1);
-    write_uleb(out, gimli::constants::DW_LNCT_path.0 as u64);
-    write_uleb(out, gimli::constants::DW_FORM_line_strp.0 as u64);
+    write_uleb(out, u64::from(gimli::constants::DW_LNCT_path.0));
+    write_uleb(out, u64::from(gimli::constants::DW_FORM_line_strp.0));
     write_uleb(out, 1 + cu.include_directories.len() as u64);
     let comp_dir_off = pool.intern(&cu.comp_dir);
     out.extend_from_slice(&comp_dir_off.to_le_bytes());
@@ -331,10 +329,10 @@ fn emit_v5_line_program_pooled(out: &mut Vec<u8>, cu: &CuLineInfo, pool: &mut Li
     }
 
     out.push(2);
-    write_uleb(out, gimli::constants::DW_LNCT_path.0 as u64);
-    write_uleb(out, gimli::constants::DW_FORM_line_strp.0 as u64);
-    write_uleb(out, gimli::constants::DW_LNCT_directory_index.0 as u64);
-    write_uleb(out, gimli::constants::DW_FORM_udata.0 as u64);
+    write_uleb(out, u64::from(gimli::constants::DW_LNCT_path.0));
+    write_uleb(out, u64::from(gimli::constants::DW_FORM_line_strp.0));
+    write_uleb(out, u64::from(gimli::constants::DW_LNCT_directory_index.0));
+    write_uleb(out, u64::from(gimli::constants::DW_FORM_udata.0));
     write_uleb(out, 1 + cu.file_entries.len() as u64);
     let primary_off = pool.intern(&cu.primary_file_name);
     out.extend_from_slice(&primary_off.to_le_bytes());
@@ -510,22 +508,23 @@ fn apply_rewrite(
     let new_section_name_offset_in_shstrtab = shstrtab_old_size as u32;
     let _ = shdr_end; // kept in scope for clarity; used by assertions
 
-    let mut ops: Vec<Op> = Vec::with_capacity(3);
-    ops.push(Op {
-        position: debug_line_offset as usize,
-        delete: old_debug_line_size,
-        insert: new_debug_line.to_vec(),
-    });
-    ops.push(Op {
-        position: debug_line_end,
-        delete: 0,
-        insert: new_debug_line_str.to_vec(),
-    });
-    ops.push(Op {
-        position: shstrtab_end,
-        delete: 0,
-        insert: new_section_name.to_vec(),
-    });
+    let mut ops: Vec<Op> = vec![
+        Op {
+            position: debug_line_offset as usize,
+            delete: old_debug_line_size,
+            insert: new_debug_line.to_vec(),
+        },
+        Op {
+            position: debug_line_end,
+            delete: 0,
+            insert: new_debug_line_str.to_vec(),
+        },
+        Op {
+            position: shstrtab_end,
+            delete: 0,
+            insert: new_section_name.to_vec(),
+        },
+    ];
     ops.sort_by_key(|op| op.position);
 
     // ---- Apply ops A/B/C: stream old bytes → new.

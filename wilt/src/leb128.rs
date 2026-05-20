@@ -1,6 +1,6 @@
-/// LEB128 encoding/decoding utilities for WASM binary format.
-///
-/// All functions work directly on byte slices — no allocations.
+//! LEB128 encoding/decoding utilities for WASM binary format.
+//!
+//! All functions work directly on byte slices — no allocations.
 
 /// Read an unsigned LEB128 value. Returns (value, bytes_consumed).
 pub fn read_u32(data: &[u8]) -> Option<(u32, usize)> {

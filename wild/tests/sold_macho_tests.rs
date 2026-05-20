@@ -33,7 +33,7 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
     for entry in std::fs::read_dir(&test_dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.extension().map_or(true, |e| e != "sh") {
+        if path.extension().is_none_or(|e| e != "sh") {
             continue;
         }
 

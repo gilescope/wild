@@ -14,6 +14,7 @@
 //!   * not exported,
 //!   * not the start function,
 //!   * not appearing as a `ref.func` target in any body or element segment.
+//!
 //! Anything in those sets keeps its identity (its index is part of
 //! the module's external contract).
 
@@ -128,20 +129,20 @@ fn rewrite_calls(body: &[u8], remap: &HashMap<u32, u32>) -> Option<Vec<u8>> {
     let start = opcode::skip_locals(body)?;
     let mut iter = InstrIter::new(body, start);
     let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter.by_ref() {
         if body[p] != 0x10 {
             continue;
         } // call
         let Some((f, _)) = leb128::read_u32(&body[p + 1..]) else {
             continue;
         };
-        if let Some(&new_f) = remap.get(&f) {
-            if new_f != f {
-                let mut repl = Vec::with_capacity(1 + 5);
-                repl.push(0x10);
-                leb128::write_u32(&mut repl, new_f);
-                edits.push((p, len, repl));
-            }
+        if let Some(&new_f) = remap.get(&f)
+            && new_f != f
+        {
+            let mut repl = Vec::with_capacity(1 + 5);
+            repl.push(0x10);
+            leb128::write_u32(&mut repl, new_f);
+            edits.push((p, len, repl));
         }
     }
     if iter.failed() {
@@ -186,19 +187,19 @@ fn collect_ref_func_targets(module: &WasmModule<'_>) -> HashSet<u32> {
         let Some(start) = opcode::skip_locals(b) else {
             continue;
         };
-        let mut iter = InstrIter::new(b, start);
-        while let Some((p, _)) = iter.next() {
-            if b[p] == 0xD2 {
-                if let Some((f, _)) = leb128::read_u32(&b[p + 1..]) {
-                    out.insert(f);
-                }
+        let iter = InstrIter::new(b, start);
+        for (p, _) in iter {
+            if b[p] == 0xD2
+                && let Some((f, _)) = leb128::read_u32(&b[p + 1..])
+            {
+                out.insert(f);
             }
         }
     }
-    if let Some(sec) = module.section(wmod::SECTION_ELEMENT) {
-        if let Some(targets) = super::dce::scan_elements_funcidx(sec.payload.slice(data)) {
-            out.extend(targets);
-        }
+    if let Some(sec) = module.section(wmod::SECTION_ELEMENT)
+        && let Some(targets) = super::dce::scan_elements_funcidx(sec.payload.slice(data))
+    {
+        out.extend(targets);
     }
     out
 }
@@ -235,12 +236,12 @@ mod tests {
         let body2 = wm.function_bodies()[2].body.slice(wm.data());
         let mut calls: Vec<u32> = Vec::new();
         let start = opcode::skip_locals(body2).unwrap();
-        let mut iter = InstrIter::new(body2, start);
-        while let Some((p, _)) = iter.next() {
-            if body2[p] == 0x10 {
-                if let Some((f, _)) = leb128::read_u32(&body2[p + 1..]) {
-                    calls.push(f);
-                }
+        let iter = InstrIter::new(body2, start);
+        for (p, _) in iter {
+            if body2[p] == 0x10
+                && let Some((f, _)) = leb128::read_u32(&body2[p + 1..])
+            {
+                calls.push(f);
             }
         }
         assert_eq!(

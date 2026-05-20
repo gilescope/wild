@@ -628,10 +628,10 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
 
             // --- Target/arch ---
             "--target" => {
-                if let Some(t) = iter.next() {
-                    if t.as_ref().starts_with("wasm64") {
-                        args.memory64 = true;
-                    }
+                if let Some(t) = iter.next()
+                    && t.as_ref().starts_with("wasm64")
+                {
+                    args.memory64 = true;
                 }
             }
             _ if arg.starts_with("--target=") => {
@@ -692,7 +692,7 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                         args.memory64 = true;
                     }
                     // Strip leading `+`/`=` if present, store the bare name.
-                    let bare = feat.trim_start_matches(|c| c == '+' || c == '=');
+                    let bare = feat.trim_start_matches(['+', '=']);
                     if !bare.is_empty() {
                         args.extra_features.push(bare.to_string());
                     }
@@ -703,7 +703,7 @@ fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) ->
                     if feat == "+memory64" {
                         args.memory64 = true;
                     }
-                    let bare = feat.trim_start_matches(|c| c == '+' || c == '=');
+                    let bare = feat.trim_start_matches(['+', '=']);
                     if !bare.is_empty() {
                         args.extra_features.push(bare.to_string());
                     }

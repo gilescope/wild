@@ -229,10 +229,10 @@ fn has_get_then_set(body: &[u8]) -> bool {
     let Some(start) = opc::skip_locals(body) else {
         return false;
     };
-    let mut iter = InstrIter::new(body, start);
+    let iter = InstrIter::new(body, start);
     let mut has_get = false;
     let mut has_set = false;
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter {
         match body[p] {
             OP_LOCAL_GET => has_get = true,
             OP_LOCAL_SET => has_set = true,

@@ -52,12 +52,11 @@ pub fn apply_with_remap(module: &mut WasmModule<'_>) -> (Vec<u8>, crate::remap::
         };
         for (p, _) in instrs {
             let op = b[p];
-            if op == opcode::OP_CALL || op == opcode::OP_REF_FUNC {
-                if let Some((t, _)) = leb128::read_u32(&b[p + 1..]) {
-                    if (t as usize) < count.len() {
-                        count[t as usize] += 1;
-                    }
-                }
+            if (op == opcode::OP_CALL || op == opcode::OP_REF_FUNC)
+                && let Some((t, _)) = leb128::read_u32(&b[p + 1..])
+                && (t as usize) < count.len()
+            {
+                count[t as usize] += 1;
             }
         }
     }
@@ -68,10 +67,10 @@ pub fn apply_with_remap(module: &mut WasmModule<'_>) -> (Vec<u8>, crate::remap::
             count[idx as usize] += 1;
         }
     }
-    if let Some(s) = module.start_function() {
-        if (s as usize) < count.len() {
-            count[s as usize] += 1;
-        }
+    if let Some(s) = module.start_function()
+        && (s as usize) < count.len()
+    {
+        count[s as usize] += 1;
     }
 
     // Build a permutation of defined indices, sorted by descending count.

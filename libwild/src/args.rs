@@ -552,6 +552,7 @@ pub(crate) enum FileWriteMode {
 
     /// As for `UpdateInPlace`, but if we get an error opening the file for write, fallback to
     /// unlinking and replacing.
+    #[allow(dead_code)]
     UpdateInPlaceWithFallback,
 }
 

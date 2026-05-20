@@ -94,30 +94,29 @@ fn fold_body_with_edits(body: &[u8]) -> Option<(Vec<u8>, crate::provenance::Body
             let (a0, a1) = spans[i];
             let (b0, b1) = spans[i + 1];
             let (c0, _c1) = spans[i + 2];
-            if body[a0] == I32_CONST && body[b0] == I32_CONST {
-                if let (Some((va, _)), Some((vb, _))) = (
+            if body[a0] == I32_CONST
+                && body[b0] == I32_CONST
+                && let (Some((va, _)), Some((vb, _))) = (
                     read_sleb128_i32(&body[a0 + 1..a1]),
                     read_sleb128_i32(&body[b0 + 1..b1]),
-                ) {
-                    if let Some(r) = evaluate(body[c0], va, vb) {
-                        replacements.push((a0, spans[i + 2].1, Repl::Const(r)));
-                        i += 3;
-                        continue;
-                    }
-                }
+                )
+                && let Some(r) = evaluate(body[c0], va, vb)
+            {
+                replacements.push((a0, spans[i + 2].1, Repl::Const(r)));
+                i += 3;
+                continue;
             }
         }
         if i + 1 < spans.len() {
             let (a0, a1) = spans[i];
             let (b0, _b1) = spans[i + 1];
-            if body[a0] == I32_CONST {
-                if let Some((v, _)) = read_sleb128_i32(&body[a0 + 1..a1]) {
-                    if is_rhs_identity(body[b0], v) {
-                        replacements.push((a0, spans[i + 1].1, Repl::Empty));
-                        i += 2;
-                        continue;
-                    }
-                }
+            if body[a0] == I32_CONST
+                && let Some((v, _)) = read_sleb128_i32(&body[a0 + 1..a1])
+                && is_rhs_identity(body[b0], v)
+            {
+                replacements.push((a0, spans[i + 1].1, Repl::Empty));
+                i += 2;
+                continue;
             }
         }
         i += 1;
@@ -250,7 +249,7 @@ pub fn apply(module: &WasmModule<'_>) -> Vec<u8> {
     let mut new_code_payload = Vec::new();
     leb128::write_u32(&mut new_code_payload, func_count);
 
-    off = leb128::u32_size(func_count) as usize;
+    off = leb128::u32_size(func_count);
     for replacement in &replacements {
         let Some((body_size, size_consumed)) = leb128::read_u32(&code_payload[off..]) else {
             break;

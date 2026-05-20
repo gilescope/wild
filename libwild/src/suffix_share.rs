@@ -239,23 +239,18 @@ mod tests {
         let off = *packed
             .offsets
             .get(name)
-            .unwrap_or_else(|| panic!("{:?} not in packed", name));
+            .unwrap_or_else(|| panic!("{name:?} not in packed"));
         let off = off as usize;
-        assert!(
-            off + name.len() + 1 <= packed.bytes.len(),
-            "offset out of range"
-        );
+        assert!(off + name.len() < packed.bytes.len(), "offset out of range");
         assert_eq!(
             &packed.bytes[off..off + name.len()],
             name,
-            "packed bytes at offset don't match name {:?}",
-            name
+            "packed bytes at offset don't match name {name:?}"
         );
         assert_eq!(
             packed.bytes[off + name.len()],
             0,
-            "no NUL terminator at offset + len for {:?}",
-            name
+            "no NUL terminator at offset + len for {name:?}"
         );
     }
 

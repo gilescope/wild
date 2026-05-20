@@ -72,10 +72,10 @@ fn rewrite_body_with_edits(body: &[u8]) -> Option<(Vec<u8>, crate::provenance::B
             let it = ir.instrs()[k as usize];
             match it.op {
                 OP_LOCAL_GET => {
-                    if let Some(x) = local_idx(&ir, k as usize) {
-                        if !killed.contains(&x) {
-                            used.insert(x);
-                        }
+                    if let Some(x) = local_idx(&ir, k as usize)
+                        && !killed.contains(&x)
+                    {
+                        used.insert(x);
                     }
                 }
                 OP_LOCAL_SET | OP_LOCAL_TEE => {
@@ -187,8 +187,8 @@ fn has_local_set(body: &[u8]) -> bool {
     let Some(start) = opc::skip_locals(body) else {
         return false;
     };
-    let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
+    let iter = InstrIter::new(body, start);
+    for (p, _) in iter {
         if body[p] == OP_LOCAL_SET {
             return true;
         }

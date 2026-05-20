@@ -95,7 +95,7 @@ fn dump_sha_trace(stage: &str, path: &std::path::Path, buf: Option<&[u8]>) {
     };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
-        h ^= b as u64;
+        h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     let (data_filesize, data_vmsize, text_filesize, text_vmsize) =
@@ -321,9 +321,9 @@ impl MachOSymtabPrecount {
     /// Exact symtab + strtab byte count. Used by
     /// `build_mappings_and_size` to replace the 512 B/sym fudge.
     pub(crate) fn symtab_plus_strtab_bytes(&self) -> u64 {
-        let nlist_bytes = (self.n_syms() as u64) * 16;
+        let nlist_bytes = u64::from(self.n_syms()) * 16;
         // +1 for leading NUL that Mach-O strtabs conventionally carry.
-        let strtab = self.strtab_bytes as u64 + 1;
+        let strtab = u64::from(self.strtab_bytes) + 1;
         nlist_bytes + strtab
     }
 }
@@ -601,8 +601,7 @@ pub(crate) fn precount_symtab<'data>(layout: &Layout<'data, MachO>) -> MachOSymt
                         .object
                         .sections
                         .get(sec_idx)
-                        .map(|s| crate::macho::trim_nul(s.sectname()) == b"__text")
-                        .unwrap_or(false);
+                        .is_some_and(|s| crate::macho::trim_nul(s.sectname()) == b"__text");
                     if !is_text {
                         continue;
                     }
@@ -624,7 +623,7 @@ pub(crate) fn precount_symtab<'data>(layout: &Layout<'data, MachO>) -> MachOSymt
         // name).
         for ast_path in &layout.symbol_db.args.ast_paths {
             pc.n_stabs += 1;
-            pc.strtab_bytes += ast_path.as_bytes().len() as u32 + 1;
+            pc.strtab_bytes += ast_path.len() as u32 + 1;
         }
     }
 
@@ -756,7 +755,7 @@ pub(crate) fn precount_symtab<'data>(layout: &Layout<'data, MachO>) -> MachOSymt
 ///
 /// **Complexity:** Θ(segments) CPU, Θ(1) memory — no symbol-table walks
 /// beyond reading pre-populated `precount` fields.
-pub(self) fn compute_chained_fixups_size_upper(
+fn compute_chained_fixups_size_upper(
     precount: &MachOSymtabPrecount,
     mappings: &[SegmentMapping],
     is_dylib: bool,
@@ -769,7 +768,7 @@ pub(self) fn compute_chained_fixups_size_upper(
     // span. Small for most binaries; hundreds for mid-size Rust.
     let data_pages: u32 = if has_data {
         let dm = &mappings[1];
-        (((dm.vm_end - dm.vm_start) + PAGE_SIZE - 1) / PAGE_SIZE) as u32
+        (dm.vm_end - dm.vm_start).div_ceil(PAGE_SIZE) as u32
     } else {
         0
     };
@@ -817,11 +816,10 @@ pub(crate) fn write_output<A: Arch<Platform = MachO>>(
         .segments
         .iter()
         .find(|s| s.sizes.file_size > 0 || s.sizes.mem_size > 0)
-        .map(|s| {
+        .map_or((PAGEZERO_SIZE, PAGEZERO_SIZE + PAGE_SIZE), |s| {
             let content_end = s.sizes.mem_offset + s.sizes.mem_size;
             (s.sizes.mem_offset, align_to(content_end, PAGE_SIZE))
-        })
-        .unwrap_or((PAGEZERO_SIZE, PAGEZERO_SIZE + PAGE_SIZE));
+        });
     let text_content_end = {
         let candidates = [
             output_section_id::TEXT,
@@ -885,8 +883,7 @@ pub(crate) fn write_output<A: Arch<Platform = MachO>>(
             .unwrap_or_else(|| {
                 output_path
                     .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "a.out".to_string())
+                    .map_or_else(|| "a.out".to_string(), |s| s.to_string_lossy().into_owned())
             })
     } else {
         String::new()
@@ -1127,23 +1124,22 @@ fn print_dependencies(layout: &Layout<'_, MachO>) {
                 // Check if defined in a linked object file.
                 let mut def_path = String::new();
                 // First check if it resolves to a real address (object-defined).
-                if let Some(res) = resolutions.get(def_id.as_usize()).and_then(|r| r.as_ref()) {
-                    if res.raw_value != 0
-                        && !res.flags.contains(crate::value_flags::ValueFlags::DYNAMIC)
-                    {
-                        let def_file_id = layout.symbol_db.file_id_for_symbol(def_id);
-                        if let Some(p) = file_id_to_path.get(&def_file_id) {
-                            def_path = p.clone();
-                        }
+                if let Some(res) = resolutions.get(def_id.as_usize()).and_then(|r| r.as_ref())
+                    && res.raw_value != 0
+                    && !res.flags.contains(crate::value_flags::ValueFlags::DYNAMIC)
+                {
+                    let def_file_id = layout.symbol_db.file_id_for_symbol(def_id);
+                    if let Some(p) = file_id_to_path.get(&def_file_id) {
+                        def_path = p.clone();
                     }
                 }
                 // If not found in objects, check dylib symbols.
                 if def_path.is_empty() {
                     // Check extra_dylibs provenance first.
-                    if let Some(&idx) = layout.symbol_db.args.dylib_symbol_provenance.get(name) {
-                        if let Some((path, _)) = layout.symbol_db.args.extra_dylibs.get(idx) {
-                            def_path = String::from_utf8_lossy(path).into_owned();
-                        }
+                    if let Some(&idx) = layout.symbol_db.args.dylib_symbol_provenance.get(name)
+                        && let Some((path, _)) = layout.symbol_db.args.extra_dylibs.get(idx)
+                    {
+                        def_path = String::from_utf8_lossy(path).into_owned();
                     }
                     // Fall back to libSystem for known dylib symbols.
                     if def_path.is_empty() && layout.symbol_db.args.dylib_symbols.contains(name) {
@@ -1218,9 +1214,10 @@ fn write_map_file(layout: &Layout<'_, MachO>, path: &std::path::Path) -> Result 
     for group in &layout.group_layouts {
         for file_layout in &group.files {
             if let FileLayout::Object(obj) = file_layout {
-                let path_str = std::fs::canonicalize(&obj.input.file.filename)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| obj.input.file.filename.to_string_lossy().into_owned());
+                let path_str = std::fs::canonicalize(&obj.input.file.filename).map_or_else(
+                    |_| obj.input.file.filename.to_string_lossy().into_owned(),
+                    |p| p.to_string_lossy().into_owned(),
+                );
                 writeln!(f, "[{obj_index:3}] {path_str}").unwrap();
                 obj_paths.push(path_str);
                 obj_index += 1;
@@ -1241,19 +1238,18 @@ fn write_map_file(layout: &Layout<'_, MachO>, path: &std::path::Path) -> Result 
                         .section_resolutions
                         .get(sec_idx)
                         .and_then(|r| r.address())
+                        && let Some(sec) = obj.object.sections.get(sec_idx)
                     {
-                        if let Some(sec) = obj.object.sections.get(sec_idx) {
-                            use object::read::macho::Section as _;
-                            let segname = crate::macho::trim_nul(sec.segname()).to_vec();
-                            let sectname = crate::macho::trim_nul(sec.sectname()).to_vec();
-                            let size = sec.size(le);
-                            if size > 0 {
-                                let entry = section_map
-                                    .entry((segname, sectname))
-                                    .or_insert((u64::MAX, 0));
-                                entry.0 = entry.0.min(addr);
-                                entry.1 += size;
-                            }
+                        use object::read::macho::Section as _;
+                        let segname = crate::macho::trim_nul(sec.segname()).to_vec();
+                        let sectname = crate::macho::trim_nul(sec.sectname()).to_vec();
+                        let size = sec.size(le);
+                        if size > 0 {
+                            let entry = section_map
+                                .entry((segname, sectname))
+                                .or_insert((u64::MAX, 0));
+                            entry.0 = entry.0.min(addr);
+                            entry.1 += size;
                         }
                     }
                 }
@@ -1422,7 +1418,9 @@ fn build_mappings_and_size(
         .count();
     // Count stab (debug) symbols for size estimation: 1 N_OSO per object + any
     // existing stabs in input objects.
-    let n_stabs = if !layout.symbol_db.args.should_strip_debug() {
+    let n_stabs = if layout.symbol_db.args.should_strip_debug() {
+        0
+    } else {
         layout
             .group_layouts
             .iter()
@@ -1448,8 +1446,6 @@ fn build_mappings_and_size(
                 1 + input_stabs // +1 for synthesized N_OSO
             })
             .sum::<usize>()
-    } else {
-        0
     };
     // Each nlist64 = 16 bytes, Rust mangled symbol names in heavy crates
     // (midnight-node-runtime, subxt+sqlx workloads) average 400-500 bytes
@@ -1783,7 +1779,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
             &mut imports,
             has_extra_dylibs,
             &name_cache,
-        )?;
+        );
     }
 
     // Deduplicate imports by (name, lib_ordinal, weak_import, addend).
@@ -1859,11 +1855,11 @@ fn write_macho<A: Arch<Platform = MachO>>(
         let mut tvars_start = usize::MAX;
         let mut tvars_end = 0usize;
         for f in &bind_fixups {
-            if let Some(imp) = imports.get(f.import_index as usize) {
-                if imp.name == b"__tlv_bootstrap" {
-                    tvars_start = tvars_start.min(f.file_offset);
-                    tvars_end = tvars_end.max(f.file_offset + 24); // descriptor size
-                }
+            if let Some(imp) = imports.get(f.import_index as usize)
+                && imp.name == b"__tlv_bootstrap"
+            {
+                tvars_start = tvars_start.min(f.file_offset);
+                tvars_end = tvars_end.max(f.file_offset + 24); // descriptor size
             }
         }
         // Also scan rebase fixups that target init functions (which are in
@@ -1965,7 +1961,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
         // When using DYLD_CHAINED_IMPORT_ADDEND format, addend is in the
         // import table, not in the pointer. Only encode 8-bit inline addend
         // for format 1.
-        let encoded = (1u64 << 63) | (f.import_index as u64 & 0xFF_FFFF);
+        let encoded = (1u64 << 63) | (u64::from(f.import_index) & 0xFF_FFFF);
         all_data_fixups.push((f.file_offset, encoded));
     }
     all_data_fixups.sort_by_key(|&(off, _)| off);
@@ -2044,7 +2040,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
     // Must match `write_chained_fixups_header`.
     let total_seg_starts_size: u32 = if has_fixups && has_data {
         let data_span = mappings[1].vm_end - mappings[1].vm_start;
-        let total_pages = ((data_span + PAGE_SIZE - 1) / PAGE_SIZE) as u32;
+        let total_pages = data_span.div_ceil(PAGE_SIZE) as u32;
         if splits_data {
             use output_section_id as osi;
             let data_vmstart = mappings[1].vm_start;
@@ -2060,8 +2056,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
                 })
                 .max()
                 .unwrap_or(data_vmstart);
-            let const_pages =
-                (((const_max_end - data_vmstart + PAGE_SIZE - 1) / PAGE_SIZE) as u32).max(1);
+            let const_pages = ((const_max_end - data_vmstart).div_ceil(PAGE_SIZE) as u32).max(1);
             let data_pages = total_pages.saturating_sub(const_pages);
             let first = 22 + 2 * const_pages;
             if data_pages > 0 {
@@ -2079,7 +2074,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
     let has_addends = bind_fixups.iter().any(|f| f.addend != 0);
     let needs_64bit_addend = bind_fixups
         .iter()
-        .any(|f| f.addend > i32::MAX as i64 || f.addend < i32::MIN as i64);
+        .any(|f| f.addend > i64::from(i32::MAX) || f.addend < i64::from(i32::MIN));
     let import_entry_size = if needs_64bit_addend {
         16u32 // format 3: 8 (import64) + 8 (addend64)
     } else if has_addends {
@@ -2087,9 +2082,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
     } else {
         4u32 // format 1: 4 (import32)
     };
-    let cf_data_size = if !has_fixups {
-        (32 + 4 + 4 * seg_count + 8).max(48)
-    } else {
+    let cf_data_size = if has_fixups {
         let seg_starts_size = total_seg_starts_size;
         let imports_size = import_entry_size * n_imports;
         let raw =
@@ -2099,6 +2092,8 @@ fn write_macho<A: Arch<Platform = MachO>>(
         // 8-byte boundary without an inter-table gap, and the reported
         // datasize matches what `__LINKEDIT.filesize` covers.
         (raw + 7) & !7
+    } else {
+        (32 + 4 + 4 * seg_count + 8).max(48)
     };
 
     // Build and write __unwind_info now that __eh_frame is in the output buffer.
@@ -2109,13 +2104,13 @@ fn write_macho<A: Arch<Platform = MachO>>(
         let fde_map: std::collections::HashMap<u64, EhFrameFdeInfo> = if eh_layout.mem_size > 0 {
             if let Some(eh_foff) = vm_addr_to_file_offset(eh_layout.mem_offset, mappings) {
                 crate::timing_phase!("Scan eh_frame FDE offsets");
-                let m = scan_eh_frame_fde_offsets(
+
+                scan_eh_frame_fde_offsets(
                     out,
                     eh_layout.mem_offset,
                     eh_foff,
                     eh_layout.mem_size as usize,
-                );
-                m
+                )
             } else {
                 Default::default()
             }
@@ -2161,12 +2156,12 @@ fn write_macho<A: Arch<Platform = MachO>>(
             }
             let vm_addr = cursor;
             let size = data.len() as u64;
-            if vm_addr + size <= text_vm_end {
-                if let Some(foff) = vm_addr_to_file_offset(vm_addr, mappings) {
-                    let end = foff + data.len();
-                    if end <= out.len() {
-                        out[foff..end].copy_from_slice(data);
-                    }
+            if vm_addr + size <= text_vm_end
+                && let Some(foff) = vm_addr_to_file_offset(vm_addr, mappings)
+            {
+                let end = foff + data.len();
+                if end <= out.len() {
+                    out[foff..end].copy_from_slice(data);
                 }
             }
             sectcreate_placements.push((*segname, *sectname, vm_addr, size));
@@ -2236,21 +2231,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
     // Write chained fixups
     crate::timing_phase!("Write chained fixups");
     let final_size = if let Some(cf_off) = chained_fixups_offset {
-        if !has_fixups {
-            let cf = cf_off as usize;
-            if cf + cf_data_size as usize <= out.len() {
-                // Minimal header with correct seg_count and imports_format
-                let starts_off = 32u32;
-                out[cf + 4..cf + 8].copy_from_slice(&starts_off.to_le_bytes()); // starts_offset
-                let imports_off = starts_off + 4 + 4 * seg_count;
-                out[cf + 8..cf + 12].copy_from_slice(&imports_off.to_le_bytes()); // imports_offset
-                out[cf + 12..cf + 16].copy_from_slice(&imports_off.to_le_bytes()); // symbols_offset
-                out[cf + 20..cf + 24].copy_from_slice(&1u32.to_le_bytes()); // imports_format
-                let si = cf + starts_off as usize;
-                out[si..si + 4].copy_from_slice(&seg_count.to_le_bytes());
-            }
-            cf + cf_data_size as usize
-        } else {
+        if has_fixups {
             let ordinals: Vec<u8> = imports.iter().map(|e| e.lib_ordinal).collect();
             let weak_flags: Vec<bool> = imports.iter().map(|e| e.weak_import).collect();
             // Collect per-import addends for DYLD_CHAINED_IMPORT_ADDEND[64].
@@ -2285,7 +2266,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
                     .max()
                     .unwrap_or(mappings[1].vm_start);
                 let const_span = const_max_end - mappings[1].vm_start;
-                (((const_span + PAGE_SIZE - 1) / PAGE_SIZE) as u16).max(1)
+                (const_span.div_ceil(PAGE_SIZE) as u16).max(1)
             } else {
                 1
             };
@@ -2307,8 +2288,22 @@ fn write_macho<A: Arch<Platform = MachO>>(
                 },
                 splits_data,
                 const_pages,
-            )?;
+            );
             cf_off as usize + cf_data_size as usize
+        } else {
+            let cf = cf_off as usize;
+            if cf + cf_data_size as usize <= out.len() {
+                // Minimal header with correct seg_count and imports_format
+                let starts_off = 32u32;
+                out[cf + 4..cf + 8].copy_from_slice(&starts_off.to_le_bytes()); // starts_offset
+                let imports_off = starts_off + 4 + 4 * seg_count;
+                out[cf + 8..cf + 12].copy_from_slice(&imports_off.to_le_bytes()); // imports_offset
+                out[cf + 12..cf + 16].copy_from_slice(&imports_off.to_le_bytes()); // symbols_offset
+                out[cf + 20..cf + 24].copy_from_slice(&1u32.to_le_bytes()); // imports_format
+                let si = cf + starts_off as usize;
+                out[si..si + 4].copy_from_slice(&seg_count.to_le_bytes());
+            }
+            cf + cf_data_size as usize
         }
     } else {
         out.len()
@@ -2322,12 +2317,12 @@ fn write_macho<A: Arch<Platform = MachO>>(
     // test suite catches those as ~48+8 bytes of __LINKEDIT content
     // missing per binary.
     let mut cursor = final_size;
-    let (exports_trie_off, exports_trie_size) = if !layout.symbol_db.args.is_relocatable {
+    let (exports_trie_off, exports_trie_size) = if layout.symbol_db.args.is_relocatable {
+        (cursor, 0usize)
+    } else {
         let (off, size) = write_exports_trie_compat(out, cursor, layout);
         cursor = off + size;
         (off, size)
-    } else {
-        (cursor, 0usize)
     };
     let (func_starts_off, func_starts_size) =
         if !layout.symbol_db.args.no_function_starts && !layout.symbol_db.args.is_relocatable {
@@ -2351,7 +2346,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
             func_starts_size,
             exports_trie_off,
             exports_trie_size,
-        )?
+        )
     } else {
         write_exe_symtab(
             out,
@@ -2363,7 +2358,7 @@ fn write_macho<A: Arch<Platform = MachO>>(
             exports_trie_off,
             exports_trie_size,
             precount,
-        )?
+        )
     };
 
     Ok(final_size)
@@ -2455,7 +2450,7 @@ fn write_function_starts_compat(
     }
     payload.push(0); // terminator
     // Align to 8 bytes so the following table stays aligned.
-    while payload.len() % 8 != 0 {
+    while !payload.len().is_multiple_of(8) {
         payload.push(0);
     }
 
@@ -2668,7 +2663,7 @@ fn write_exports_trie_compat(
     // starts immediately after on an aligned boundary. strip rejects a
     // gap between tables ("function starts data out of place") even
     // when the dataoff alignment is satisfied independently.
-    while trie.len() % 8 != 0 {
+    while !trie.len().is_multiple_of(8) {
         trie.push(0);
     }
     if off + trie.len() > out.len() {
@@ -2707,7 +2702,7 @@ fn write_dylib_symtab(
     // Signing subsystem".
     pre_exports_trie_off: usize,
     pre_exports_trie_size: usize,
-) -> Result<usize> {
+) -> usize {
     // Collect exported symbols from dynamic_symbol_definitions.
     //
     // Avoid `.iter().nth(i)` (𝒪(i) for a Vec iterator — walks from
@@ -2867,7 +2862,7 @@ fn write_dylib_symtab(
         off += cmdsize;
     }
 
-    Ok(pos)
+    pos
 }
 
 /// Parse section address ranges from the already-written Mach-O headers.
@@ -2943,12 +2938,12 @@ fn is_symbol_external(layout: &Layout<'_, MachO>, symbol_id: crate::symbol_db::S
     let file_id = layout.symbol_db.file_id_for_symbol(symbol_id);
     for group in &layout.group_layouts {
         for file_layout in &group.files {
-            if let crate::layout::FileLayout::Object(obj) = file_layout {
-                if obj.file_id == file_id {
-                    let local_index = symbol_id.to_input(obj.symbol_id_range);
-                    if let Ok(sym) = obj.object.symbols.symbol(local_index) {
-                        return (sym.n_type() & object::macho::N_EXT) != 0;
-                    }
+            if let crate::layout::FileLayout::Object(obj) = file_layout
+                && obj.file_id == file_id
+            {
+                let local_index = symbol_id.to_input(obj.symbol_id_range);
+                if let Ok(sym) = obj.object.symbols.symbol(local_index) {
+                    return (sym.n_type() & object::macho::N_EXT) != 0;
                 }
             }
         }
@@ -2971,12 +2966,12 @@ fn is_symbol_private_external(
     let file_id = layout.symbol_db.file_id_for_symbol(symbol_id);
     for group in &layout.group_layouts {
         for file_layout in &group.files {
-            if let crate::layout::FileLayout::Object(obj) = file_layout {
-                if obj.file_id == file_id {
-                    let local_index = symbol_id.to_input(obj.symbol_id_range);
-                    if let Ok(sym) = obj.object.symbols.symbol(local_index) {
-                        return (sym.n_type() & object::macho::N_PEXT) != 0;
-                    }
+            if let crate::layout::FileLayout::Object(obj) = file_layout
+                && obj.file_id == file_id
+            {
+                let local_index = symbol_id.to_input(obj.symbol_id_range);
+                if let Ok(sym) = obj.object.symbols.symbol(local_index) {
+                    return (sym.n_type() & object::macho::N_PEXT) != 0;
                 }
             }
         }
@@ -3014,7 +3009,7 @@ fn write_exe_symtab(
     exports_trie_off: usize,
     exports_trie_size: usize,
     precount: &MachOSymtabPrecount,
-) -> Result<usize> {
+) -> usize {
     use crate::symbol_db::SymbolId;
 
     // Synthesize N_OSO stab entries for each input object so dsymutil
@@ -3079,8 +3074,7 @@ fn write_exe_symtab(
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_secs());
                     // Emit SO/OSO/BNSYM/FUN/ENSYM stab sequence for dsymutil.
                     // SO (empty) — start marker
                     stab_entries.push((Vec::new(), 0x64, 0, 0, 0));
@@ -3142,12 +3136,10 @@ fn write_exe_symtab(
                                 continue;
                             }
                             let sec_idx = n_sect as usize - 1;
-                            let is_text = obj
-                                .object
-                                .sections
-                                .get(sec_idx)
-                                .map(|s| crate::macho::trim_nul(s.sectname()) == b"__text")
-                                .unwrap_or(false);
+                            let is_text =
+                                obj.object.sections.get(sec_idx).is_some_and(|s| {
+                                    crate::macho::trim_nul(s.sectname()) == b"__text"
+                                });
                             if !is_text {
                                 continue;
                             }
@@ -3260,7 +3252,12 @@ fn write_exe_symtab(
         // Each worker emits two sub-partials (locals, extdefs). The
         // serial merge below routes them into the category Vecs in
         // one pass without re-examining n_type.
-        let partials: Vec<(Vec<(Vec<u8>, u64, u8)>, Vec<(Vec<u8>, u64, u8)>)> = resolutions
+        /// `(name, value, n_type)` — one nlist row before it's serialised
+        /// into the symtab section.
+        type SymRow = (Vec<u8>, u64, u8);
+        /// Worker output: `(locals_part, extdefs_part)`.
+        type WorkerPart = (Vec<SymRow>, Vec<SymRow>);
+        let partials: Vec<WorkerPart> = resolutions
             .par_chunks(CHUNK)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
@@ -3519,7 +3516,7 @@ fn write_exe_symtab(
         && undef_entries.is_empty()
         && stab_entries.is_empty()
     {
-        return Ok(start);
+        return start;
     }
 
     // Sort each category Vec by address (DYSYMTAB requires the regions
@@ -3605,11 +3602,11 @@ fn write_exe_symtab(
     // indexes sequentially into the concatenation locals ++ extdef
     // ++ undef, so a single cursor matches.
     let sorted_sections = sorted_section_ranges_with_idx(out);
-    let mut str_off_idx = 0usize;
-    for (name, value, n_type) in locals_entries
+    for (str_off_idx, (name, value, n_type)) in locals_entries
         .iter()
         .chain(extdef_entries.iter())
         .chain(undef_entries.iter())
+        .enumerate()
     {
         if pos + 16 > out.len() {
             break;
@@ -3632,7 +3629,6 @@ fn write_exe_symtab(
         out[pos + 6..pos + 8].copy_from_slice(&0u16.to_le_bytes());
         out[pos + 8..pos + 16].copy_from_slice(&value.to_le_bytes());
         pos += 16;
-        str_off_idx += 1;
     }
 
     // Build indirect symbol table: maps __stubs and __got entries to nlist indices.
@@ -3855,7 +3851,7 @@ fn write_exe_symtab(
         off += cmdsize;
     }
 
-    Ok(pos)
+    pos
 }
 
 /// Build a Mach-O export trie as a prefix-compressed radix tree.
@@ -4090,7 +4086,7 @@ fn write_stubs_and_got<A: Arch<Platform = MachO>>(
     rebase_fixups: &mut Vec<RebaseFixup>,
     bind_fixups: &mut Vec<BindFixup>,
     imports: &mut Vec<ImportEntry>,
-    has_extra_dylibs: bool,
+    _has_extra_dylibs: bool,
 ) -> Result {
     use crate::symbol_db::SymbolId;
 
@@ -4158,17 +4154,17 @@ fn write_stubs_and_got<A: Arch<Platform = MachO>>(
                         got_addr,
                         selector,
                     );
-                    if selref_addr.is_some() {
-                        if let Some(sref_file_off) = vm_addr_to_file_offset(sref, mappings) {
-                            // Initial slot value = methname address
-                            // (will be rebased for ASLR by dyld).
-                            out[sref_file_off..sref_file_off + 8]
-                                .copy_from_slice(&methname_addr.to_le_bytes());
-                            rebase_fixups.push(RebaseFixup {
-                                file_offset: sref_file_off,
-                                target: methname_addr,
-                            });
-                        }
+                    if selref_addr.is_some()
+                        && let Some(sref_file_off) = vm_addr_to_file_offset(sref, mappings)
+                    {
+                        // Initial slot value = methname address
+                        // (will be rebased for ASLR by dyld).
+                        out[sref_file_off..sref_file_off + 8]
+                            .copy_from_slice(&methname_addr.to_le_bytes());
+                        rebase_fixups.push(RebaseFixup {
+                            file_offset: sref_file_off,
+                            target: methname_addr,
+                        });
                     }
                 }
             }
@@ -4196,14 +4192,14 @@ fn write_stubs_and_got<A: Arch<Platform = MachO>>(
             continue;
         }
 
-        if let Some(plt_file_off) = vm_addr_to_file_offset(plt_addr, mappings) {
-            if plt_file_off + 12 <= out.len() {
-                A::write_plt_entry(
-                    &mut out[plt_file_off..plt_file_off + 12],
-                    got_addr,
-                    plt_addr,
-                )?;
-            }
+        if let Some(plt_file_off) = vm_addr_to_file_offset(plt_addr, mappings)
+            && plt_file_off + 12 <= out.len()
+        {
+            A::write_plt_entry(
+                &mut out[plt_file_off..plt_file_off + 12],
+                got_addr,
+                plt_addr,
+            )?;
         }
 
         if let Some(got_file_off) = vm_addr_to_file_offset(got_addr, mappings) {
@@ -4333,9 +4329,12 @@ fn write_objc_msgsend_stub(
 ) {
     debug_assert!(buf.len() >= crate::macho::OBJC_STUB_SLOT_BYTES as usize);
     debug_assert!(selector.len() < crate::macho::OBJC_STUB_MAX_SELECTOR + 1);
-    debug_assert!(stub_vm % 4 == 0, "stub_vm must be 4-byte aligned for ARM64");
     debug_assert!(
-        selref_vm % 8 == 0,
+        stub_vm.is_multiple_of(4),
+        "stub_vm must be 4-byte aligned for ARM64"
+    );
+    debug_assert!(
+        selref_vm.is_multiple_of(8),
         "selref_vm must be 8-byte aligned for LDR x1, [.., #imm12]"
     );
 
@@ -4437,9 +4436,9 @@ fn write_got_entries(
     rebase_fixups: &mut Vec<RebaseFixup>,
     bind_fixups: &mut Vec<BindFixup>,
     imports: &mut Vec<ImportEntry>,
-    has_extra_dylibs: bool,
+    _has_extra_dylibs: bool,
     name_cache: &ResolutionByNameCache,
-) -> Result {
+) {
     use crate::symbol_db::SymbolId;
 
     for (sym_idx, res) in layout.symbol_resolutions.iter().enumerate() {
@@ -4497,7 +4496,6 @@ fn write_got_entries(
             }
         }
     }
-    Ok(())
 }
 
 /// When a symbol's merged resolution has `raw_value == 0` (broken definition
@@ -4671,7 +4669,7 @@ fn write_filtered_eh_frame(
         let mut m = std::collections::HashMap::with_capacity(relocs.len());
         for reloc_raw in relocs {
             let ri = reloc_raw.info(le);
-            m.insert(ri.r_address as u32, ri);
+            m.insert(ri.r_address, ri);
         }
         m
     };
@@ -5097,8 +5095,8 @@ fn write_object_sections(
         }
     }
 
-    for sec_idx in 0..obj.sections.len() {
-        let Some(slot_idx) = slot_by_sec[sec_idx] else {
+    for (sec_idx, slot) in slot_by_sec.iter().enumerate().take(obj.sections.len()) {
+        let Some(slot_idx) = *slot else {
             continue;
         };
         // Pull the slice out of section_outputs once per iteration
@@ -5479,7 +5477,6 @@ fn macho_input_to_output(obj: &ObjectLayout<'_, MachO>, sec_idx: usize, input_of
 /// 𝒪(1) memory.
 fn object_has_debug_info(obj: &ObjectLayout<'_, MachO>) -> bool {
     use object::read::macho::MachHeader as _;
-    use object::read::macho::Section as _;
     use object::read::macho::Segment as _;
     let le = object::Endianness::Little;
     let data = obj.object.data;
@@ -5560,7 +5557,7 @@ fn apply_relocations(
     rebase_fixups: &mut Vec<RebaseFixup>,
     bind_fixups: &mut Vec<BindFixup>,
     imports: &mut Vec<ImportEntry>,
-    has_extra_dylibs: bool,
+    _has_extra_dylibs: bool,
     section_desc: &str,
     active_atoms: Option<&crate::layout::SubsectionTracking>,
     source_deltas: Option<&linker_utils::relaxation::SectionDeltas>,
@@ -5576,12 +5573,12 @@ fn apply_relocations(
     // translation; otherwise identity.
     let map_r_address = |r: u32| -> u32 {
         if let Some(t) = active_atoms
-            && let Some(out) = t.input_to_output_offset(r as u64)
+            && let Some(out) = t.input_to_output_offset(u64::from(r))
         {
             return out as u32;
         }
         match source_deltas {
-            Some(d) if !d.is_empty() => d.input_to_output_offset(r as u64) as u32,
+            Some(d) if !d.is_empty() => d.input_to_output_offset(u64::from(r)) as u32,
             _ => r,
         }
     };
@@ -5597,7 +5594,7 @@ fn apply_relocations(
         let buckets = tracking.reloc_buckets.get_or_init(|| {
             let mut b: Vec<Vec<u32>> = vec![Vec::new(); tracking.atoms.len()];
             for (idx, r) in relocs.iter().enumerate() {
-                let r_addr = r.info(le).r_address as u64;
+                let r_addr = u64::from(r.info(le).r_address);
                 if let Some(atom_idx) = tracking.atom_index_for_offset(r_addr) {
                     b[atom_idx].push(idx as u32);
                 }
@@ -5618,21 +5615,21 @@ fn apply_relocations(
     for (reloc_idx, reloc_raw) in relocs.iter().enumerate() {
         let reloc = reloc_raw.info(le);
 
-        if let Some(skip) = reloc_skip.as_ref() {
-            if skip[reloc_idx] {
-                // Out-of-atom (gap) or inactive atom — skip, but
-                // reset pending-reloc state so we don't carry an
-                // addend/subtractor from the previous reloc across
-                // a dead atom.
-                pending_addend = 0;
-                pending_subtrahend = None;
-                continue;
-            }
+        if let Some(skip) = reloc_skip.as_ref()
+            && skip[reloc_idx]
+        {
+            // Out-of-atom (gap) or inactive atom — skip, but
+            // reset pending-reloc state so we don't carry an
+            // addend/subtractor from the previous reloc across
+            // a dead atom.
+            pending_addend = 0;
+            pending_subtrahend = None;
+            continue;
         }
 
         if reloc.r_type == 10 {
             // ARM64_RELOC_ADDEND
-            pending_addend = reloc.r_symbolnum as i64;
+            pending_addend = i64::from(reloc.r_symbolnum);
             continue;
         }
         if reloc.r_type == 1 {
@@ -5661,8 +5658,7 @@ fn apply_relocations(
                                         .object
                                         .sections
                                         .get(sec_idx)
-                                        .map(|s| s.addr.get(le))
-                                        .unwrap_or(0);
+                                        .map_or(0, |s| s.addr.get(le));
                                     section_local_vm(
                                         obj,
                                         sec_idx,
@@ -5673,7 +5669,7 @@ fn apply_relocations(
                                     crate::string_merging::get_merged_string_output_address::<MachO>(
                                         sym_idx,
                                         0,
-                                        &obj.object,
+                                        obj.object,
                                         &obj.sections,
                                         &layout.merged_strings,
                                         &layout.merged_string_start_addresses,
@@ -5717,7 +5713,7 @@ fn apply_relocations(
         // that emit rebase/bind records. Every other use is an index
         // into the section slice `out`, so local is what we want.
         let patch_file_offset = out_r_addr as usize;
-        let pc_addr = section_vm_addr + out_r_addr as u64;
+        let pc_addr = section_vm_addr + u64::from(out_r_addr);
         if patch_file_offset + 4 > out.len() {
             continue;
         }
@@ -5781,7 +5777,7 @@ fn apply_relocations(
                                 crate::string_merging::get_merged_string_output_address::<MachO>(
                                     sym_idx,
                                     0,
-                                    &obj.object,
+                                    obj.object,
                                     &obj.sections,
                                     &layout.merged_strings,
                                     &layout.merged_string_start_addresses,
@@ -5860,8 +5856,8 @@ fn apply_relocations(
                 // input section, then compute the output address.
                 use object::read::macho::Section as _;
                 let input_sec = obj.object.sections.get(sec_idx);
-                let sec_type = input_sec.map(|s| s.flags(le) & 0xFF).unwrap_or(0);
-                let input_sec_base = input_sec.map(|s| s.addr.get(le)).unwrap_or(0);
+                let sec_type = input_sec.map_or(0, |s| s.flags(le) & 0xFF);
+                let input_sec_base = input_sec.map_or(0, |s| s.addr.get(le));
                 let tdata = layout.section_layouts.get(output_section_id::TDATA);
                 let tbss = layout.section_layouts.get(output_section_id::TBSS);
                 match sec_type {
@@ -6194,7 +6190,7 @@ fn apply_relocations(
                             out[patch_file_offset..patch_file_offset + 8]
                                 .copy_from_slice(&tls_offset.to_le_bytes());
                         } else {
-                            if patch_file_offset % 8 != 0 {
+                            if !patch_file_offset.is_multiple_of(8) {
                                 // Skip metadata sections (e.g. __llvm_addrsig)
                                 // that aren't part of the runtime data layout.
                                 if !section_desc.contains("__llvm") {
@@ -6226,11 +6222,10 @@ fn apply_relocations(
                     let sym_name = if reloc.r_extern {
                         let sym_idx = object::SymbolIndex(reloc.r_symbolnum as usize);
                         let sym_id = obj.symbol_id_range.input_to_id(sym_idx);
-                        layout
-                            .symbol_db
-                            .symbol_name(sym_id)
-                            .map(|n| String::from_utf8_lossy(n.bytes()).into_owned())
-                            .unwrap_or_else(|_| format!("#{}", sym_idx.0))
+                        layout.symbol_db.symbol_name(sym_id).map_or_else(
+                            |_| format!("#{}", sym_idx.0),
+                            |n| String::from_utf8_lossy(n.bytes()).into_owned(),
+                        )
                     } else {
                         format!("non-extern sym#{}", reloc.r_symbolnum)
                     };
@@ -6278,7 +6273,7 @@ fn write_chained_fixups_header(
     // at load with "section `__got` end address is beyond containing
     // segment's end".
     compat_const_pages: u16,
-) -> Result {
+) {
     let has_data = mappings.len() > 1 && (mappings[1].vm_end > mappings[1].vm_start);
     let base_segs = if is_dylib { 2u32 } else { 3u32 };
     // Mirror the seg_count logic in `write_macho` — when the DATA
@@ -6308,7 +6303,7 @@ fn write_chained_fixups_header(
 
     let image_base = if mappings
         .first()
-        .map_or(false, |m| m.vm_start >= PAGEZERO_SIZE)
+        .is_some_and(|m| m.vm_start >= PAGEZERO_SIZE)
     {
         PAGEZERO_SIZE
     } else {
@@ -6345,10 +6340,9 @@ fn write_chained_fixups_header(
             // boundary (e.g. 16640 bytes → 1 floor-page, 0 data pages),
             // producing a zero-page entry that dyld rejects as
             // "malformed import table".
-            let total_pages =
-                ((data_map.vm_end - data_map.vm_start + PAGE_SIZE - 1) / PAGE_SIZE) as u16;
+            let total_pages = (data_map.vm_end - data_map.vm_start).div_ceil(PAGE_SIZE) as u16;
             let data_pages = total_pages.saturating_sub(const_pages);
-            let const_bytes = const_pages as u64 * PAGE_SIZE;
+            let const_bytes = u64::from(const_pages) * PAGE_SIZE;
             seg_entries.push(SegStarts {
                 slot: base_slot,
                 file_off: data_map.file_offset,
@@ -6366,8 +6360,7 @@ fn write_chained_fixups_header(
                 });
             }
         } else {
-            let pages =
-                (((data_map.vm_end - data_map.vm_start) + PAGE_SIZE - 1) / PAGE_SIZE) as u16;
+            let pages = (data_map.vm_end - data_map.vm_start).div_ceil(PAGE_SIZE) as u16;
             seg_entries.push(SegStarts {
                 slot: base_slot,
                 file_off: data_map.file_offset,
@@ -6383,7 +6376,7 @@ fn write_chained_fixups_header(
     for &(file_off, _) in all_fixups {
         let file_off = file_off as u64;
         let Some(entry) = seg_entries.iter_mut().find(|e| {
-            file_off >= e.file_off && file_off < e.file_off + (e.page_count as u64) * PAGE_SIZE
+            file_off >= e.file_off && file_off < e.file_off + u64::from(e.page_count) * PAGE_SIZE
         }) else {
             continue;
         };
@@ -6410,7 +6403,7 @@ fn write_chained_fixups_header(
     let mut total_seg_starts_size = 0u32;
     for entry in &seg_entries {
         entry_offsets.push(cursor);
-        let entry_size = 22 + 2 * entry.page_count as u32;
+        let entry_size = 22 + 2 * u32::from(entry.page_count);
         cursor += entry_size;
         total_seg_starts_size += entry_size;
     }
@@ -6418,9 +6411,9 @@ fn write_chained_fixups_header(
     let imports_table_offset = starts_offset + starts_in_image_size as u32 + total_seg_starts_size;
     // Format 1: no addend (4 bytes). Format 2: 32-bit addend (4+4=8). Format 3: 64-bit addend
     // (4+4+8=16).
-    let needs_64bit_addend = import_addends.map_or(false, |a| {
+    let needs_64bit_addend = import_addends.is_some_and(|a| {
         a.iter()
-            .any(|v| *v > i32::MAX as i64 || *v < i32::MIN as i64)
+            .any(|v| *v > i64::from(i32::MAX) || *v < i64::from(i32::MIN))
     });
     let imports_format = if needs_64bit_addend {
         3u32 // DYLD_CHAINED_IMPORT_ADDEND64
@@ -6461,7 +6454,7 @@ fn write_chained_fixups_header(
     // Emit each segment's starts_in_segment at its recorded offset.
     for (entry, &entry_off) in seg_entries.iter().zip(&entry_offsets) {
         let ss = si + entry_off as usize;
-        let entry_size = 22 + 2 * entry.page_count as u32;
+        let entry_size = 22 + 2 * u32::from(entry.page_count);
         w[ss..ss + 4].copy_from_slice(&entry_size.to_le_bytes());
         w[ss + 4..ss + 6].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
         w[ss + 6..ss + 8].copy_from_slice(&6u16.to_le_bytes());
@@ -6476,7 +6469,7 @@ fn write_chained_fixups_header(
     let it = imports_table_offset as usize;
     let entry_sz = import_entry_size as usize;
     for (i, &name_off) in import_name_offsets.iter().enumerate() {
-        let ordinal = import_ordinals[i] as u32;
+        let ordinal = u32::from(import_ordinals[i]);
         let weak_bit = if import_weak.get(i).copied().unwrap_or(false) {
             1u32 << 8
         } else {
@@ -6492,8 +6485,8 @@ fn write_chained_fixups_header(
             };
             // Ordinal is a signed 16-bit value in format 3 (vs 8-bit in format 1/2).
             // Special ordinals like 0xFE (-2 as i8) must be sign-extended to i16.
-            let ordinal16 = (ordinal as i8 as i16 as u16) as u64;
-            let import_val: u64 = ordinal16 | weak64 | ((name_off as u64 & 0xFFFF_FFFF) << 32);
+            let ordinal16 = u64::from(i16::from(ordinal as i8) as u16);
+            let import_val: u64 = ordinal16 | weak64 | ((u64::from(name_off) & 0xFFFF_FFFF) << 32);
             w[it + i * entry_sz..it + i * entry_sz + 8].copy_from_slice(&import_val.to_le_bytes());
             let addend = import_addends.and_then(|a| a.get(i).copied()).unwrap_or(0);
             w[it + i * entry_sz + 8..it + i * entry_sz + 16].copy_from_slice(&addend.to_le_bytes());
@@ -6513,8 +6506,6 @@ fn write_chained_fixups_header(
     if sp + symbols_pool.len() <= w.len() {
         w[sp..sp + symbols_pool.len()].copy_from_slice(symbols_pool);
     }
-
-    Ok(())
 }
 
 struct SegmentMapping {
@@ -6697,7 +6688,7 @@ fn collect_compact_unwind_entries(layout: &Layout<'_, MachO>) -> Vec<CollectedUn
                         let mut m = std::collections::HashMap::with_capacity(relocs.len());
                         for r in relocs {
                             let ri = r.info(le);
-                            m.insert(ri.r_address as u32, ri);
+                            m.insert(ri.r_address, ri);
                         }
                         m
                     };
@@ -6829,10 +6820,10 @@ fn resolve_compact_unwind_addr(
     if reloc.r_extern {
         let sym_idx = object::SymbolIndex(reloc.r_symbolnum as usize);
         let sym_id = obj.symbol_id_range.input_to_id(sym_idx);
-        if let Some(res) = layout.merged_symbol_resolution(sym_id) {
-            if res.raw_value != 0 {
-                return Some(res.raw_value);
-            }
+        if let Some(res) = layout.merged_symbol_resolution(sym_id)
+            && res.raw_value != 0
+        {
+            return Some(res.raw_value);
         }
         // Fallback: local symbol (compute from section base + symbol value).
         let sym = obj.object.symbols.symbol(sym_idx).ok()?;
@@ -6843,12 +6834,12 @@ fn resolve_compact_unwind_addr(
         let sec_idx = n_sect as usize - 1;
         let sec_out = obj.section_resolutions.get(sec_idx)?.address()?;
         let sec_in = obj.object.sections.get(sec_idx).map(|s| s.addr.get(le))?;
-        return Some(section_local_vm(
+        Some(section_local_vm(
             obj,
             sec_idx,
             sec_out,
             sym.n_value(le).wrapping_sub(sec_in),
-        ));
+        ))
     } else {
         // Non-extern (section-relative): r_symbolnum is 1-based section ordinal.
         let sec_ord = reloc.r_symbolnum as usize;
@@ -6869,12 +6860,12 @@ fn resolve_compact_unwind_addr(
         // the target section. Map the section-local offset
         // through the relax deltas so compacted atoms land
         // on their output positions.
-        return Some(section_local_vm(
+        Some(section_local_vm(
             obj,
             sec_idx,
             sec_out,
             addend.wrapping_sub(sec_in),
-        ));
+        ))
     }
 }
 
@@ -6948,7 +6939,7 @@ fn read_uleb128(data: &[u8], pos: &mut usize) -> u64 {
     while *pos < data.len() {
         let b = data[*pos];
         *pos += 1;
-        val |= ((b & 0x7F) as u64) << shift;
+        val |= u64::from(b & 0x7F) << shift;
         shift += 7;
         if b & 0x80 == 0 {
             break;
@@ -6981,7 +6972,7 @@ fn read_pcrel(data: &[u8], pos: usize, size: usize, field_vm_addr: u64) -> u64 {
         None => return 0,
     };
     let delta = match size {
-        4 => i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) as i64,
+        4 => i64::from(i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]))),
         8 => i64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
         _ => return 0,
     };
@@ -7092,17 +7083,16 @@ fn parse_cie_aug(data: &[u8], cie_pos: usize, eh_frame_vm_addr: u64) -> CieAugIn
                             && !(target_vm >= 0x1_0000_0000
                                 && (target_vm - 0x1_0000_0000) < (1u64 << 31))
                         {
-                            if std::env::var_os("WILD_STRICT_PERSONALITY").is_some() {
-                                panic!(
-                                    "parse_cie_aug: CIE personality resolves to \
-                                     {target_vm:#x}, outside the expected __got / \
-                                     __TEXT window — reloc scan likely missed the \
-                                     CIE POINTER_TO_GOT. Set
-                                     WILD_STRICT_PERSONALITY=1 to debug; the fix \
-                                     is in MachO::load_object_section_relocations \
-                                     (`is_eh_frame` branch)."
-                                );
-                            }
+                            assert!(
+                                std::env::var_os("WILD_STRICT_PERSONALITY").is_none(),
+                                "parse_cie_aug: CIE personality resolves to \
+                                 {target_vm:#x}, outside the expected __got / \
+                                 __TEXT window — reloc scan likely missed the \
+                                 CIE POINTER_TO_GOT. Set
+                                 WILD_STRICT_PERSONALITY=1 to debug; the fix \
+                                 is in MachO::load_object_section_relocations \
+                                 (`is_eh_frame` branch)."
+                            );
                             static WARNED: std::sync::Once = std::sync::Once::new();
                             WARNED.call_once(|| {
                                 eprintln!(
@@ -7192,7 +7182,7 @@ fn scan_eh_frame_fde_offsets(
             // FDE: resolve CIE, then extract pc_begin, LSDA.
             // cie_id = byte distance from the cie_ptr field to the CIE.
             let cie_ptr_field_off = pos + 4;
-            let cie_off = (cie_ptr_field_off as u64).wrapping_sub(prefix.cie_id as u64) as u32;
+            let cie_off = (cie_ptr_field_off as u64).wrapping_sub(u64::from(prefix.cie_id)) as u32;
             let cie_aug = cie_map.get(&cie_off).cloned().unwrap_or_default();
             let ptr_size = cie_aug.fde_ptr_size.max(4) as usize;
 
@@ -7350,10 +7340,11 @@ fn build_unwind_info_section(
 
     // Also collect personalities from compact_unwind entries.
     for e in plain_entries {
-        if let Some(got) = e.personality_got {
-            if is_plausible_got_vm(got) && !personalities.contains(&got) {
-                personalities.push(got);
-            }
+        if let Some(got) = e.personality_got
+            && is_plausible_got_vm(got)
+            && !personalities.contains(&got)
+        {
+            personalities.push(got);
         }
     }
 
@@ -7370,11 +7361,11 @@ fn build_unwind_info_section(
         }
         let mut enc = e.encoding;
         // Set personality index in encoding bits [29:28]
-        if let Some(got) = e.personality_got {
-            if let Some(pos) = personalities.iter().position(|&g| g == got) {
-                let pers_idx = (pos + 1) as u32;
-                enc = (enc & !(0x3 << 28)) | ((pers_idx & 3) << 28);
-            }
+        if let Some(got) = e.personality_got
+            && let Some(pos) = personalities.iter().position(|&g| g == got)
+        {
+            let pers_idx = (pos + 1) as u32;
+            enc = (enc & !(0x3 << 28)) | ((pers_idx & 3) << 28);
         }
         // Set UNWIND_HAS_LSDA flag and record LSDA descriptor
         if let Some(lsda) = e.lsda_addr {
@@ -7672,7 +7663,7 @@ fn build_unwind_info_section(
             wu16!(sl_off + 4, COMPRESSED_PAGE_HEADER_BYTES as u16); // entryPageOffset
             wu16!(sl_off + 6, n); // entryCount
             let encodings_page_off =
-                COMPRESSED_PAGE_HEADER_BYTES + n as u32 * COMPRESSED_ENTRY_BYTES;
+                COMPRESSED_PAGE_HEADER_BYTES + u32::from(n) * COMPRESSED_ENTRY_BYTES;
             wu16!(sl_off + 8, encodings_page_off as u16); // encodingsPageOffset
             wu16!(sl_off + 10, enc_count); // encodingsCount (deduplicated)
 
@@ -7707,7 +7698,7 @@ fn build_unwind_info_section(
 
     // Sentinel first-level index entry
     let (last_fa, last_fs, _) = *all_entries.last().unwrap();
-    let sentinel_fn_off = (last_fa - text_base + last_fs as u64) as u32;
+    let sentinel_fn_off = (last_fa - text_base + u64::from(last_fs)) as u32;
     let sie = idx_off as usize + num_pages * 12;
     wu32!(sie, sentinel_fn_off);
     wu32!(sie + 4, 0u32); // secondLevelPagesSectionOffset = 0 (sentinel)
@@ -7797,7 +7788,7 @@ fn write_headers(
     layout: &Layout<'_, MachO>,
     mappings: &[SegmentMapping],
     chained_fixups_data_size: u32,
-    unwind_info_vm_addr: u64,
+    _unwind_info_vm_addr: u64,
     unwind_info_size: u64,
     sectcreate_placements: &[([u8; 16], [u8; 16], u64, u64)],
     init_offsets_vm_addr: u64,
@@ -7855,13 +7846,13 @@ fn write_headers(
                     for (sec_idx, _) in obj.sections.iter().enumerate() {
                         if let Some(s) = obj.object.sections.get(sec_idx) {
                             let name = crate::macho::trim_nul(s.sectname());
-                            if name == b".rustc" {
-                                if let Some(addr) = obj.section_resolutions[sec_idx].address() {
-                                    if rustc_addr == 0 || addr < rustc_addr {
-                                        rustc_addr = addr;
-                                    }
-                                    rustc_size += s.size(le);
+                            if name == b".rustc"
+                                && let Some(addr) = obj.section_resolutions[sec_idx].address()
+                            {
+                                if rustc_addr == 0 || addr < rustc_addr {
+                                    rustc_addr = addr;
                                 }
+                                rustc_size += s.size(le);
                             }
                         }
                     }
@@ -8011,7 +8002,7 @@ fn write_headers(
             // output, so clamp to a minimum of 2 (2^2=4) when the section
             // type is S_SYMBOL_STUBS.
             const STUBS_MIN_ALIGN_EXP: u32 = 2; // 2^2 = 4 bytes
-            let mut align = sec_layout.alignment.exponent as u32;
+            let mut align = u32::from(sec_layout.alignment.exponent);
             if (info.flags & SECTION_TYPE_MASK) == S_SYMBOL_STUBS && align < STUBS_MIN_ALIGN_EXP {
                 align = STUBS_MIN_ALIGN_EXP;
             }
@@ -8223,8 +8214,7 @@ fn write_headers(
         .args
         .umbrella
         .as_ref()
-        .map(|u| align8(12 + u.len() as u32 + 1))
-        .unwrap_or(0);
+        .map_or(0, |u| align8(12 + u.len() as u32 + 1));
     if umbrella_cmd_size > 0 {
         add_cmd(&mut ncmds, &mut cmdsize, umbrella_cmd_size); // LC_SUB_FRAMEWORK
     }
@@ -8242,15 +8232,14 @@ fn write_headers(
                 if res.is_none() {
                     // Unresolved — check if it's a dylib symbol.
                     let sym_id = crate::symbol_db::SymbolId::from_usize(sym_idx);
-                    if let Ok(name) = layout.symbol_db.symbol_name(sym_id) {
-                        if let Some(&idx) = layout
+                    if let Ok(name) = layout.symbol_db.symbol_name(sym_id)
+                        && let Some(&idx) = layout
                             .symbol_db
                             .args
                             .dylib_symbol_provenance
                             .get(name.bytes())
-                        {
-                            used_indices.insert(idx);
-                        }
+                    {
+                        used_indices.insert(idx);
                     }
                 }
             }
@@ -8591,7 +8580,7 @@ fn write_headers(
         )
     };
     let cf_offset = last_file_end;
-    let cf_size = chained_fixups_data_size as u64;
+    let cf_size = u64::from(chained_fixups_data_size);
 
     // LINKEDIT vmsize must cover the full content (fixups + symtab + exports).
     let linkedit_vmsize = align_to(
@@ -9045,7 +9034,7 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
             }
 
             // Process symbols: add to output symbol table.
-            for sym_idx in 0..n_input_syms {
+            for (sym_idx, remap_slot) in sym_remap.iter_mut().enumerate().take(n_input_syms) {
                 let Ok(sym) = obj.object.symbols.symbol(object::SymbolIndex(sym_idx)) else {
                     continue;
                 };
@@ -9076,12 +9065,12 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
                     sym.n_value(le)
                 };
                 let out_idx = symbols.len() as u32;
-                sym_remap[sym_idx] = out_idx;
+                *remap_slot = out_idx;
                 symbols.push(OutSym {
                     name,
                     n_type,
                     n_sect: n_sect_out,
-                    n_desc: sym.n_desc(le) as u16,
+                    n_desc: sym.n_desc(le),
                     n_value,
                 });
             }
@@ -9122,7 +9111,7 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
                             && sec_ord - 1 < sec_remap.len()
                             && sec_remap[sec_ord - 1] > 0
                         {
-                            sec_remap[sec_ord - 1] as u32
+                            u32::from(sec_remap[sec_ord - 1])
                         } else {
                             ri.r_symbolnum
                         }
@@ -9134,9 +9123,9 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
                     let word0 = ri.r_address.wrapping_add(addr_adjust);
                     let word1: u32 = (new_symbolnum & 0x00FF_FFFF)
                         | (if ri.r_pcrel { 1 << 24 } else { 0 })
-                        | ((ri.r_length as u32 & 3) << 25)
+                        | ((u32::from(ri.r_length) & 3) << 25)
                         | (if ri.r_extern { 1 << 27 } else { 0 })
-                        | ((ri.r_type as u32 & 0xF) << 28);
+                        | ((u32::from(ri.r_type) & 0xF) << 28);
                     let mut entry = [0u8; 8];
                     entry[0..4].copy_from_slice(&word0.to_le_bytes());
                     entry[4..8].copy_from_slice(&word1.to_le_bytes());
@@ -9149,7 +9138,7 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
     if sections.is_empty() {
         // Nothing to output
         let output_path = layout.symbol_db.args.output();
-        std::fs::write(output_path.as_ref(), &[])
+        std::fs::write(output_path.as_ref(), [])
             .map_err(|e| crate::error!("Failed to write: {e}"))?;
         return Ok(());
     }
@@ -9284,17 +9273,17 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
     let seg_vmsize = sections
         .iter()
         .enumerate()
-        .map(|(i, s)| sec_offsets[i] as u64 - sec_offsets[0] as u64 + s.data.len() as u64)
+        .map(|(i, s)| u64::from(sec_offsets[i]) - u64::from(sec_offsets[0]) + s.data.len() as u64)
         .max()
         .unwrap_or(0);
     buf[pos..pos + 8].copy_from_slice(&0u64.to_le_bytes()); // vmaddr
     pos += 8;
     buf[pos..pos + 8].copy_from_slice(&seg_vmsize.to_le_bytes()); // vmsize
     pos += 8;
-    buf[pos..pos + 8].copy_from_slice(&(sec_offsets[0] as u64).to_le_bytes()); // fileoff
+    buf[pos..pos + 8].copy_from_slice(&u64::from(sec_offsets[0]).to_le_bytes()); // fileoff
     pos += 8;
     buf[pos..pos + 8]
-        .copy_from_slice(&(section_offset as u64 - sec_offsets[0] as u64).to_le_bytes()); // filesize
+        .copy_from_slice(&(u64::from(section_offset) - u64::from(sec_offsets[0])).to_le_bytes()); // filesize
     pos += 8;
     w(&mut buf, &mut pos, 7); // maxprot: rwx
     w(&mut buf, &mut pos, 7); // initprot: rwx
@@ -9308,7 +9297,7 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
         buf[pos..pos + 16].copy_from_slice(&sec.segname);
         pos += 16;
         buf[pos..pos + 8]
-            .copy_from_slice(&((sec_offsets[i] - sec_offsets[0]) as u64).to_le_bytes()); // addr (section-relative)
+            .copy_from_slice(&u64::from(sec_offsets[i] - sec_offsets[0]).to_le_bytes()); // addr (section-relative)
         pos += 8;
         buf[pos..pos + 8].copy_from_slice(&(sec.data.len() as u64).to_le_bytes()); // size
         pos += 8;
@@ -9401,13 +9390,15 @@ fn write_relocatable_object(layout: &Layout<'_, MachO>) -> Result {
 ///
 /// # Chained fixups invariants
 /// - Page start offsets are within a page (< page_size)
+///
 /// Debug-only: every symbol whose flags include `ValueFlags::GOT`
 /// must have a `got_address` in its resolution. A mismatch means
 /// some reloc-scan pass set the flag but the GOT slot allocator
 /// never ran for this symbol — any later POINTER_TO_GOT against
 /// it will silently corrupt the output. Cheap linear walk.
-#[cfg(debug_assertions)]
+///
 /// See function body for details.
+#[cfg(debug_assertions)]
 ///
 /// **Complexity:** 𝒪(n) CPU (one pass over all symbol resolutions); 𝒪(1) memory.
 fn validate_got_flag_consistency(layout: &Layout<'_, MachO>) -> Result {
@@ -9418,11 +9409,10 @@ fn validate_got_flag_consistency(layout: &Layout<'_, MachO>) -> Result {
         let sym_id = SymbolId::from_usize(idx);
         let flags = layout.flags_for_symbol(sym_id);
         if flags.contains(ValueFlags::GOT) && res.format_specific.got_address.is_none() {
-            let name = layout
-                .symbol_db
-                .symbol_name(sym_id)
-                .map(|n| String::from_utf8_lossy(n.bytes()).into_owned())
-                .unwrap_or_else(|_| format!("#{idx}"));
+            let name = layout.symbol_db.symbol_name(sym_id).map_or_else(
+                |_| format!("#{idx}"),
+                |n| String::from_utf8_lossy(n.bytes()).into_owned(),
+            );
             crate::bail!(
                 "layout invariant: symbol `{name}` (id {idx}) has \
                  ValueFlags::GOT but no got_address was allocated. \
@@ -9458,7 +9448,7 @@ fn validate_no_references_into_dormant_atoms(layout: &Layout<'_, MachO>) -> Resu
             let FileLayout::Object(obj) = file_layout else {
                 continue;
             };
-            for (sec_idx, tracking) in obj.subsection_tracking.iter() {
+            for (sec_idx, tracking) in &obj.subsection_tracking {
                 let Some(input_section) = obj.object.sections.get(*sec_idx) else {
                     continue;
                 };
@@ -9498,10 +9488,10 @@ fn validate_no_references_into_dormant_atoms(layout: &Layout<'_, MachO>) -> Resu
                     }
                     let flags = layout.flags_for_symbol(global_id);
                     if flags.has_resolution() {
-                        let name = sym
-                            .name(le, obj.object.symbols.strings())
-                            .map(|n| String::from_utf8_lossy(n).into_owned())
-                            .unwrap_or_else(|_| format!("sym#{sym_idx}"));
+                        let name = sym.name(le, obj.object.symbols.strings()).map_or_else(
+                            |_| format!("sym#{sym_idx}"),
+                            |n| String::from_utf8_lossy(n).into_owned(),
+                        );
                         let sectname = String::from_utf8_lossy(crate::macho::trim_nul(
                             input_section.sectname(),
                         ))
@@ -9583,7 +9573,7 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
 
                     let sec_addr = sec.addr(le);
                     let sec_size = sec.size(le);
-                    let sec_offset = sec.offset(le) as u64;
+                    let sec_offset = u64::from(sec.offset(le));
                     let sec_align = sec.align(le);
 
                     // Section addr within segment
@@ -9601,16 +9591,19 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
                     // Section file offset within segment
                     let sec_type = sec.flags(le) & 0xFF;
                     let is_zerofill = sec_type == 0x01 || sec_type == 0x0C;
-                    if sec_size > 0 && !is_zerofill && sec_offset > 0 && file_size > 0 {
-                        if sec_offset < file_off || sec_offset + sec_size > file_off + file_size {
-                            crate::bail!(
-                                "validate: section {segname_str},{sect_name} file range \
+                    if sec_size > 0
+                        && !is_zerofill
+                        && sec_offset > 0
+                        && file_size > 0
+                        && (sec_offset < file_off || sec_offset + sec_size > file_off + file_size)
+                    {
+                        crate::bail!(
+                            "validate: section {segname_str},{sect_name} file range \
                                  [{sec_offset:#x}..{:#x}) outside segment \
                                  [{file_off:#x}..{:#x})",
-                                sec_offset + sec_size,
-                                file_off + file_size
-                            );
-                        }
+                            sec_offset + sec_size,
+                            file_off + file_size
+                        );
                     }
 
                     // Section alignment
@@ -9639,101 +9632,96 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
         }
 
         // Check TLS invariants for __thread_vars descriptors.
-        if let Ok(Some((seg, seg_data))) = cmd.segment_64() {
-            if crate::macho::trim_nul(&seg.segname) == b"__DATA" {
-                if let Ok(sections) = seg.sections(le, seg_data) {
-                    let mut tdata_start = 0u64;
-                    let mut tdata_size = 0u64;
-                    let mut tbss_start = 0u64;
-                    let mut tbss_size = 0u64;
-                    let mut tvars_foff = 0usize;
-                    let mut tvars_count = 0usize;
-                    for sec in sections {
-                        let sec_type = sec.flags(le) & 0xFF;
-                        let addr = sec.addr(le);
-                        let size = sec.size(le);
-                        match sec_type {
-                            0x11 => {
-                                tdata_start = addr;
-                                tdata_size = size;
-                            }
-                            0x12 => {
-                                tbss_start = addr;
-                                tbss_size = size;
-                            }
-                            0x13 => {
-                                tvars_foff = sec.offset(le) as usize;
-                                tvars_count = size as usize / 24;
-                            }
-                            _ => {}
-                        }
+        if let Ok(Some((seg, seg_data))) = cmd.segment_64()
+            && crate::macho::trim_nul(&seg.segname) == b"__DATA"
+            && let Ok(sections) = seg.sections(le, seg_data)
+        {
+            let mut tdata_start = 0u64;
+            let mut tdata_size = 0u64;
+            let mut tbss_start = 0u64;
+            let mut tbss_size = 0u64;
+            let mut tvars_foff = 0usize;
+            let mut tvars_count = 0usize;
+            for sec in sections {
+                let sec_type = sec.flags(le) & 0xFF;
+                let addr = sec.addr(le);
+                let size = sec.size(le);
+                match sec_type {
+                    0x11 => {
+                        tdata_start = addr;
+                        tdata_size = size;
                     }
-                    // Match dyld's `findInitialContent`: the per-thread
-                    // span runs from tdata's address to the end of the
-                    // last TLV-template section. Padding between tdata
-                    // and tbss (from alignment) counts toward the span.
-                    // Using `tdata.size + tbss.size` under-reports when
-                    // the section header truncates tdata.size to
-                    // content-end rather than mem_size.
-                    let tls_total = if tbss_size > 0 {
-                        (tbss_start + tbss_size).saturating_sub(tdata_start)
-                    } else {
-                        tdata_size
-                    };
+                    0x12 => {
+                        tbss_start = addr;
+                        tbss_size = size;
+                    }
+                    0x13 => {
+                        tvars_foff = sec.offset(le) as usize;
+                        tvars_count = size as usize / 24;
+                    }
+                    _ => {}
+                }
+            }
+            // Match dyld's `findInitialContent`: the per-thread
+            // span runs from tdata's address to the end of the
+            // last TLV-template section. Padding between tdata
+            // and tbss (from alignment) counts toward the span.
+            // Using `tdata.size + tbss.size` under-reports when
+            // the section header truncates tdata.size to
+            // content-end rather than mem_size.
+            let tls_total = if tbss_size > 0 {
+                (tbss_start + tbss_size).saturating_sub(tdata_start)
+            } else {
+                tdata_size
+            };
 
-                    if tvars_count > 0 && tls_total > 0 {
-                        let mut offsets = Vec::new();
-                        for i in 0..tvars_count {
-                            let base = tvars_foff + i * 24;
-                            if base + 24 > buf.len() {
-                                break;
-                            }
-                            let key =
-                                u64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap());
-                            let offset =
-                                u64::from_le_bytes(buf[base + 16..base + 24].try_into().unwrap());
+            if tvars_count > 0 && tls_total > 0 {
+                let mut offsets = Vec::new();
+                for i in 0..tvars_count {
+                    let base = tvars_foff + i * 24;
+                    if base + 24 > buf.len() {
+                        break;
+                    }
+                    let key = u64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap());
+                    let offset = u64::from_le_bytes(buf[base + 16..base + 24].try_into().unwrap());
 
-                            // Invariant: key must be 0 (dyld manages it at runtime)
-                            if key != 0 {
-                                crate::bail!(
-                                    "validate: TLV descriptor [{i}] key={key:#x} (must be 0)"
-                                );
-                            }
+                    // Invariant: key must be 0 (dyld manages it at runtime)
+                    if key != 0 {
+                        crate::bail!("validate: TLV descriptor [{i}] key={key:#x} (must be 0)");
+                    }
 
-                            // Invariant: offset must not have fixup encoding
-                            // (high bits in 51-63 must be 0)
-                            if (offset >> 51) != 0 {
-                                crate::bail!(
-                                    "validate: TLV descriptor [{i}] offset={offset:#x} \
+                    // Invariant: offset must not have fixup encoding
+                    // (high bits in 51-63 must be 0)
+                    if (offset >> 51) != 0 {
+                        crate::bail!(
+                            "validate: TLV descriptor [{i}] offset={offset:#x} \
                                      has fixup encoding (bits 51+ set)"
-                                );
-                            }
+                        );
+                    }
 
-                            // Invariant: offset must be within TLS block
-                            if offset >= tls_total {
-                                crate::bail!(
-                                    "validate: TLV descriptor [{i}] offset={offset:#x} \
+                    // Invariant: offset must be within TLS block
+                    if offset >= tls_total {
+                        crate::bail!(
+                            "validate: TLV descriptor [{i}] offset={offset:#x} \
                                      exceeds TLS block size {tls_total:#x} \
                                      (tdata @ {tdata_start:#x}+{tdata_size:#x}, \
                                      tbss @ {tbss_start:#x}+{tbss_size:#x})"
-                                );
-                            }
+                        );
+                    }
 
-                            offsets.push(offset);
-                        }
+                    offsets.push(offset);
+                }
 
-                        // Invariant: no two TLV descriptors should share the same offset
-                        // (unless both are zero — which indicates a bug but may not crash)
-                        offsets.sort();
-                        for w in offsets.windows(2) {
-                            if w[0] == w[1] && tvars_count > 1 {
-                                crate::bail!(
-                                    "validate: duplicate TLV offset {:#x} — \
+                // Invariant: no two TLV descriptors should share the same offset
+                // (unless both are zero — which indicates a bug but may not crash)
+                offsets.sort();
+                for w in offsets.windows(2) {
+                    if w[0] == w[1] && tvars_count > 1 {
+                        crate::bail!(
+                            "validate: duplicate TLV offset {:#x} — \
                                      two thread-locals share the same TLS slot",
-                                    w[0]
-                                );
-                            }
-                        }
+                            w[0]
+                        );
                     }
                 }
             }
@@ -9741,10 +9729,10 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
 
         // Check LC_SYMTAB
         if let Ok(Some(symtab)) = cmd.symtab() {
-            let symoff = symtab.symoff.get(le) as u64;
-            let nsyms = symtab.nsyms.get(le) as u64;
-            let stroff = symtab.stroff.get(le) as u64;
-            let strsize = symtab.strsize.get(le) as u64;
+            let symoff = u64::from(symtab.symoff.get(le));
+            let nsyms = u64::from(symtab.nsyms.get(le));
+            let stroff = u64::from(symtab.stroff.get(le));
+            let strsize = u64::from(symtab.strsize.get(le));
             let sym_end = symoff + nsyms * 16;
             if sym_end > file_len {
                 crate::bail!(
@@ -9772,13 +9760,13 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
         // Collect all sections with their address ranges
         let mut section_ranges: Vec<(u64, u64)> = Vec::new(); // (addr, addr+size)
         while let Ok(Some(cmd)) = cmds_sym.next() {
-            if let Ok(Some((seg, seg_data))) = cmd.segment_64() {
-                if let Ok(sections) = seg.sections(le, seg_data) {
-                    for sec in sections {
-                        let addr = sec.addr(le);
-                        let size = sec.size(le);
-                        section_ranges.push((addr, addr + size));
-                    }
+            if let Ok(Some((seg, seg_data))) = cmd.segment_64()
+                && let Ok(sections) = seg.sections(le, seg_data)
+            {
+                for sec in sections {
+                    let addr = sec.addr(le);
+                    let size = sec.size(le);
+                    section_ranges.push((addr, addr + size));
                 }
             }
             if let Ok(Some(symtab)) = cmd.symtab() {
@@ -9821,8 +9809,7 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
                             let name_end = buf[name_start..]
                                 .iter()
                                 .position(|&b| b == 0)
-                                .map(|p| name_start + p)
-                                .unwrap_or(name_start);
+                                .map_or(name_start, |p| name_start + p);
                             String::from_utf8_lossy(&buf[name_start..name_end]).to_string()
                         } else {
                             format!("<sym {i}>")
@@ -9852,7 +9839,7 @@ fn validate_macho_output(buf: &[u8], flat_namespace: bool) -> Result {
                     for sec in sections {
                         let sectname =
                             String::from_utf8_lossy(crate::macho::trim_nul(sec.sectname()));
-                        let sec_offset = sec.offset(le) as u64;
+                        let sec_offset = u64::from(sec.offset(le));
                         let sec_size = sec.size(le);
                         let sec_type = sec.flags(le) & 0xFF;
                         // Skip zerofill sections (no file data)
@@ -9954,7 +9941,7 @@ fn validate_chained_fixups(buf: &[u8]) -> Result {
     let mut cf_off = 0u32;
     let mut cf_size = 0u32;
     let mut seg_table: Vec<(u64, u64)> = Vec::new(); // (vmaddr, fileoff)
-    let image_base: u64;
+
     let mut image_end = 0u64; // highest vmaddr + vmsize
 
     // Scan load commands manually for chained fixups offset.
@@ -9998,7 +9985,7 @@ fn validate_chained_fixups(buf: &[u8]) -> Result {
     // must match it even for oddly-laid-out bundles where __PAGEZERO
     // exists but __TEXT overlaps it at vmaddr 0.
     const PAGEZERO_SIZE: u64 = 0x1_0000_0000;
-    image_base = match text_vmaddr {
+    let image_base: u64 = match text_vmaddr {
         Some(v) if v >= PAGEZERO_SIZE => PAGEZERO_SIZE,
         _ => 0,
     };
@@ -10037,7 +10024,7 @@ fn validate_chained_fixups(buf: &[u8]) -> Result {
         if ss + 22 > cf.len() {
             continue;
         }
-        let page_size = u16::from_le_bytes(cf[ss + 4..ss + 6].try_into().unwrap()) as u64;
+        let page_size = u64::from(u16::from_le_bytes(cf[ss + 4..ss + 6].try_into().unwrap()));
         let segment_offset = u64::from_le_bytes(cf[ss + 8..ss + 16].try_into().unwrap());
         let page_count = u16::from_le_bytes(cf[ss + 20..ss + 22].try_into().unwrap()) as usize;
 
@@ -10055,8 +10042,7 @@ fn validate_chained_fixups(buf: &[u8]) -> Result {
             .iter()
             .filter(|&&(va, _)| va <= entry_vmaddr)
             .max_by_key(|&&(va, _)| va)
-            .map(|&(va, fo)| fo + (entry_vmaddr - va))
-            .unwrap_or(0);
+            .map_or(0, |&(va, fo)| fo + (entry_vmaddr - va));
 
         for p in 0..page_count {
             let ps_pos = ss + 22 + p * 2;
@@ -10067,7 +10053,7 @@ fn validate_chained_fixups(buf: &[u8]) -> Result {
             if ps == 0xFFFF {
                 continue;
             }
-            if ps as u64 >= page_size {
+            if u64::from(ps) >= page_size {
                 crate::bail!(
                     "validate: chained fixup page start {ps:#x} >= page_size {page_size:#x} \
                      (seg {s}, page {p})"
@@ -10177,8 +10163,7 @@ fn validate_no_self_imports(buf: &[u8]) -> Result {
                         let name_end = buf[name_start..]
                             .iter()
                             .position(|&b| b == 0)
-                            .map(|p| name_start + p)
-                            .unwrap_or(name_start);
+                            .map_or(name_start, |p| name_start + p);
                         let name = &buf[name_start..name_end];
                         if !name.is_empty() {
                             defined_syms.insert(name.to_vec());
@@ -10324,7 +10309,6 @@ fn validate_linkedit_alignment(buf: &[u8]) -> Result {
 /// 𝒪(L) memory for the blob list.
 fn validate_linkedit_layout(buf: &[u8]) -> Result {
     use object::read::macho::MachHeader as _;
-    use object::read::macho::Segment as _;
     let le = object::Endianness::Little;
     let header = match object::macho::MachHeader64::<object::Endianness>::parse(buf, 0) {
         Ok(h) => h,
@@ -10337,11 +10321,11 @@ fn validate_linkedit_layout(buf: &[u8]) -> Result {
         .load_commands(le, buf, 0)
         .map_err(|e| crate::error!("validate: bad load commands: {e}"))?;
     while let Ok(Some(cmd)) = cmds.next() {
-        if let Ok(Some((seg, _))) = cmd.segment_64() {
-            if crate::macho::trim_nul(&seg.segname) == b"__LINKEDIT" {
-                linkedit = Some((seg.fileoff.get(le), seg.filesize.get(le)));
-                break;
-            }
+        if let Ok(Some((seg, _))) = cmd.segment_64()
+            && crate::macho::trim_nul(&seg.segname) == b"__LINKEDIT"
+        {
+            linkedit = Some((seg.fileoff.get(le), seg.filesize.get(le)));
+            break;
         }
     }
     let Some((le_off, le_size)) = linkedit else {
@@ -10386,11 +10370,18 @@ fn validate_linkedit_layout(buf: &[u8]) -> Result {
         };
         if cmd_id == 0x2 {
             if cmdsize >= 24 {
-                let symoff = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as u64;
-                let nsyms = u32::from_le_bytes(buf[off + 12..off + 16].try_into().unwrap()) as u64;
-                let stroff = u32::from_le_bytes(buf[off + 16..off + 20].try_into().unwrap()) as u64;
-                let strsize =
-                    u32::from_le_bytes(buf[off + 20..off + 24].try_into().unwrap()) as u64;
+                let symoff = u64::from(u32::from_le_bytes(
+                    buf[off + 8..off + 12].try_into().unwrap(),
+                ));
+                let nsyms = u64::from(u32::from_le_bytes(
+                    buf[off + 12..off + 16].try_into().unwrap(),
+                ));
+                let stroff = u64::from(u32::from_le_bytes(
+                    buf[off + 16..off + 20].try_into().unwrap(),
+                ));
+                let strsize = u64::from(u32::from_le_bytes(
+                    buf[off + 20..off + 24].try_into().unwrap(),
+                ));
                 if nsyms > 0 {
                     blobs.push(("LC_SYMTAB_nlist", symoff, nsyms * 16));
                 }
@@ -10399,8 +10390,12 @@ fn validate_linkedit_layout(buf: &[u8]) -> Result {
                 }
             }
         } else if cmdsize >= 16 {
-            let off_val = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as u64;
-            let size_val = u32::from_le_bytes(buf[off + 12..off + 16].try_into().unwrap()) as u64;
+            let off_val = u64::from(u32::from_le_bytes(
+                buf[off + 8..off + 12].try_into().unwrap(),
+            ));
+            let size_val = u64::from(u32::from_le_bytes(
+                buf[off + 12..off + 16].try_into().unwrap(),
+            ));
             if size_val > 0 {
                 blobs.push((name, off_val, size_val));
             }
@@ -10467,7 +10462,7 @@ fn validate_unwind_info(buf: &[u8]) -> Result {
             if let Ok(sections) = seg.sections(le, seg_data) {
                 for sec in sections {
                     if crate::macho::trim_nul(sec.sectname()) == b"__unwind_info" {
-                        ui = Some((sec.offset(le) as u64, sec.size(le)));
+                        ui = Some((u64::from(sec.offset(le)), sec.size(le)));
                         break;
                     }
                 }
@@ -10510,7 +10505,7 @@ fn validate_unwind_info(buf: &[u8]) -> Result {
             u16::from_le_bytes(ui_buf[page_off + 4..page_off + 6].try_into().unwrap()) as usize;
         let entry_count =
             u16::from_le_bytes(ui_buf[page_off + 6..page_off + 8].try_into().unwrap()) as usize;
-        let encodings_page_off =
+        let _encodings_page_off =
             u16::from_le_bytes(ui_buf[page_off + 8..page_off + 10].try_into().unwrap()) as usize;
         let encodings_count =
             u16::from_le_bytes(ui_buf[page_off + 10..page_off + 12].try_into().unwrap()) as usize;
@@ -10578,11 +10573,11 @@ fn validate_compat_datasplit(buf: &[u8]) -> Result {
         .load_commands(le, buf, 0)
         .map_err(|e| crate::error!("validate: bad load commands: {e}"))?;
     while let Ok(Some(cmd)) = cmds.next() {
-        if let Ok(Some((seg, _))) = cmd.segment_64() {
-            if crate::macho::trim_nul(&seg.segname) == b"__DATA_CONST" {
-                data_const = Some((seg.vmaddr.get(le), seg.vmsize.get(le)));
-                break;
-            }
+        if let Ok(Some((seg, _))) = cmd.segment_64()
+            && crate::macho::trim_nul(&seg.segname) == b"__DATA_CONST"
+        {
+            data_const = Some((seg.vmaddr.get(le), seg.vmsize.get(le)));
+            break;
         }
     }
     let Some((dc_start, dc_size)) = data_const else {
@@ -10600,25 +10595,25 @@ fn validate_compat_datasplit(buf: &[u8]) -> Result {
         .load_commands(le, buf, 0)
         .map_err(|e| crate::error!("validate: bad load commands: {e}"))?;
     while let Ok(Some(cmd)) = cmds.next() {
-        if let Ok(Some((seg, seg_data))) = cmd.segment_64() {
-            if let Ok(sections) = seg.sections(le, seg_data) {
-                for sec in sections {
-                    let sec_segname = crate::macho::trim_nul(&sec.segname);
-                    if sec_segname != b"__DATA_CONST" {
-                        continue;
-                    }
-                    let addr = sec.addr(le);
-                    let size = sec.size(le);
-                    if size == 0 {
-                        continue;
-                    }
-                    if addr < dc_start || addr + size > dc_end {
-                        let sn = String::from_utf8_lossy(crate::macho::trim_nul(sec.sectname()));
-                        crate::bail!(
-                            "validate: section __DATA_CONST,{sn} addr {addr:#x}+{size:#x} \
+        if let Ok(Some((seg, seg_data))) = cmd.segment_64()
+            && let Ok(sections) = seg.sections(le, seg_data)
+        {
+            for sec in sections {
+                let sec_segname = crate::macho::trim_nul(&sec.segname);
+                if sec_segname != b"__DATA_CONST" {
+                    continue;
+                }
+                let addr = sec.addr(le);
+                let size = sec.size(le);
+                if size == 0 {
+                    continue;
+                }
+                if addr < dc_start || addr + size > dc_end {
+                    let sn = String::from_utf8_lossy(crate::macho::trim_nul(sec.sectname()));
+                    crate::bail!(
+                        "validate: section __DATA_CONST,{sn} addr {addr:#x}+{size:#x} \
                              escapes __DATA_CONST segment [{dc_start:#x}..{dc_end:#x})"
-                        );
-                    }
+                    );
                 }
             }
         }
@@ -10672,7 +10667,8 @@ fn validate_eh_frame_consistency(buf: &[u8]) -> Result {
                     let sn = crate::macho::trim_nul(sec.sectname());
                     match sn {
                         b"__eh_frame" => {
-                            eh_frame = Some((sec.addr(le), sec.offset(le) as u64, sec.size(le)));
+                            eh_frame =
+                                Some((sec.addr(le), u64::from(sec.offset(le)), sec.size(le)));
                         }
                         b"__gcc_except_tab" => {
                             except_tab = Some((sec.addr(le), sec.size(le)));
@@ -10717,7 +10713,7 @@ fn validate_eh_frame_consistency(buf: &[u8]) -> Result {
                 // return-address register all decoded without error).
             }
             gimli::CieOrFde::Fde(partial) => {
-                let fde_section_offset = partial.offset() as usize;
+                let fde_section_offset = partial.offset();
                 // Check 2: FDE references a valid CIE.
                 let fde = match partial.parse(|_, _, off| section.cie_from_offset(&bases, off)) {
                     Ok(f) => f,
@@ -10745,36 +10741,33 @@ fn validate_eh_frame_consistency(buf: &[u8]) -> Result {
                 }
 
                 // Check 4: LSDA inside __gcc_except_tab.
-                if let Some(gimli::Pointer::Direct(lsda)) = fde.lsda() {
-                    if lsda != 0 {
-                        if let Some((et_vm, et_size)) = except_tab {
-                            if lsda < et_vm || lsda >= et_vm + et_size {
-                                let signed_distance = lsda as i64 - et_vm as i64;
-                                crate::bail!(
-                                    "validate: __eh_frame FDE at {fde_section_offset:#x}: \
+                if let Some(gimli::Pointer::Direct(lsda)) = fde.lsda()
+                    && lsda != 0
+                    && let Some((et_vm, et_size)) = except_tab
+                    && (lsda < et_vm || lsda >= et_vm + et_size)
+                {
+                    let signed_distance = lsda as i64 - et_vm as i64;
+                    crate::bail!(
+                        "validate: __eh_frame FDE at {fde_section_offset:#x}: \
                                      LSDA {lsda:#x} outside __gcc_except_tab \
                                      [{et_vm:#x}..{end:#x}) (off by {signed_distance})",
-                                    end = et_vm + et_size
-                                );
-                            }
-                        }
-                    }
+                        end = et_vm + et_size
+                    );
                 }
 
                 // Check 5: Personality inside __got or __TEXT.
                 if let Some((_, gimli::Pointer::Direct(pers)))
                 | Some((_, gimli::Pointer::Indirect(pers))) =
                     fde.cie().personality_with_encoding()
+                    && pers != 0
                 {
-                    if pers != 0 {
-                        let in_got = got.map_or(false, |(gv, gs)| pers >= gv && pers < gv + gs);
-                        let in_text = pers >= text_vm && pers < text_vm + text_vmsize;
-                        if !in_got && !in_text {
-                            crate::bail!(
-                                "validate: __eh_frame CIE personality {pers:#x} not in \
+                    let in_got = got.is_some_and(|(gv, gs)| pers >= gv && pers < gv + gs);
+                    let in_text = pers >= text_vm && pers < text_vm + text_vmsize;
+                    if !in_got && !in_text {
+                        crate::bail!(
+                            "validate: __eh_frame CIE personality {pers:#x} not in \
                                  __got or __TEXT"
-                            );
-                        }
+                        );
                     }
                 }
 
@@ -10820,7 +10813,7 @@ fn validate_eh_frame_consistency(buf: &[u8]) -> Result {
 /// 𝒪(1) extra memory (reads `fde_by_offset` in-place).
 fn validate_unwind_fde_xref(
     buf: &[u8],
-    ef_vm: u64,
+    _ef_vm: u64,
     ef_size: u64,
     text_base: u64,
     fde_by_offset: &std::collections::HashMap<usize, u64>,
@@ -10839,14 +10832,13 @@ fn validate_unwind_fde_xref(
         .load_commands(le, buf, 0)
         .map_err(|e| crate::error!("validate: bad load commands: {e}"))?;
     while let Ok(Some(cmd)) = cmds.next() {
-        if let Ok(Some((seg, seg_data))) = cmd.segment_64() {
-            if crate::macho::trim_nul(&seg.segname) == b"__TEXT" {
-                if let Ok(sections) = seg.sections(le, seg_data) {
-                    for sec in sections {
-                        if crate::macho::trim_nul(sec.sectname()) == b"__unwind_info" {
-                            ui_bounds = Some((sec.offset(le) as usize, sec.size(le) as usize));
-                        }
-                    }
+        if let Ok(Some((seg, seg_data))) = cmd.segment_64()
+            && crate::macho::trim_nul(&seg.segname) == b"__TEXT"
+            && let Ok(sections) = seg.sections(le, seg_data)
+        {
+            for sec in sections {
+                if crate::macho::trim_nul(sec.sectname()) == b"__unwind_info" {
+                    ui_bounds = Some((sec.offset(le) as usize, sec.size(le) as usize));
                 }
             }
         }
@@ -10922,15 +10914,15 @@ fn validate_unwind_fde_xref(
                      {fde_off:#x} >= __eh_frame size {ef_size:#x}"
                 );
             }
-            let expected_fn_vm = text_base + first_fn_off as u64 + fn_off as u64;
-            if let Some(&actual_fn_vm) = fde_by_offset.get(&fde_off) {
-                if actual_fn_vm != expected_fn_vm {
-                    crate::bail!(
-                        "validate: __unwind_info page {page} entry {j}: DWARF FDE at \
+            let expected_fn_vm = text_base + u64::from(first_fn_off) + u64::from(fn_off);
+            if let Some(&actual_fn_vm) = fde_by_offset.get(&fde_off)
+                && actual_fn_vm != expected_fn_vm
+            {
+                crate::bail!(
+                    "validate: __unwind_info page {page} entry {j}: DWARF FDE at \
                          __eh_frame+{fde_off:#x} has pc_begin={actual_fn_vm:#x} but \
                          compact_unwind says func={expected_fn_vm:#x}"
-                    );
-                }
+                );
             }
         }
     }

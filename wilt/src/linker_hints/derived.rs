@@ -215,7 +215,7 @@ fn scan_purity(body: &[u8], num_imports: u32) -> PurityFacts {
         callees_defined: Vec::new(),
     };
     let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter.by_ref() {
         let op = body[p];
         if op == 0xFC {
             // Decode the sub-opcode: the trunc_sat family (0..=7) and
@@ -293,12 +293,12 @@ fn collect_global_consts(
         let mutability = p[off + 1];
         off += 2;
         // init expr: single const + end — or anything else (we skip).
-        if mutability == 0 {
-            if let Some((val, next)) = read_single_const(p, off) {
-                out.insert(first_defined_idx + i, val);
-                off = next;
-                continue;
-            }
+        if mutability == 0
+            && let Some((val, next)) = read_single_const(p, off)
+        {
+            out.insert(first_defined_idx + i, val);
+            off = next;
+            continue;
         }
         // Skip init expr up to terminating `end`.
         let Some(end_off) = skip_const_expr(p, off) else {
@@ -499,12 +499,12 @@ fn scan_body_ref_funcs(body: &[u8], out: &mut HashSet<u32>) {
     let Some(start) = opcode::skip_locals(body) else {
         return;
     };
-    let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
-        if body[p] == 0xD2 {
-            if let Some((f, _)) = leb128::read_u32(&body[p + 1..]) {
-                out.insert(f);
-            }
+    let iter = InstrIter::new(body, start);
+    for (p, _) in iter {
+        if body[p] == 0xD2
+            && let Some((f, _)) = leb128::read_u32(&body[p + 1..])
+        {
+            out.insert(f);
         }
     }
 }
@@ -513,15 +513,15 @@ fn scan_body_calls(body: &[u8], num_imports: u32, counts: &mut HashMap<u32, u32>
     let Some(start) = opcode::skip_locals(body) else {
         return;
     };
-    let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
+    let iter = InstrIter::new(body, start);
+    for (p, _) in iter {
         if body[p] != 0x10 {
             continue;
         }
-        if let Some((f, _)) = leb128::read_u32(&body[p + 1..]) {
-            if f >= num_imports {
-                *counts.entry(f).or_insert(0) += 1;
-            }
+        if let Some((f, _)) = leb128::read_u32(&body[p + 1..])
+            && f >= num_imports
+        {
+            *counts.entry(f).or_insert(0) += 1;
         }
     }
 }
@@ -530,8 +530,8 @@ fn scan_body_global_reads(body: &[u8], out: &mut HashSet<u32>) {
     let Some(start) = opcode::skip_locals(body) else {
         return;
     };
-    let mut iter = InstrIter::new(body, start);
-    while let Some((p, _)) = iter.next() {
+    let iter = InstrIter::new(body, start);
+    for (p, _) in iter {
         if body[p] == 0x23 {
             // global.get
             if let Some((g, _)) = leb128::read_u32(&body[p + 1..]) {
@@ -631,10 +631,10 @@ fn scan_const_expr_for_ref_func(
     while off < payload.len() {
         let len = opcode::instr_len(payload, off)?;
         let op = payload[off];
-        if op == 0xD2 {
-            if let Some((f, _)) = leb128::read_u32(&payload[off + 1..]) {
-                out.insert(f);
-            }
+        if op == 0xD2
+            && let Some((f, _)) = leb128::read_u32(&payload[off + 1..])
+        {
+            out.insert(f);
         }
         if op == 0x0B {
             return Some(off + 1);

@@ -47,10 +47,11 @@ fn binaryen_sample() -> Option<Vec<u8>> {
         if entry.extension().and_then(|s| s.to_str()) != Some("wasm") {
             continue;
         }
-        if let Ok(b) = std::fs::read(&entry) {
-            if WasmModule::parse(&b).is_ok() && b.len() > 500 {
-                return Some(b);
-            }
+        if let Ok(b) = std::fs::read(&entry)
+            && WasmModule::parse(&b).is_ok()
+            && b.len() > 500
+        {
+            return Some(b);
         }
     }
     None

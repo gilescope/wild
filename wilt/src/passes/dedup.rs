@@ -92,10 +92,10 @@ fn collect_ref_func_targets(module: &WasmModule<'_>) -> HashSet<u32> {
             continue;
         };
         for (p, _) in instrs {
-            if b[p] == opcode::OP_REF_FUNC {
-                if let Some((t, _)) = leb128::read_u32(&b[p + 1..]) {
-                    set.insert(t);
-                }
+            if b[p] == opcode::OP_REF_FUNC
+                && let Some((t, _)) = leb128::read_u32(&b[p + 1..])
+            {
+                set.insert(t);
             }
         }
     }

@@ -68,20 +68,17 @@ fn rewrite_body_with_edits(
     let mut to_remove: Vec<(usize, usize)> = Vec::new();
 
     let mut w = BlockWalker::with_resolver(body, instrs_start, frames, Some(sigs));
-    while let Some(step) = w.next() {
+    for step in w.by_ref() {
         if step.op == 0x0B {
             // end — check if prev was a removable `br 0`.
-            if let (Some((0x0C, pp, plen, psd, preach)), Some(frame)) = (prev, step.closed_frame) {
-                if preach
-                    && !matches!(frame.kind, BlockKind::Loop)
-                    && psd == frame.entry_depth + frame.fallthrough_arity as i32
-                {
-                    if let Some((label, _)) = leb128::read_u32(&body[pp + 1..]) {
-                        if label == 0 {
-                            to_remove.push((pp, plen));
-                        }
-                    }
-                }
+            if let (Some((0x0C, pp, plen, psd, preach)), Some(frame)) = (prev, step.closed_frame)
+                && preach
+                && !matches!(frame.kind, BlockKind::Loop)
+                && psd == frame.entry_depth + frame.fallthrough_arity as i32
+                && let Some((label, _)) = leb128::read_u32(&body[pp + 1..])
+                && label == 0
+            {
+                to_remove.push((pp, plen));
             }
         }
         prev = Some((

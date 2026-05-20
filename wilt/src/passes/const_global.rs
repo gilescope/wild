@@ -39,9 +39,9 @@ pub fn apply_mut_with_hints(m: &mut MutModule<'_>, hints: Option<&dyn LinkerHint
 
 fn rewrite_body(body: &[u8], hints: &dyn LinkerHints) -> Option<Vec<u8>> {
     let start = opc::skip_locals(body)?;
-    let mut iter = InstrIter::new(body, start);
+    let iter = InstrIter::new(body, start);
     let mut rewrites: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter {
         if body[p] != OP_GLOBAL_GET {
             continue;
         }

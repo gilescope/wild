@@ -130,6 +130,7 @@ impl LayoutSnapshot {
         self.sections.len()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.sections.is_empty()
     }
@@ -337,7 +338,7 @@ impl LayoutSnapshot {
         if bytes.len() < size_of::<Header>() {
             return None;
         }
-        if bytes.as_ptr() as usize % REQUIRED_ALIGN != 0 {
+        if !(bytes.as_ptr() as usize).is_multiple_of(REQUIRED_ALIGN) {
             return None;
         }
         let header = unsafe { &*(bytes.as_ptr() as *const Header) };
@@ -355,7 +356,7 @@ impl LayoutSnapshot {
         if sections_end > bytes.len() {
             return None;
         }
-        if sections_off % std::mem::align_of::<SectionEntry>() != 0 {
+        if !sections_off.is_multiple_of(std::mem::align_of::<SectionEntry>()) {
             return None;
         }
         let names_off = header.names_off as usize;

@@ -623,7 +623,7 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
             FileKind::FatBinary => {
                 // TODO: Extract arm64 slice from universal binary.
                 // For now, skip fat binaries (e.g. libclang_rt.osx.a).
-                return Ok(LoadedFileState::Archive(input_file, Vec::new()));
+                Ok(LoadedFileState::Archive(input_file, Vec::new()))
             }
             FileKind::Archive => process_archive(input_file, &Arc::new(file), self),
             FileKind::ThinArchive => process_thin_archive(input_file, self),

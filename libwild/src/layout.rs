@@ -466,10 +466,9 @@ fn update_dynamic_symbol_resolutions<'data, P: Platform>(
     for (index, sym) in resources.dynamic_symbol_definitions.iter().enumerate() {
         if let Some(dynamic_symbol_index) =
             NonZeroU32::new(epilogue.dynsym_start_index + index as u32)
+            && let Some(res) = &mut resolutions[sym.symbol_id.as_usize()]
         {
-            if let Some(res) = &mut resolutions[sym.symbol_id.as_usize()] {
-                res.dynamic_symbol_index = Some(dynamic_symbol_index);
-            }
+            res.dynamic_symbol_index = Some(dynamic_symbol_index);
         }
     }
 }
@@ -1249,8 +1248,8 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
     /// the object carries `MH_SUBSECTIONS_VIA_SYMBOLS` and the
     /// section is eligible for per-atom GC). Callers use this to
     /// gate the relocation-scan short-circuit in platform code.
-    pub(crate) fn subsection_tracking_has(&self, section_index: &usize) -> bool {
-        self.subsection_tracking.contains_key(section_index)
+    pub(crate) fn subsection_tracking_has(&self, section_index: usize) -> bool {
+        self.subsection_tracking.contains_key(&section_index)
     }
 }
 
@@ -1627,7 +1626,7 @@ impl<'data, P: Platform> Layout<'data, P> {
             let contributors = contributors_map.remove(&id).unwrap_or_default();
             snap.push(crate::layout_snapshot::SnapshotSection {
                 name,
-                alignment: layout.alignment.value() as u64,
+                alignment: layout.alignment.value(),
                 file_offset: layout.file_offset as u64,
                 file_size: layout.file_size as u64,
                 mem_offset: layout.mem_offset,
@@ -3694,12 +3693,11 @@ fn should_emit_undefined_error<P: Platform>(
             }
             // Check if the symbol is provided by a linked dylib (via .tbd parsing).
             let dylib_syms = symbol_db.args.dylib_symbols();
-            if !dylib_syms.is_empty() {
-                if let Ok(name) = symbol_db.symbol_name(symbol_id) {
-                    if dylib_syms.contains(name.bytes()) {
-                        return false;
-                    }
-                }
+            if !dylib_syms.is_empty()
+                && let Ok(name) = symbol_db.symbol_name(symbol_id)
+                && dylib_syms.contains(name.bytes())
+            {
+                return false;
             }
             true
         }
@@ -4104,7 +4102,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         // Atom map for Mach-O subsections-via-symbols sections. Built
         // once at load time; atom scans are driven by subsequent
         // symbol-request-triggered activations below.
-        let atoms = <A::Platform as Platform>::compute_atoms(&self.object, section_index);
+        let atoms = <A::Platform as Platform>::compute_atoms(self.object, section_index);
 
         // `-order_file` reorder: when the order file ranks at least one atom
         // anchor in this section AND the priority-sorted order differs from
@@ -4115,7 +4113,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             None
         } else {
             <A::Platform as Platform>::compute_atom_output_offsets(
-                &self.object,
+                self.object,
                 section_index,
                 &atoms,
                 resources.symbol_db.args.symbol_order(),
@@ -4135,7 +4133,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             // delta (negative = insertion) disambiguates the semantics at
             // query time.
             let subsection_padding = <A::Platform as Platform>::compute_subsection_padding_deltas(
-                &self.object,
+                self.object,
                 section_index,
             );
             if !subsection_padding.is_empty() {
@@ -4472,10 +4470,10 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 continue;
             }
             // Skip symbols in discarded sections (e.g. __compact_unwind).
-            if let Ok(Some(sec_idx)) = self.object.symbol_section(sym, sym_index) {
-                if matches!(self.sections.get(sec_idx.0), Some(SectionSlot::Discard)) {
-                    continue;
-                }
+            if let Ok(Some(sec_idx)) = self.object.symbol_section(sym, sym_index)
+                && matches!(self.sections.get(sec_idx.0), Some(SectionSlot::Discard))
+            {
+                continue;
             }
             let symbol_id = self.symbol_id_range().input_to_id(sym_index);
             let old_flags = resources

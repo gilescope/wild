@@ -204,10 +204,10 @@ fn collect_debug_sections(
             }
             (Some(sh), ".debug_info") => {
                 let abbrev = collect_named_section(m, ".debug_abbrev");
-                if let Some(abbrev_bytes) = abbrev {
-                    if let Some(patched) = patch_debug_info(body, &abbrev_bytes, sh) {
-                        sections.push((name.to_string(), patched));
-                    }
+                if let Some(abbrev_bytes) = abbrev
+                    && let Some(patched) = patch_debug_info(body, &abbrev_bytes, sh)
+                {
+                    sections.push((name.to_string(), patched));
                 }
             }
             (Some(sh), ".debug_rnglists") => {
@@ -243,7 +243,7 @@ fn collect_debug_sections(
 ///
 /// For wasm (32-bit addresses), each entry is 8 bytes.
 fn patch_debug_ranges(body: &[u8], shifts: &[((u32, u32), i64)]) -> Option<Vec<u8>> {
-    if body.len() % 8 != 0 {
+    if !body.len().is_multiple_of(8) {
         return None;
     }
     let mut out = body.to_vec();
@@ -351,6 +351,7 @@ struct AttrSpec {
     form: u64,
     /// `Some(v)` for `DW_FORM_implicit_const` — value lives in the
     /// abbrev rather than the DIE bytes.
+    #[allow(dead_code)]
     implicit_const: Option<i64>,
 }
 
@@ -358,6 +359,7 @@ struct AttrSpec {
 struct Abbrev {
     #[allow(dead_code)]
     tag: u64,
+    #[allow(dead_code)]
     has_children: bool,
     attrs: Vec<AttrSpec>,
 }
@@ -958,7 +960,6 @@ fn patch_debug_aranges(body: &[u8], shifts: &[((u32, u32), i64)]) -> Option<Vec<
             let addr = u32::from_le_bytes(out[t..t + 4].try_into().ok()?);
             let len = u32::from_le_bytes(out[t + 4..t + 8].try_into().ok()?);
             if addr == 0 && len == 0 {
-                t += 8;
                 break;
             }
             let end_addr = addr.saturating_add(len);
@@ -1172,12 +1173,13 @@ mod tests {
         // Abbrev table: one entry, code=1, tag=0x2E (subprogram),
         // no children, attrs=[(low_pc, addr), (high_pc, data4),
         // (0,0)].
-        let mut abbrev = Vec::new();
-        abbrev.push(0x01); // abbrev_code 1
-        abbrev.push(0x2E); // tag = subprogram
-        abbrev.push(0x00); // has_children = no
-        abbrev.push(DW_AT_LOW_PC as u8);
-        abbrev.push(DW_FORM_ADDR as u8);
+        let mut abbrev: Vec<u8> = vec![
+            0x01, // abbrev_code 1
+            0x2E, // tag = subprogram
+            0x00, // has_children = no
+            DW_AT_LOW_PC as u8,
+            DW_FORM_ADDR as u8,
+        ];
         abbrev.push(DW_AT_HIGH_PC as u8);
         abbrev.push(DW_FORM_DATA4 as u8);
         abbrev.push(0);
@@ -1227,12 +1229,7 @@ mod tests {
     #[test]
     fn patch_debug_info_handles_high_pc_as_addr() {
         // Same shape but high_pc is FORM_addr — must shift.
-        let mut abbrev = Vec::new();
-        abbrev.push(0x01);
-        abbrev.push(0x2E);
-        abbrev.push(0x00);
-        abbrev.push(DW_AT_LOW_PC as u8);
-        abbrev.push(DW_FORM_ADDR as u8);
+        let mut abbrev: Vec<u8> = vec![0x01, 0x2E, 0x00, DW_AT_LOW_PC as u8, DW_FORM_ADDR as u8];
         abbrev.push(DW_AT_HIGH_PC as u8);
         abbrev.push(DW_FORM_ADDR as u8);
         abbrev.push(0);
@@ -1315,12 +1312,13 @@ mod tests {
     fn patch_debug_info_handles_dwarf64() {
         // DWARF-64 DWARF-4 CU: 0xFFFFFFFF + u64 length + u16 version
         // + u64 debug_abbrev_offset + u8 address_size + DIEs.
-        let mut abbrev = Vec::new();
-        abbrev.push(0x01);
-        abbrev.push(0x2E); // subprogram tag
-        abbrev.push(0x00); // no children
-        abbrev.push(DW_AT_LOW_PC as u8);
-        abbrev.push(DW_FORM_ADDR as u8);
+        let mut abbrev: Vec<u8> = vec![
+            0x01,
+            0x2E, // subprogram tag
+            0x00, // no children
+            DW_AT_LOW_PC as u8,
+            DW_FORM_ADDR as u8,
+        ];
         abbrev.push(0);
         abbrev.push(0);
         abbrev.push(0);

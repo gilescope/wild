@@ -62,15 +62,15 @@ fn compress_body(body: &[u8]) -> Option<Vec<u8>> {
         match opcode {
             // call funcidx
             0x10 => {
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
             }
             // call_indirect typeidx tableidx
             0x11 => {
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
             }
             // block/loop/if — blocktype
-            0x02 | 0x03 | 0x04 => {
+            0x02..=0x04 => {
                 if pos < body.len() {
                     if body[pos] == 0x40 {
                         // void
@@ -82,13 +82,13 @@ fn compress_body(body: &[u8]) -> Option<Vec<u8>> {
                         pos += 1;
                     } else {
                         // Type index as signed LEB128 — compress it.
-                        compress_sleb(&body, &mut pos, &mut out, &mut compressed);
+                        compress_sleb(body, &mut pos, &mut out, &mut compressed);
                     }
                 }
             }
             // br, br_if
             0x0C | 0x0D => {
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
             }
             // br_table
             0x0E => {
@@ -101,30 +101,30 @@ fn compress_body(body: &[u8]) -> Option<Vec<u8>> {
                     leb128::write_u32(&mut out, count);
                     pos += c;
                     for _ in 0..=count {
-                        compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                        compress_leb(body, &mut pos, &mut out, &mut compressed);
                     }
                 }
             }
             // local.get/set/tee, global.get/set
             0x20..=0x24 => {
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
             }
             // Memory load/store: align + offset
             0x28..=0x3E => {
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
             }
             // memory.size, memory.grow
             0x3F | 0x40 => {
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
             }
             // i32.const (signed LEB128)
             0x41 => {
-                compress_sleb(&body, &mut pos, &mut out, &mut compressed);
+                compress_sleb(body, &mut pos, &mut out, &mut compressed);
             }
             // i64.const (signed LEB128)
             0x42 => {
-                compress_sleb64(&body, &mut pos, &mut out, &mut compressed);
+                compress_sleb64(body, &mut pos, &mut out, &mut compressed);
             }
             // f32.const
             0x43 => {
@@ -144,10 +144,8 @@ fn compress_body(body: &[u8]) -> Option<Vec<u8>> {
             // Read the sub-opcode first (so we know how many further
             // immediates follow), then compress the LEB-encoded operands.
             0xFC => {
-                let Some((sub, _)) = leb128::read_u32(&body[pos..]) else {
-                    return None;
-                };
-                compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                let (sub, _) = leb128::read_u32(&body[pos..])?;
+                compress_leb(body, &mut pos, &mut out, &mut compressed);
                 let leb_immediates: usize = match sub {
                     // i{32,64}.trunc_sat_f{32,64}_{s,u}.
                     0x00..=0x07 => 0,
@@ -166,13 +164,13 @@ fn compress_body(body: &[u8]) -> Option<Vec<u8>> {
                     // table.copy dst src
                     0x0E => 2,
                     // table.grow / table.size / table.fill: tableidx
-                    0x0F | 0x10 | 0x11 => 1,
+                    0x0F..=0x11 => 1,
                     // Unknown sub-opcode — refuse to compress so we don't
                     // silently corrupt the body.
                     _ => return None,
                 };
                 for _ in 0..leb_immediates {
-                    compress_leb(&body, &mut pos, &mut out, &mut compressed);
+                    compress_leb(body, &mut pos, &mut out, &mut compressed);
                 }
             }
             // SIMD (0xFD) and atomics (0xFE) have wildly varying operand

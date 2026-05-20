@@ -101,10 +101,10 @@ pub fn apply_with_remap(module: &mut WasmModule<'_>) -> (Vec<u8>, crate::remap::
 
     // Safety rail: bail on element sections we can't rewrite. DCE's shared
     // emit falls back to verbatim, which here would carry stale indices.
-    if let Some(sec) = module.section(module::SECTION_ELEMENT) {
-        if super::dce::scan_elements_funcidx(sec.payload.slice(data)).is_none() {
-            return (data.to_vec(), crate::remap::FuncRemap::identity(total));
-        }
+    if let Some(sec) = module.section(module::SECTION_ELEMENT)
+        && super::dce::scan_elements_funcidx(sec.payload.slice(data)).is_none()
+    {
+        return (data.to_vec(), crate::remap::FuncRemap::identity(total));
     }
 
     let bytes = emit(

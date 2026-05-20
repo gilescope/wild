@@ -292,6 +292,11 @@ impl Iterator for SymbolIdRangeIterator {
     }
 }
 
+/// New `(key, bytes)` rows that the parsed-input cache should adopt as a
+/// side-effect of reading a group's symbols. Returned alongside
+/// [`SymbolLoadOutputs`] from the group-read path.
+pub(crate) type BundleAdditions = Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)>;
+
 pub(crate) struct SymbolLoadOutputs<'data> {
     /// Pending non-versioned symbols, grouped by hash bucket.
     pending_symbols_by_bucket: Vec<PendingSymbolHashBucket<'data>>,
@@ -1587,14 +1592,14 @@ fn read_symbols<'data, P: Platform>(
         // next link will just re-parse — correctness invariant is "a
         // missing or corrupt bundle MUST NOT prevent the link", so we
         // never fail upward from here.
-        if let Err(e) = bundle_builder.write_to(&bundle_path) {
-            if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some() {
-                eprintln!(
-                    "wild parse-skip: bundle write to {} failed: {}",
-                    bundle_path.display(),
-                    e
-                );
-            }
+        if let Err(e) = bundle_builder.write_to(&bundle_path)
+            && std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+        {
+            eprintln!(
+                "wild parse-skip: bundle write to {} failed: {}",
+                bundle_path.display(),
+                e
+            );
         }
     }
 
@@ -1776,10 +1781,7 @@ fn read_symbols_for_group<'data, P: Platform>(
     output_kind: OutputKind,
     clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
     bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
-) -> Result<(
-    SymbolLoadOutputs<'data>,
-    Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)>,
-)> {
+) -> Result<(SymbolLoadOutputs<'data>, BundleAdditions)> {
     verbose_timing_phase!(
         "Read group symbols",
         group_id = shard.group.group_id(),

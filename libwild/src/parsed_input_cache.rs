@@ -147,7 +147,7 @@ impl<'data> CacheView<'data> {
         if bytes.len() < size_of::<CacheHeader>() {
             return None;
         }
-        if bytes.as_ptr() as usize % REQUIRED_ALIGN != 0 {
+        if !(bytes.as_ptr() as usize).is_multiple_of(REQUIRED_ALIGN) {
             // `mmap` always returns page-aligned pointers so this
             // only trips for in-memory tests on misaligned buffers.
             return None;
@@ -165,7 +165,7 @@ impl<'data> CacheView<'data> {
         if sym_end > bytes.len() {
             return None;
         }
-        if sym_start % std::mem::align_of::<CachedSymbol>() != 0 {
+        if !sym_start.is_multiple_of(std::mem::align_of::<CachedSymbol>()) {
             return None;
         }
         let names_start = header.names_off as usize;
@@ -189,6 +189,7 @@ impl<'data> CacheView<'data> {
         self.header.n_symbols as usize
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -424,6 +425,7 @@ pub(crate) fn bundle_path_for_output(output: &Path) -> PathBuf {
 /// borrow into the leaked mmap and downcast trivially to any per-link
 /// `'data` lifetime.
 pub(crate) struct BundleView<'data> {
+    #[allow(dead_code)]
     bytes: &'data [u8],
     index: hashbrown::HashMap<[u8; BUNDLE_KEY_LEN], &'data [u8], foldhash::fast::FixedState>,
 }
@@ -433,7 +435,7 @@ impl<'data> BundleView<'data> {
         if bytes.len() < size_of::<BundleHeader>() {
             return None;
         }
-        if bytes.as_ptr() as usize % REQUIRED_ALIGN != 0 {
+        if !(bytes.as_ptr() as usize).is_multiple_of(REQUIRED_ALIGN) {
             return None;
         }
         let header = unsafe { &*(bytes.as_ptr() as *const BundleHeader) };
@@ -449,7 +451,7 @@ impl<'data> BundleView<'data> {
         if toc_end > bytes.len() {
             return None;
         }
-        if toc_off % std::mem::align_of::<BundleTocEntry>() != 0 {
+        if !toc_off.is_multiple_of(std::mem::align_of::<BundleTocEntry>()) {
             return None;
         }
         let blobs_off = header.blobs_off as usize;
@@ -487,11 +489,13 @@ impl<'data> BundleView<'data> {
         self.index.get(key).copied()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.index.len()
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn raw_bytes(&self) -> &'data [u8] {
         self.bytes
     }
@@ -536,6 +540,7 @@ impl BundleBuilder {
         self.entries.push((key, blob));
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -648,6 +653,7 @@ mod tests {
     /// the test slice. On real use the mmap'd page is always
     /// page-aligned.
     #[repr(C, align(8))]
+    #[allow(dead_code)]
     struct Aligned<const N: usize>([u8; N]);
 
     fn aligned(bytes: &[u8]) -> Box<[u8]> {

@@ -51,7 +51,7 @@ fn rewrite_body(body: &[u8], hints: &dyn LinkerHints) -> Option<Vec<u8>> {
     let mut iter = InstrIter::new(body, start);
     let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
 
-    while let Some((p, len)) = iter.next() {
+    for (p, len) in iter.by_ref() {
         if body[p] != OP_CALL_INDIRECT {
             continue;
         }

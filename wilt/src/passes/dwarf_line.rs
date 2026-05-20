@@ -61,17 +61,17 @@ pub fn rewrite(input: &[u8], optimised: &[u8], remap: &FuncRemap) -> Option<Vec<
     // Step 3: bodies byte-identical but possibly moved. Patch
     // DW_LNE_set_address opcodes in the line program with the new
     // file offsets. Same byte length, so no downstream encoding shift.
-    if per_function_bytes_match(input, optimised, remap, &in_offsets, &out_offsets) {
-        if let Some(patched) = patch_addresses(
+    if per_function_bytes_match(input, optimised, remap, &in_offsets, &out_offsets)
+        && let Some(patched) = patch_addresses(
             line_bytes,
             input,
             optimised,
             remap,
             &in_offsets,
             &out_offsets,
-        ) {
-            return Some(patched);
-        }
+        )
+    {
+        return Some(patched);
     }
 
     // Step 4: some bodies modified. Walk the program, drop
@@ -412,8 +412,8 @@ fn patch_addresses(
 
     // Patch by walking the program body.
     let mut out = line_bytes.to_vec();
-    let header_len = header.header_length() as usize
-        + header.offset().0 as usize
+    let header_len = header.header_length()
+        + header.offset().0
         + 22 /* fixed header bytes before header_length */;
     // Use the spec'd header length: header_offset = (program_offset
     // - header_offset_to_program). gimli's header offers `header_size`

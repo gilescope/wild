@@ -39,12 +39,12 @@ pub fn call_graph(module: &mut WasmModule<'_>) -> Vec<Vec<u32>> {
         while pos < bytes.len() {
             let opcode = bytes[pos];
             pos += 1;
-            if opcode == OP_CALL {
-                if let Some((target, consumed)) = leb128::read_u32(&bytes[pos..]) {
-                    pos += consumed;
-                    if (target as usize) < num_funcs && !graph[func_idx].contains(&target) {
-                        graph[func_idx].push(target);
-                    }
+            if opcode == OP_CALL
+                && let Some((target, consumed)) = leb128::read_u32(&bytes[pos..])
+            {
+                pos += consumed;
+                if (target as usize) < num_funcs && !graph[func_idx].contains(&target) {
+                    graph[func_idx].push(target);
                 }
             }
             // We don't parse other opcodes — just scan for 0x10.

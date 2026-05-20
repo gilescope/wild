@@ -102,7 +102,7 @@ fn blob_size(code_limit: u64, ident_len: usize) -> usize {
 pub(crate) fn blob_reserve_bytes(body_len: usize, max_ident_len: usize) -> usize {
     // Max sig_pad is 15 (16-byte alignment).
     let aligned_body_cap = body_len + 15;
-    let n_slots_max = (aligned_body_cap + PAGE_SIZE - 1) / PAGE_SIZE;
+    let n_slots_max = aligned_body_cap.div_ceil(PAGE_SIZE);
     let ident_cap = max_ident_len + 1; // null terminator
     // SuperBlob(12) + BlobIndex(8) + CD fixed(88) + ident + hashes + slack.
     15 + 12 + 8 + 88 + ident_cap + n_slots_max * HASH_SIZE as usize + 64
@@ -190,7 +190,7 @@ pub(crate) fn sign_in_place(buf: &mut [u8], body_len: usize, identifier: &str) -
     let code_limit = match codesig_lc_off {
         Some(cs_off) => {
             let old_dataoff = u32::from_le_bytes(buf[cs_off + 8..cs_off + 12].try_into().unwrap());
-            old_dataoff as u64
+            u64::from(old_dataoff)
         }
         None => file_len,
     };
@@ -229,7 +229,7 @@ pub(crate) fn sign_in_place(buf: &mut [u8], body_len: usize, identifier: &str) -
         buf[cs_off + 12..cs_off + 16].copy_from_slice(&(new_datasize as u32).to_le_bytes());
     } else {
         let new_lc_off = 32 + sizeofcmds as usize;
-        let header_pad_end = find_header_pad_end(&buf)?;
+        let header_pad_end = find_header_pad_end(buf)?;
         if new_lc_off + 16 > header_pad_end {
             crate::bail!(
                 "codesign: header-pad exhausted (have {} bytes free, need 16 \
@@ -301,7 +301,7 @@ pub(crate) fn sign_in_place(buf: &mut [u8], body_len: usize, identifier: &str) -
             .map(|n| n.get())
             .unwrap_or(1)
             .min(n_slots.max(1));
-        let buf_ref: &[u8] = &buf;
+        let buf_ref: &[u8] = buf;
         let aligned_end_u = aligned_end as usize;
 
         // Each worker owns a contiguous output strip and the matching
@@ -364,7 +364,7 @@ pub(crate) fn sign_in_place(buf: &mut [u8], body_len: usize, identifier: &str) -
     blob[cd_base + 52..cd_base + 56].copy_from_slice(&0u32.to_be_bytes()); // spare3
     blob[cd_base + 56..cd_base + 64].copy_from_slice(&0u64.to_be_bytes()); // codeLimit64
     // execSegBase / execSegLimit / execSegFlags — parse __TEXT fileoff/filesize.
-    let (exec_seg_base, exec_seg_limit) = parse_text_segment(&buf);
+    let (exec_seg_base, exec_seg_limit) = parse_text_segment(buf);
     // execSegFlags: 1 = main binary; 0 for dylibs/bundles — the
     // header filetype tells us which.
     let filetype = u32::from_le_bytes(buf[12..16].try_into().unwrap());
@@ -451,8 +451,9 @@ fn find_header_pad_end(buf: &[u8]) -> Result<usize> {
                 if sec + 40 > buf.len() {
                     break;
                 }
-                let sec_fileoff =
-                    u32::from_le_bytes(buf[sec + 48..sec + 52].try_into().unwrap()) as u64;
+                let sec_fileoff = u64::from(u32::from_le_bytes(
+                    buf[sec + 48..sec + 52].try_into().unwrap(),
+                ));
                 if sec_fileoff > 0 && sec_fileoff < min_sect_fileoff {
                     min_sect_fileoff = sec_fileoff;
                 }

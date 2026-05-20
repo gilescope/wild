@@ -85,8 +85,7 @@ impl SizedOutput {
     /// stale trailing bytes left in the mmap-backed buffer.
     pub(crate) fn effective_len(&self) -> usize {
         self.final_size_override
-            .map(|n| n as usize)
-            .unwrap_or_else(|| self.out.len())
+            .map_or_else(|| self.out.len(), |n| n as usize)
     }
 }
 
@@ -296,6 +295,7 @@ impl Output {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn create_file_non_lazily(&self, file_size: u64) -> Result<SizedOutput> {
         timing_phase!("Create output file");
         SizedOutput::new(self.path.clone(), self.config, file_size)
@@ -318,7 +318,7 @@ fn default_file_write_mode(args: &impl platform::Args, output_kind: OutputKind) 
     #[cfg(target_os = "macos")]
     {
         let _ = args;
-        return FileWriteMode::UnlinkAndReplace;
+        FileWriteMode::UnlinkAndReplace
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -401,9 +401,7 @@ impl SizedOutput {
                 // invalidation covers exactly the codesigned range.
                 #[cfg(target_os = "macos")]
                 {
-                    let bytes = final_size
-                        .map(|s| (s as usize).min(mmap.len()))
-                        .unwrap_or(mmap.len());
+                    let bytes = final_size.map_or(mmap.len(), |s| (s as usize).min(mmap.len()));
                     if bytes > 0 {
                         // SAFETY: FFI call to `msync(2)`. All FFI
                         // crosses the language boundary and is

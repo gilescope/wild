@@ -147,11 +147,12 @@ fn transfer(ir: &BodyIr, bb: &crate::ir::BasicBlock, in_state: Bindings) -> Bind
         let op = ir.instrs()[i].op;
         match op {
             OP_I32_CONST | OP_I64_CONST | OP_F32_CONST | OP_F64_CONST => {
-                if (k + 1) < bb.end_instr && ir.instrs()[(k + 1) as usize].op == OP_LOCAL_SET {
-                    if let Some(x) = local_idx(ir, (k + 1) as usize) {
-                        state.insert(x, ir.instr_bytes(i).to_vec());
-                        skip_next_set = true;
-                    }
+                if (k + 1) < bb.end_instr
+                    && ir.instrs()[(k + 1) as usize].op == OP_LOCAL_SET
+                    && let Some(x) = local_idx(ir, (k + 1) as usize)
+                {
+                    state.insert(x, ir.instr_bytes(i).to_vec());
+                    skip_next_set = true;
                 }
             }
             OP_LOCAL_SET => {
@@ -185,20 +186,20 @@ fn record_rewrites(
         let it = ir.instrs()[i];
         match it.op {
             OP_I32_CONST | OP_I64_CONST | OP_F32_CONST | OP_F64_CONST => {
-                if (k + 1) < bb.end_instr && ir.instrs()[(k + 1) as usize].op == OP_LOCAL_SET {
-                    if let Some(x) = local_idx(ir, (k + 1) as usize) {
-                        state.insert(x, ir.instr_bytes(i).to_vec());
-                        skip_next_set = true;
-                    }
+                if (k + 1) < bb.end_instr
+                    && ir.instrs()[(k + 1) as usize].op == OP_LOCAL_SET
+                    && let Some(x) = local_idx(ir, (k + 1) as usize)
+                {
+                    state.insert(x, ir.instr_bytes(i).to_vec());
+                    skip_next_set = true;
                 }
             }
             OP_LOCAL_GET => {
-                if let Some(x) = local_idx(ir, i) {
-                    if let Some(bytes) = state.get(&x) {
-                        if bytes.len() <= it.len as usize {
-                            out.push((it.start as usize, it.len as usize, bytes.clone()));
-                        }
-                    }
+                if let Some(x) = local_idx(ir, i)
+                    && let Some(bytes) = state.get(&x)
+                    && bytes.len() <= it.len as usize
+                {
+                    out.push((it.start as usize, it.len as usize, bytes.clone()));
                 }
             }
             OP_LOCAL_SET => {
@@ -226,10 +227,10 @@ fn has_const_and_local_get(body: &[u8]) -> bool {
     let Some(start) = opc::skip_locals(body) else {
         return false;
     };
-    let mut iter = InstrIter::new(body, start);
+    let iter = InstrIter::new(body, start);
     let mut has_const = false;
     let mut has_get = false;
-    while let Some((p, _)) = iter.next() {
+    for (p, _) in iter {
         match body[p] {
             OP_I32_CONST | OP_I64_CONST | OP_F32_CONST | OP_F64_CONST => has_const = true,
             OP_LOCAL_GET => has_get = true,
@@ -312,7 +313,7 @@ mod tests {
         ];
         let out = rewrite_body(&body).expect("both branches agree → propagate");
         // local.get 0 should become i32.const 5.
-        let last_ops: Vec<u8> = out.iter().rev().take(4).copied().collect();
+        let _last_ops: Vec<u8> = out.iter().rev().take(4).copied().collect();
         // Last 4 bytes: end-func, drop, the const value (5), const opcode (0x41) → reversed
         // Just check that 0x20 (local.get) is gone in favor of 0x41 (i32.const).
         assert!(

@@ -45,9 +45,7 @@ use std::path::PathBuf;
 /// connect, so other local users can't hijack the daemon to link as
 /// us.
 pub fn default_socket_path() -> PathBuf {
-    let dir = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let dir = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     let uid = unsafe { libc::getuid() };
     dir.join(format!("wild-{uid}.sock"))
 }

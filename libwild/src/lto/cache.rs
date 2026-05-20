@@ -260,7 +260,7 @@ mod tests {
             "filename should start with content-hash prefix: {}",
             key.filename()
         );
-        assert!(key.filename().ends_with(".obj"));
+        assert!(key.filename().to_ascii_lowercase().ends_with(".obj"));
     }
 
     #[test]

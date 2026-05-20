@@ -559,11 +559,7 @@ mod tests {
 
         // Replay must produce one Undefined (set_next) and one Defined
         // (add_non_versioned + set_next) — 3 ops total.
-        let kinds: Vec<_> = replayed
-            .ops
-            .iter()
-            .map(|op| std::mem::discriminant(op))
-            .collect();
+        let kinds: Vec<_> = replayed.ops.iter().map(std::mem::discriminant).collect();
         assert_eq!(kinds.len(), 3);
     }
 }
