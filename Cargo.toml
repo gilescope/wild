@@ -31,7 +31,7 @@ anyhow = "1.0.97"
 sha2 = "0.10"
 ar = "0.9.0"
 atomic-take = "1.0.0"
-bitflags = "2.4.0"
+bitflags = "2.4.1"
 blake3 = { version = "1.0.0", features = ["rayon"] }
 bumpalo-herd = "0.1.2"
 bytesize = "2.0.0"

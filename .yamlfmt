@@ -5,5 +5,7 @@ formatter:
 # LLVM `obj2yaml` outputs used as wasm-link test fixtures — these need to
 # round-trip byte-exact, so we don't let yamlfmt rewrite them.
 exclude:
+  - "wild/tests/lld-wasm/*.yaml"
+  - "wild/tests/lld-wasm/*.yml"
   - "wild/tests/lld-wasm/**/*.yaml"
   - "wild/tests/lld-wasm/**/*.yml"
