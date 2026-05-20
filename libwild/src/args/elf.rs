@@ -175,15 +175,15 @@ pub struct ElfArgs {
 /// argument shape.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DebugCompression {
-    /// Emit `.debug_*` sections uncompressed.
+    /// Emit `.debug_*` sections uncompressed. Matches ld / lld's default
+    /// and what wild's validation tests under `wild/tests/elf/**` expect.
+    #[default]
     None,
     /// `SHF_COMPRESSED` with `ch_type = ELFCOMPRESS_ZSTD`. Tools
     /// from binutils 2.40 + and recent gdb / lldb / llvm-objdump
-    /// decompress transparently. This is wild's default — only
-    /// `.debug_*` sections that exceed the compressibility threshold
-    /// are touched; release builds (no `-g`) see no effect. Disable
-    /// via `--compress-debug-sections=none`.
-    #[default]
+    /// decompress transparently. Opt-in via `--compress-debug-sections=zstd`.
+    /// Only `.debug_*` sections exceeding the compressibility threshold
+    /// are touched; release builds (no `-g`) see no effect.
     Zstd,
 }
 
@@ -374,7 +374,7 @@ impl Default for ElfArgs {
             rpath_set: Default::default(),
             plugin_path: None,
             plugin_args: Vec::new(),
-            compress_debug_sections: DebugCompression::Zstd,
+            compress_debug_sections: DebugCompression::None,
             upgrade_debug_line: DebugLineUpgrade::None,
             dedup_debug_abbrev: false,
             opt_level: 0,
