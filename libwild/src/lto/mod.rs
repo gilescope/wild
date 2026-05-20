@@ -36,7 +36,9 @@ use crate::platform::Platform;
 
 pub(crate) mod cache;
 mod dispatcher;
-#[cfg(feature = "macho-lto")]
+// Mirrors the gate on `pub(crate) mod macho_lto;` in lib.rs — the
+// libLTO driver is only buildable where `libloading` is.
+#[cfg(all(feature = "macho-lto", any(unix, windows)))]
 pub(crate) mod macho_liblto;
 pub(crate) mod wasm_batch;
 pub(crate) mod wasm_lower;

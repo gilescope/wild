@@ -22,7 +22,7 @@
 //! pipelines will dispatch to for Mach-O once those wire up the
 //! cross-platform `LtoDriver<_>` dispatcher.
 
-#![cfg(feature = "macho-lto")]
+#![cfg(all(feature = "macho-lto", any(unix, windows)))]
 
 use crate::error::Error;
 use crate::error::Result;
