@@ -2,14 +2,13 @@ formatter:
   retain_line_breaks: true
   eof_newline: true
 
-# Per yamlfmt docs/paths.md: standard mode (default) treats `*` literally —
-# patterns like `wild/tests/lld-wasm/**/*.yaml` only match a file literally
-# called `**/*.yaml`. Switch to doublestar mode so the `**` patterns below
-# match across arbitrary depth.
-match_type: doublestar
+# Stay in `standard` mode (default) so the workflow's `yamlfmt -lint .`
+# keeps working — doublestar mode treats `.` as a literal file pattern,
+# breaking that invocation with "read .: is a directory". In standard
+# mode, exclude entries are directory or file paths (no globbing).
 
 # LLVM `obj2yaml` outputs used as wasm-link test fixtures — these need to
-# round-trip byte-exact, so we don't let yamlfmt rewrite them.
+# round-trip byte-exact, so we don't let yamlfmt rewrite them. Directory
+# excludes apply recursively to every yaml/yml inside the tree.
 exclude:
-  - "wild/tests/lld-wasm/**/*.yaml"
-  - "wild/tests/lld-wasm/**/*.yml"
+  - "wild/tests/lld-wasm"
