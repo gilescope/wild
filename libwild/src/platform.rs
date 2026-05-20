@@ -1320,6 +1320,10 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Path to libLTO.dylib for native LTO compilation (Mach-O -lto_library).
+    // dead_code suppressed because on macOS-only builds without the LTO
+    // pipeline enabled, the trait method's default impl reads as unused.
+    // ELF/wasm builds reach it through `input_data`.
+    #[allow(dead_code)]
     fn lto_library_path(&self) -> Option<&Path> {
         None
     }
@@ -1334,6 +1338,8 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Path to write LTO-compiled intermediate object (Mach-O -object_path_lto).
+    // dead_code: same rationale as `lto_library_path` above.
+    #[allow(dead_code)]
     fn object_path_lto(&self) -> Option<&Path> {
         None
     }

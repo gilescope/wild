@@ -20,21 +20,40 @@
 //! no libwild here to fall back to. Cargo's standard linker-error
 //! plumbing surfaces the message via rustc.
 
-use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
+// The whole client is Unix-domain-socket driven; on non-Unix it
+// compiles to a stub that refuses to link. (Windows/wasip1 builds
+// only include the binary because the workspace `--all-targets` Cargo
+// targets it; users don't actually invoke wild-client there.)
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    eprintln!("wild-client is only supported on Unix targets");
+    ExitCode::from(1)
+}
+
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::path::PathBuf;
+
+#[cfg(unix)]
 #[path = "../../libwild/src/daemon_protocol.rs"]
 #[allow(dead_code)] // client uses only a subset of the protocol surface
 mod daemon_protocol;
 
+#[cfg(unix)]
 use daemon_protocol::Request;
+#[cfg(unix)]
 use daemon_protocol::read_response;
+#[cfg(unix)]
 use daemon_protocol::write_request;
 
+#[cfg(unix)]
 fn main() -> ExitCode {
-    println!("Hellow world");
+    println!("Hello world");
     let mut c = vec!["a", "b", "C"];
     c.pop();
     c.pop();

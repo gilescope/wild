@@ -769,7 +769,8 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
             }
             // If the platform provides a native LTO library (Mach-O libLTO.dylib),
             // compile bitcode to native code immediately and treat as a regular object.
-            #[cfg(feature = "macho-lto")]
+            // Matches the gating on `pub(crate) mod macho_lto;` in lib.rs.
+            #[cfg(all(feature = "macho-lto", any(unix, windows)))]
             if let Some(lto_lib_path) = self.args.lto_library_path() {
                 let filename = input_ref.file.filename.to_string_lossy().into_owned();
                 let obj_path = crate::macho_lto::compile_bitcode_to_file(

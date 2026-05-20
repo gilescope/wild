@@ -7699,10 +7699,10 @@ fn build_unwind_info_section(
     // Sentinel first-level index entry
     let (last_fa, last_fs, _) = *all_entries.last().unwrap();
     let sentinel_fn_off = (last_fa - text_base + u64::from(last_fs)) as u32;
-    let sie = idx_off as usize + num_pages * 12;
-    wu32!(sie, sentinel_fn_off);
-    wu32!(sie + 4, 0u32); // secondLevelPagesSectionOffset = 0 (sentinel)
-    wu32!(sie + 8, lsda_off + lsda_bytes); // lsdaIndexArraySectionOffset (end)
+    let size = idx_off as usize + num_pages * 12;
+    wu32!(size, sentinel_fn_off);
+    wu32!(size + 4, 0u32); // secondLevelPagesSectionOffset = 0 (sentinel)
+    wu32!(size + 8, lsda_off + lsda_bytes); // lsdaIndexArraySectionOffset (end)
 
     out
 }

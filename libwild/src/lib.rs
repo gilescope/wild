@@ -50,7 +50,10 @@ pub(crate) mod lto;
 pub(crate) mod macho;
 pub(crate) mod macho_aarch64;
 pub(crate) mod macho_codesign;
-#[cfg(feature = "macho-lto")]
+// Also gate on `any(unix, windows)` because libLTO is loaded via
+// `libloading::Library`, which doesn't compile on wasi targets even when
+// the workspace's `macho-lto` feature is on.
+#[cfg(all(feature = "macho-lto", any(unix, windows)))]
 pub(crate) mod macho_lto;
 pub(crate) mod macho_writer;
 pub(crate) mod output_kind;

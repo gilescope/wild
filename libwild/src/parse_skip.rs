@@ -211,6 +211,7 @@ impl<'a, 'data> SymbolSink<'data> for TeeSink<'a, 'data> {
 /// A single sink operation, captured verbatim. Used by the canary to
 /// diff two parse paths for the same input.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // variants are constructed on the canary-enabled build only.
 pub(crate) enum StreamOp<'data> {
     SetNext {
         flags: u32,

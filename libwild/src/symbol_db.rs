@@ -144,16 +144,19 @@ impl<'data> PendingSymbol<'data> {
         &self.name
     }
 
+    #[allow(dead_code)] // used only on debug-canary builds.
     pub(crate) fn symbol_id(&self) -> SymbolId {
         self.symbol_id
     }
 }
 
 impl<'data> PendingVersionedSymbol<'data> {
+    #[allow(dead_code)] // used only on debug-canary builds.
     pub(crate) fn name(&self) -> &PreHashed<VersionedSymbolName<'data>> {
         &self.name
     }
 
+    #[allow(dead_code)] // used only on debug-canary builds.
     pub(crate) fn symbol_id(&self) -> SymbolId {
         self.symbol_id
     }

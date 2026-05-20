@@ -174,7 +174,7 @@ where
         let owner_offset = emitted_offsets[owner];
         let owner_len = unique[owner].len() as u32;
         let self_len = unique[i].len() as u32;
-        // `owner_len - self_len` bytes preceed our slice inside the
+        // `owner_len - self_len` bytes precede our slice inside the
         // owner's buffer; our slice starts at that relative offset.
         debug_assert!(owner_len >= self_len, "owner shorter than absorbed");
         let my_offset = owner_offset + (owner_len - self_len);

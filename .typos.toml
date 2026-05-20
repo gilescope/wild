@@ -4,10 +4,40 @@ rela = "rela"
 ot = "ot"
 FRE = "FRE"
 aranges = "aranges"
+# DWARF DW_AT_endianity (DWARF 4 §7.27, 0x65) — terminology of the spec.
+Endianity = "Endianity"
+# Inherited from upstream LLD `weak-alias-overide.s` test fixture name.
+overide = "overide"
+# `b"abd"` is arbitrary 3-byte test input for a hash function; not text.
+abd = "abd"
+# `-oout.bin` is `-o` (linker output flag) glued to `out.bin` (no space).
+oout = "oout"
+# `FUNCTIONs`, `GLOBALs`, `CHECKs`, `ACCESSes` and friends in comments
+# (typos splits CamelCase on the trailing `s` and flags the leading run).
+FUNCTIO = "FUNCTIO"
+GLOBA = "GLOBA"
+CHEC = "CHEC"
+ACCES = "ACCES"
+# `mis-` as a hyphenated prefix ("mis-tagged", "mis-reports") in comments.
+mis = "mis"
+# `fo` = file offset, used as a short local in mach-o byte-layout code.
+fo = "fo"
+# `ue` for `unused_elem` time-step labels in wilt tests.
+ue = "ue"
+# `ba` appears in two places as part of a WASM `loop`-block-flag mnemonic
+# (`ba` = "block-already-merged") in suffix_share + wasm-todo notes.
+ba = "ba"
 
 [files]
 extend-exclude = [
   "external_test_suites",
   "wild/tests/bins",
+  # LLD test fixtures (`*.s`, `*.ll`, `*.yaml`) ported from upstream LLVM
+  # — keep their original comment misspellings intact so re-imports from
+  # upstream diff cleanly.
+  "wild/tests/lld-macho",
+  "wild/tests/lld-wasm",
+  "wild/tests/sources/macho",
+  "wild/tests/sources/macho-ld64-compat-dylib",
+  "wild/tests/sold-macho",
 ]
-
