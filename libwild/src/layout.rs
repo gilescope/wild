@@ -4301,6 +4301,18 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                     let address = P::frame_data_base_address(memory_offsets);
                     SectionResolution { address }
                 }
+                // `.riscv.attributes` and `.note.gnu.property` go through their
+                // own write paths (they're consolidated, not concatenated),
+                // but their STT_SECTION symbols still need a resolvable
+                // address. Use the section's base — no relocations target
+                // these symbols at runtime, so the exact value doesn't
+                // matter as long as `address()` returns Some.
+                SectionSlot::RiscvVAttributes(..) => SectionResolution {
+                    address: *memory_offsets.get(crate::part_id::RISCV_ATTRIBUTES),
+                },
+                SectionSlot::NoteGnuProperty(..) => SectionResolution {
+                    address: *memory_offsets.get(crate::part_id::NOTE_GNU_PROPERTY),
+                },
                 _ => SectionResolution::none(),
             };
             section_resolutions.push(resolution);
