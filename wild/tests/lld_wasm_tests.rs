@@ -762,12 +762,36 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
             }
         }
 
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", &shell_cmd]);
-        if let Some(d) = &current_cwd {
-            cmd.current_dir(d);
-        }
-        let output = cmd.output().map_err(|e| format!("sh exec: {e}"))?;
+        // Retry posix_spawn on ENOENT: observed flake on ubuntu:25.10
+        // ARM containers under `--features plugins` (which doubles the
+        // workspace's parallel test count) — `Command::output()` can
+        // return ENOENT before sh actually runs when the per-thread
+        // pipe-fd budget is exhausted during the fork/exec dance.
+        // Reading `sh` always exists in PATH; tests that genuinely
+        // need a non-existent `current_dir` would fail deterministically.
+        let output = {
+            let mut attempt = 0;
+            loop {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", &shell_cmd]);
+                if let Some(d) = &current_cwd {
+                    cmd.current_dir(d);
+                }
+                match cmd.output() {
+                    Ok(o) => break o,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && attempt < 5
+                            && current_cwd.as_ref().is_none_or(|d| d.is_dir()) =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                        continue;
+                    }
+                    Err(e) => return Err(format!("sh exec: {e}")),
+                }
+            }
+        };
 
         if expect_failure {
             // Either path is acceptable: the pipeline failed (FileCheck
