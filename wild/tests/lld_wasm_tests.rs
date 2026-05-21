@@ -769,10 +769,15 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
         // pipe-fd budget is exhausted during the fork/exec dance.
         // Reading `sh` always exists in PATH; tests that genuinely
         // need a non-existent `current_dir` would fail deterministically.
+        //
+        // Use the absolute `/bin/sh` so a sanitised/empty `PATH` in
+        // the test child can't surface as ENOENT for the interpreter
+        // itself (observed across all 113 non-ignored tests on one
+        // linux lane).
         let output = {
             let mut attempt = 0;
             loop {
-                let mut cmd = Command::new("sh");
+                let mut cmd = Command::new("/bin/sh");
                 cmd.args(["-c", &shell_cmd]);
                 if let Some(d) = &current_cwd {
                     cmd.current_dir(d);
