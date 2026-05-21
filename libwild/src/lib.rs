@@ -3,12 +3,19 @@ pub use args::Args;
 pub(crate) mod arch;
 pub(crate) mod archive;
 pub mod args;
+#[cfg(unix)]
+pub mod daemon;
+pub mod daemon_protocol;
 pub(crate) mod debug_trace;
 pub(crate) mod diagnostics;
 pub(crate) mod diff;
 pub(crate) mod dwarf_address_info;
+pub(crate) mod eh_frame;
 pub(crate) mod elf;
 pub(crate) mod elf_aarch64;
+pub(crate) mod elf_abbrev_dedup;
+pub(crate) mod elf_compress;
+pub(crate) mod elf_line_v5;
 pub(crate) mod elf_loongarch64;
 pub(crate) mod elf_riscv64;
 pub(crate) mod elf_writer;
@@ -23,20 +30,39 @@ pub(crate) mod gc_stats;
 pub(crate) mod glob_match;
 pub(crate) mod grouping;
 pub(crate) mod hash;
+pub(crate) mod incremental_cache;
 pub(crate) mod input_data;
 pub(crate) mod layout;
 pub(crate) mod layout_rules;
-#[cfg_attr(not(feature = "plugins"), path = "linker_plugins_disabled.rs")]
+pub(crate) mod layout_snapshot;
+pub(crate) mod sdk_cache;
+pub(crate) mod suffix_share;
+// The ELF Gold-plugin LTO code lives physically under `lto/` as part
+// of the LtoDriver family (see `wild-lto-plan.md`). The `mod
+// linker_plugins` alias is kept so existing callers continue to use
+// `crate::linker_plugins::…`; a follow-up commit mass-renames them.
+#[cfg_attr(feature = "plugins", path = "lto/elf_gold.rs")]
+#[cfg_attr(not(feature = "plugins"), path = "lto/elf_gold_disabled.rs")]
 mod linker_plugins;
 pub(crate) mod linker_script;
+pub mod llvm_tools;
+pub(crate) mod lto;
 pub(crate) mod macho;
 pub(crate) mod macho_aarch64;
+pub(crate) mod macho_codesign;
+// Also gate on `any(unix, windows)` because libLTO is loaded via
+// `libloading::Library`, which doesn't compile on wasi targets even when
+// the workspace's `macho-lto` feature is on.
+#[cfg(all(feature = "macho-lto", any(unix, windows)))]
+pub(crate) mod macho_lto;
 pub(crate) mod macho_writer;
 pub(crate) mod output_kind;
 pub(crate) mod output_section_id;
 pub(crate) mod output_section_map;
 pub(crate) mod output_section_part_map;
 pub(crate) mod output_trace;
+pub(crate) mod parse_skip;
+pub(crate) mod parsed_input_cache;
 pub(crate) mod parsing;
 pub(crate) mod part_id;
 #[cfg(all(
@@ -69,11 +95,15 @@ pub(crate) mod symbol;
 pub(crate) mod symbol_db;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tidy_tests;
+pub(crate) mod tier3_skip;
 pub(crate) mod timing;
 pub(crate) mod validation;
 pub(crate) mod value_flags;
 pub(crate) mod verification;
 pub(crate) mod version_script;
+pub(crate) mod wasm;
+pub(crate) mod wasm_arch;
+pub(crate) mod wasm_writer;
 
 use crate::elf::Elf;
 use crate::error::Context;
@@ -112,6 +142,147 @@ pub fn run(mut args: Args) -> error::Result {
     drop(linker);
     timing::finalise_perfetto_trace()?;
     Ok(())
+}
+
+/// Super-early skip check — called from `main()` BEFORE
+/// `Args::parse` and BEFORE the fork dispatch. Only reads `argv`
+/// and the cache side-car; does no library-path resolution.
+///
+/// On a rust-analyzer link the full arg parser takes ~274 ms
+/// (walks `-L`, resolves every `-l`, probes the SDK). This
+/// function deliberately bypasses all of that — on a cache hit
+/// the skip cost is dominated by the 229-path fingerprint verify,
+/// not by arg parsing.
+///
+/// Gated on `WILD_INCREMENTAL_DEBUG=1`; with the env var unset,
+/// returns `false` without reading any files.
+#[must_use]
+pub fn try_early_skip_from_argv() -> Option<std::path::PathBuf> {
+    std::env::var_os("WILD_INCREMENTAL_DEBUG")?;
+    if std::env::var_os("WILD_INCREMENTAL_NO_EARLY_SKIP").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return None;
+    }
+    let argv: Vec<String> = std::env::args().collect();
+    let output = incremental_cache::extract_output_path(&argv);
+    let args_hash = incremental_cache::compute_args_hash(&argv);
+    let hashes_path = incremental_cache::hashes_path_for_output(&output);
+    let cached = incremental_cache::read_link_cache(&hashes_path)?;
+    if cached.wild_version != incremental_cache::WILD_VERSION || cached.args_hash != args_hash {
+        return None;
+    }
+    incremental_cache::verify_cached_inputs_unchanged(&cached.inputs)?;
+    match std::fs::metadata(&output) {
+        Ok(m) if m.len() == cached.output_size => {
+            eprintln!(
+                "wild incremental: EARLY SKIP (pre-argparse) — output at {} \
+                 reused",
+                output.display()
+            );
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
+/// Keep the old signature-check for callers that already have a
+/// parsed [`Args`] — used by the post-load defence-in-depth path.
+pub fn try_early_skip(args: &Args) -> bool {
+    if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_none() {
+        return false;
+    }
+    if std::env::var_os("WILD_INCREMENTAL_NO_EARLY_SKIP").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return false;
+    }
+    early_skip_impl(args)
+}
+
+/// Update the output's mtime so build systems (cargo, make) that
+/// look at timestamps see the file as freshly produced by this
+/// invocation. Equivalent to `touch -c -a -m <output>`.
+///
+/// Non-fatal — failure is silently swallowed. If the mtime doesn't
+/// update, the next build may see the output as stale and trigger
+/// a real relink, which falls through to the cold path. That's a
+/// correctness-preserving downgrade (we'd re-link unnecessarily),
+/// not a correctness bug.
+pub fn bump_output_mtime(args: &Args) {
+    bump_output_path_mtime(args.output_path());
+}
+
+/// Path-taking variant of [`bump_output_mtime`] — used from the
+/// pre-argparse skip where we only have an output path, no parsed
+/// `Args`.
+pub fn bump_output_path_mtime(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        // SAFETY: `cpath` is a valid nul-terminated C string;
+        // `utimensat(…, NULL, 0)` is a POSIX-defined way to set
+        // atime+mtime to "now" with no side effects on failure.
+        unsafe {
+            libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), std::ptr::null(), 0);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn early_skip_impl(args: &Args) -> bool {
+    let argv: Vec<String> = std::env::args().collect();
+    let args_hash = incremental_cache::compute_args_hash(&argv);
+    let hashes_path = incremental_cache::hashes_path_for_output(args.output_path());
+    let Some(cached) = incremental_cache::read_link_cache(&hashes_path) else {
+        eprintln!(
+            "wild incremental: early skip: no cache at {}",
+            hashes_path.display()
+        );
+        return false;
+    };
+    if cached.wild_version != incremental_cache::WILD_VERSION {
+        eprintln!(
+            "wild incremental: early skip: wild version mismatch (cached {} vs {})",
+            cached.wild_version,
+            incremental_cache::WILD_VERSION
+        );
+        return false;
+    }
+    if cached.args_hash != args_hash {
+        eprintln!("wild incremental: early skip: args_hash mismatch");
+        return false;
+    }
+    if incremental_cache::verify_cached_inputs_unchanged(&cached.inputs).is_none() {
+        eprintln!("wild incremental: early skip: input fingerprint mismatch");
+        return false;
+    }
+    match std::fs::metadata(args.output_path()) {
+        Ok(m) if m.len() == cached.output_size => {
+            eprintln!(
+                "wild incremental: EARLY SKIP — output at {} reused, \
+                 thread pool / linker arenas bypassed",
+                args.output_path().display()
+            );
+            true
+        }
+        Ok(m) => {
+            eprintln!(
+                "wild incremental: early skip: output size mismatch ({} vs cached {})",
+                m.len(),
+                cached.output_size
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("wild incremental: early skip: output stat failed: {e}");
+            false
+        }
+    }
 }
 
 /// Sets up whatever tracing, if any, is indicated by the supplied arguments. This can only be
@@ -209,6 +380,7 @@ impl Linker {
         match args {
             Args::Elf(elf_args) => Elf::link_for_arch(self, elf_args),
             Args::MachO(macho_args) => MachO::link_for_arch(self, macho_args),
+            Args::Wasm(wasm_args) => wasm::Wasm::link_for_arch(self, wasm_args),
         }
     }
 
@@ -218,11 +390,36 @@ impl Linker {
     ) -> error::Result<LinkerOutput<'data>> {
         let mut file_loader = input_data::FileLoader::new(&self.inputs_arena);
 
+        // Zero the tier-1 parse-skip counters so the end-of-link
+        // summary reflects only this link. Callers that drive
+        // `Linker::run` multiple times in-process get per-link
+        // granularity rather than cumulative totals.
+        parse_skip::reset_stats();
+
         // Note, we propagate errors from `link_with_input_data` after we've checked if any files
         // changed. We want inputs-changed errors to take precedence over all other errors.
         let result = self.load_inputs_and_link::<P, A>(&mut file_loader, args);
 
         file_loader.verify_inputs_unchanged()?;
+
+        // Incremental link — persist the signature + input hashes
+        // for the next link. Fires whenever the user opted into a
+        // cache-writing mode (`--incremental-cache=write|read-write`,
+        // or the legacy `WILD_INCREMENTAL_DEBUG=1` env var). On
+        // skip-paths the prior cache is already current, so we only
+        // persist on a full-link path.
+        let should_persist = result.is_ok()
+            && (args.common().incremental_cache.writes_cache()
+                || std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some());
+        if should_persist {
+            persist_link_cache::<P>(&file_loader, args);
+        }
+
+        // Tier-1 parse-skip telemetry: terse one-liner summarising
+        // how many inputs replayed vs re-parsed vs wrote cache
+        // entries. Gated on WILD_INCREMENTAL_DEBUG=1 so normal
+        // links stay silent.
+        parse_skip::maybe_report();
 
         // Write the dependency file and inputs trace after successful linking.
         if result.is_ok() {
@@ -251,6 +448,28 @@ impl Linker {
         file_loader: &mut FileLoader<'data>,
         args: &'data P::Args,
     ) -> error::Result<LinkerOutput<'data>> {
+        // Incremental *pre-load* skip — fires before `load_inputs`
+        // even opens a file. If the cache's args_hash + wild_version
+        // + per-input fingerprints + output_size all match what's
+        // on disk right now, we can short-circuit with zero mmap,
+        // zero archive extraction, zero symbol parsing.
+        //
+        // Differs from `try_whole_link_skip` (which runs after
+        // load_inputs) in WHERE it fires; both produce the same
+        // verdict under a valid cache. Keeping the post-load version
+        // as defence-in-depth for paths where the pre-load check
+        // can't run (first link, cache v-mismatch, explicit
+        // WILD_INCREMENTAL_PRE_LOAD_SKIP=0 opt-out).
+        let pre_load_skip_active = args.common().incremental_cache.reads_cache()
+            || std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some();
+        if pre_load_skip_active
+            && std::env::var_os("WILD_INCREMENTAL_PRE_LOAD_SKIP").as_deref()
+                != Some(std::ffi::OsStr::new("0"))
+            && try_pre_load_skip::<P>(args)
+        {
+            return Ok(LinkerOutput { layout: None });
+        }
+
         let mut plugin = P::maybe_init_linker_plugin(args, &self.linker_plugin_arena, &self.herd)?;
 
         let loaded = file_loader.load_inputs::<P>(&args.common().inputs, args, &mut plugin);
@@ -258,6 +477,20 @@ impl Linker {
         args.common().save_dir.finish(file_loader, args)?;
 
         let loaded = loaded?;
+
+        // Post-load fallback: same signature check, but after inputs
+        // are fully resolved. Catches cases where argv-level pre-load
+        // couldn't see the real input set (e.g. `-l` dylib lookup
+        // that resolved to a different dylib since last link).
+        // `WILD_INCREMENTAL_NO_POST_LOAD_SKIP=1` opts out so tier 3's
+        // narrower section-level skip can be exercised on workloads
+        // where whole-link-skip would otherwise win the race.
+        if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+            && std::env::var_os("WILD_INCREMENTAL_NO_POST_LOAD_SKIP").is_none()
+            && try_whole_link_skip::<P>(file_loader, args)
+        {
+            return Ok(LinkerOutput { layout: None });
+        }
 
         let output_kind = OutputKind::new(args, file_loader);
 
@@ -273,11 +506,57 @@ impl Linker {
         let mut symbol_db = symbol_db::SymbolDb::new(args, output_kind, &auxiliary, &self.herd)?;
         let mut per_symbol_flags = PerSymbolFlags::new();
 
+        // Tier-1 parse-skip gating: classify each input as clean (its
+        // on-disk bytes fingerprint matches the last link's
+        // .wild-hashes side-car) so the replay / canary paths only
+        // engage for inputs that are actually reusable. Built once
+        // per link and threaded through add_inputs → read_symbols →
+        // run_object_parse_skip; None when no parse-skip gate is
+        // active so the hashing cost vanishes on normal links.
+        let clean_input_paths = compute_clean_input_paths::<P>(file_loader, args);
+
+        // Tier-1.5: load the per-output cache bundle once. The bundle
+        // is `&'static` (leaked mmap) and shared across rayon workers
+        // for the read path. `None` on first link, schema-mismatch, or
+        // any other failure — callers fall through to the re-parse +
+        // re-write path.
+        let bundle = crate::parsed_input_cache::try_load_bundle_view_mmap(args.output());
+
+        // Tier-3 canary: mmap the PREVIOUS output binary BEFORE
+        // `produce_layout` triggers its rename-and-recreate. The mmap
+        // holds an inode reference, so even after the file is renamed
+        // to `<output>.delete` and unlinked, our pages stay valid
+        // until process exit. Used for the post-write byte-
+        // equivalence check that proves the dirty-bitmap predicate is
+        // correctly conservative — if every "reusable" section has
+        // bytes byte-identical to those a cold writer just emitted,
+        // tier-3 phase 2b's actual section-skip is empirically safe.
+        // Also needed for `--emit-patch`, which diffs the previous
+        // output against the freshly-written one for edit-and-continue.
+        // Otherwise gated on WILD_INCREMENTAL_TIER3_CANARY=1 so
+        // cold/normal links stay zero-overhead.
+        let prev_output_capture = if args.common().emit_patch.is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+        {
+            mmap_previous_output(args.output(), args.common().emit_patch.is_some())
+        } else {
+            PreviousOutputCapture::default()
+        };
+        let prev_output_mmap = prev_output_capture.bytes;
+        let prev_output_for_in_place = if prev_output_capture.source_is_current_output {
+            prev_output_capture.bytes
+        } else {
+            None
+        };
+
         symbol_db.add_inputs(
             &mut per_symbol_flags,
             &mut output_sections,
             &mut layout_rules_builder,
             loaded,
+            clean_input_paths.as_ref(),
+            bundle,
         )?;
 
         // TODO: Doing this here means that we can't wrap symbols produced by the linker plugin.
@@ -334,7 +613,483 @@ impl Linker {
             &mut output,
         )?;
 
-        P::write_output_file::<A>(&output, &layout)?;
+        // Tier-2 capture: snapshot the resolved section layout to
+        // `<output>.wild-layout` so the next link can consume it
+        // (tier 3 will use it to mmap-preserve unchanged sections of
+        // the previous output binary). Best-effort — any IO failure
+        // is silent. Gated on the same parse-skip env vars as tier 1
+        // so cold/non-incremental links pay no overhead.
+        let layout_snapshot_active = std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some();
+        // Tier-3 phase 2 canary state: if set, contains
+        // `(reusable_indices, current_snapshot)` so the post-write
+        // path can byte-compare prev_output_mmap vs the freshly-
+        // written output for every "would-be reusable" section.
+        let mut tier3_canary_state: Option<(Vec<usize>, layout_snapshot::LayoutSnapshot)> = None;
+        // Phase 2b "wholesale prev → out copy" predicate: true iff
+        // every section's layout matches AND no contributor is
+        // dirty. Unlike `tier3_canary_state`'s reusable indices
+        // (phase 3), this allows synthetic sections (empty
+        // contributors, e.g. the Mach-O header / LINKEDIT region)
+        // because phase 2b copies the entire output file from prev
+        // — the synthetic regions inherit prev's bytes wholesale,
+        // which is byte-correct.
+        let mut tier3_fully_reusable = false;
+        if layout_snapshot_active {
+            let snapshot = layout.to_layout_snapshot();
+            // Tier-2 canary: if the previous link's snapshot is on
+            // disk, byte-compare against the fresh one. Divergence
+            // means either layout went non-deterministic or the
+            // snapshot format drifted — both block tier 3 from
+            // safely consuming the snapshot, so we panic loud rather
+            // than silently corrupt.
+            if std::env::var_os("WILD_INCREMENTAL_LAYOUT_CANARY").is_some()
+                && let Some(prev) = layout_snapshot::read_snapshot(args.output())
+                && prev != snapshot
+            {
+                let prev_n = prev.len();
+                let cur_n = snapshot.len();
+                let mut first_diff: Option<(usize, String)> = None;
+                for (i, (a, b)) in prev
+                    .sections
+                    .iter()
+                    .zip(snapshot.sections.iter())
+                    .enumerate()
+                {
+                    if a != b {
+                        first_diff = Some((
+                            i,
+                            format!(
+                                "name={:?}/{:?} file={:#x}/{:#x} size={:#x}/{:#x} mem={:#x}/{:#x}",
+                                String::from_utf8_lossy(&a.name),
+                                String::from_utf8_lossy(&b.name),
+                                a.file_offset,
+                                b.file_offset,
+                                a.file_size,
+                                b.file_size,
+                                a.mem_offset,
+                                b.mem_offset,
+                            ),
+                        ));
+                        break;
+                    }
+                }
+                panic!(
+                    "wild layout-canary mismatch: prev={prev_n} sections, cur={cur_n} sections; \
+                     first divergence: {first_diff:?}"
+                );
+            }
+            // Tier-3 dry-run: under WILD_INCREMENTAL_TIER3_PROBE=1,
+            // intersect the previous snapshot's contributors map with
+            // the current link's clean-input set and report how many
+            // sections (and bytes) tier 3's writer integration WOULD
+            // be able to mmap-preserve from the previous output.
+            // Read-only — doesn't change link behaviour. Lets us
+            // measure tier 3's potential ROI on a real bench before
+            // we integrate with the writer.
+            if std::env::var_os("WILD_INCREMENTAL_TIER3_PROBE").is_some()
+                && let Some(prev_snap) = layout_snapshot::read_snapshot(args.output())
+            {
+                // Build the clean-input key set. Archive members
+                // share their parent rlib's cleanness verdict (the
+                // whole rlib is either clean or dirty), but each
+                // member has its own bundle key. Walk the loaded
+                // group_layouts to get path + entry_id for every
+                // contributing input, then filter to those whose
+                // PARENT file is in `clean_input_paths`.
+                let clean_paths = clean_input_paths.as_ref();
+                let mut clean_keys: hashbrown::HashSet<layout_snapshot::ContributorKey> =
+                    hashbrown::HashSet::new();
+                for group in &layout.group_layouts {
+                    for file in &group.files {
+                        let layout::FileLayout::Object(obj) = file else {
+                            continue;
+                        };
+                        let path = obj.input.file.filename.as_path();
+                        if let Some(set) = clean_paths
+                            && !set.contains(path)
+                        {
+                            continue; // dirty rlib → member is dirty
+                        }
+                        let entry_id = obj.input.entry.as_ref().map(|e| e.identifier.as_slice());
+                        clean_keys.insert(parsed_input_cache::bundle_key_for(path, entry_id));
+                    }
+                }
+
+                let dirty = prev_snap.dirty_section_indices(&clean_keys);
+                let total_sections = prev_snap.len();
+                let dirty_count = dirty.len();
+                let clean_count = total_sections - dirty_count;
+                let reusable_bytes: u64 = prev_snap
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !dirty.contains(i))
+                    .map(|(_, s)| s.file_size)
+                    .sum();
+                let total_bytes: u64 = prev_snap.sections.iter().map(|s| s.file_size).sum();
+                eprintln!(
+                    "wild tier-3 probe: {clean_count}/{total_sections} sections \
+                     reusable, {reusable_bytes} / {total_bytes} bytes ({pct:.1}%)",
+                    pct = if total_bytes == 0 {
+                        0.0
+                    } else {
+                        100.0 * reusable_bytes as f64 / total_bytes as f64
+                    }
+                );
+            }
+
+            // Tier-3 phase 2 canary: stash (reusable_indices, snapshot)
+            // for the post-write byte-compare. We need the SAME
+            // clean-key derivation as the dry-run probe above
+            // (handling archive members), so factor that out.
+            if (std::env::var_os("WILD_INCREMENTAL_TIER3_CANARY").is_some()
+                || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some())
+                && let Some(prev_snap) = layout_snapshot::read_snapshot(args.output())
+            {
+                let clean_paths = clean_input_paths.as_ref();
+                let mut clean_keys: hashbrown::HashSet<layout_snapshot::ContributorKey> =
+                    hashbrown::HashSet::new();
+                for group in &layout.group_layouts {
+                    for file in &group.files {
+                        let layout::FileLayout::Object(obj) = file else {
+                            continue;
+                        };
+                        let path = obj.input.file.filename.as_path();
+                        if let Some(set) = clean_paths
+                            && !set.contains(path)
+                        {
+                            continue;
+                        }
+                        let entry_id = obj.input.entry.as_ref().map(|e| e.identifier.as_slice());
+                        clean_keys.insert(parsed_input_cache::bundle_key_for(path, entry_id));
+                    }
+                }
+                let reusable = layout_snapshot::LayoutSnapshot::reusable_section_indices(
+                    &prev_snap,
+                    &snapshot,
+                    &clean_keys,
+                );
+                tier3_fully_reusable = layout_snapshot::LayoutSnapshot::is_fully_reusable(
+                    &prev_snap,
+                    &snapshot,
+                    &clean_keys,
+                );
+                tier3_canary_state = Some((reusable, snapshot.clone()));
+            }
+
+            // Persist the fresh snapshot for the next link.
+            if let Err(e) = layout_snapshot::write_snapshot(args.output(), snapshot)
+                && std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+            {
+                eprintln!(
+                    "wild layout-snapshot: write to {} failed: {}",
+                    args.output().display(),
+                    e
+                );
+            }
+        }
+
+        // Tier-3 phase 2b: speculative writer-skip. If
+        //   * `WILD_INCREMENTAL_TIER3_SKIP=1` is set,
+        //   * every section is reusable (`reusable.len() == cur_snap.len()`),
+        //   * AND the previous output's bytes are mmap'd,
+        // then bypass the platform writer entirely and copy
+        // prev_bytes → output. The byte-equivalence canary
+        // (WILD_INCREMENTAL_TIER3_CANARY=1) has empirical evidence
+        // that every reusable section's prev bytes equal the writer's
+        // cold output; under the all-reusable case that proves the
+        // wholesale copy is byte-correct including codesign (the
+        // codesign references the file's content hash, which is the
+        // same for two byte-identical files).
+        //
+        // Cases this fires (where whole-link-skip wouldn't):
+        //   * args_hash differs slightly (e.g. wild upgrade) but layout + content stayed stable.
+        //   * output_size verification falsely failed (timing).
+        //   * pre/post-load whole-link-skip explicitly disabled.
+        // Saves the entire writer phase (~280 ms on bevy-dylib-class
+        // outputs).
+        let did_speculative_skip = if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+            && tier3_fully_reusable
+            && let Some(prev_bytes) = prev_output_for_in_place
+        {
+            // mmap-COW path: tell `file_writer` to open the
+            // output `UpdateInPlace`. The file already contains
+            // prev's bytes, so no memcpy is needed — the writer
+            // closure becomes a no-op. Saves the 50 MB memcpy
+            // on bevy-class outputs.
+            tier3_skip::set(Some(tier3_skip::State {
+                reusable_ids: hashbrown::HashSet::new(),
+                ranges: Vec::new(),
+                prev_bytes,
+                use_in_place: true,
+            }));
+            output.set_size(prev_bytes.len() as u64);
+            output.write(&layout, |_sized_output, _| {
+                // Output file is already prev's bytes via
+                // UpdateInPlace; nothing to do.
+                Ok(())
+            })?;
+            tier3_skip::set(None);
+            if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+                || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+            {
+                eprintln!(
+                    "wild tier-3 skip: in-place reuse of {} bytes from prev output",
+                    prev_bytes.len()
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        if !did_speculative_skip {
+            // Tier-3 phase 3: partial writer-skip. When some
+            // sections are reusable but not ALL (so phase 2b's
+            // wholesale bypass can't fire), install per-section
+            // skip state so the platform writer:
+            //   (a) pre-fills reusable section ranges from
+            //       prev_bytes BEFORE its emit loop runs, and
+            //   (b) skips per-input-section iterations whose
+            //       target output section is reusable.
+            // Saves writer work proportional to the reusable
+            // fraction. Cleared after write returns so the global
+            // state doesn't leak across links.
+            let installed_tier3_state = if std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                && let Some((reusable, snap)) = tier3_canary_state.as_ref()
+                && !reusable.is_empty()
+                && reusable.len() < snap.sections.len()
+                && let Some(prev_bytes) = prev_output_for_in_place
+            {
+                // Build the OutputSectionId set + the file
+                // ranges to pre-fill, in one pass.
+                let mut reusable_ids: hashbrown::HashSet<
+                    crate::output_section_id::OutputSectionId,
+                > = hashbrown::HashSet::with_capacity(reusable.len());
+                let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(reusable.len());
+                for &i in reusable {
+                    let s = &snap.sections[i];
+                    reusable_ids.insert(crate::output_section_id::OutputSectionId::from_u32(
+                        i as u32,
+                    ));
+                    ranges.push((s.file_offset as usize, s.file_size as usize));
+                }
+                let total = snap.sections.len();
+                let n = reusable.len();
+                let bytes: u64 = ranges.iter().map(|&(_, sz)| sz as u64).sum();
+                if std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+                    || std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_some()
+                {
+                    eprintln!(
+                        "wild tier-3 partial-skip: pre-filling {n}/{total} \
+                             sections ({bytes} bytes) from prev output; writer \
+                             will emit the remaining {} sections only",
+                        total - n
+                    );
+                }
+                tier3_skip::set(Some(tier3_skip::State {
+                    reusable_ids,
+                    ranges,
+                    prev_bytes,
+                    // mmap-COW: open the output `UpdateInPlace`
+                    // so prev's bytes ARE the pre-fill.
+                    use_in_place: true,
+                }));
+                true
+            } else {
+                false
+            };
+
+            let result = P::write_output_file::<A>(&mut output, &layout);
+
+            if installed_tier3_state {
+                tier3_skip::set(None);
+            }
+
+            result?;
+        }
+
+        // Tier-3 phase 2 canary: byte-compare the freshly-written
+        // output's reusable sections against the previous output's
+        // pages. If every reusable section is byte-identical, tier
+        // 3's writer-skip integration is empirically safe — the
+        // dirty-bitmap predicate is correctly conservative on this
+        // workload.
+        if let (Some((reusable, snap)), Some(prev_bytes)) =
+            (tier3_canary_state.as_ref(), prev_output_mmap)
+        {
+            // Re-open the new output so we can mmap it post-write.
+            // The file_writer dropped its mmap in `flush()`, but
+            // the bytes are committed to disk now.
+            let new_mmap = std::fs::File::open(args.output())
+                .ok()
+                .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok());
+            if let Some(new_mmap) = new_mmap {
+                let new_bytes: &[u8] = &new_mmap;
+                let total_reusable = reusable.len();
+                let mut byte_matched = 0usize;
+                let mut bytes_verified: u64 = 0;
+                let mut first_diverged: Option<(usize, String)> = None;
+                for &i in reusable {
+                    let s = &snap.sections[i];
+                    let off = s.file_offset as usize;
+                    let size = s.file_size as usize;
+                    if off.saturating_add(size) > prev_bytes.len()
+                        || off.saturating_add(size) > new_bytes.len()
+                    {
+                        // A reusable section's range falls off the
+                        // end of either output — file size mismatch
+                        // we'd want to know about. Count as
+                        // diverged and capture the first occurrence.
+                        if first_diverged.is_none() {
+                            first_diverged = Some((
+                                i,
+                                format!(
+                                    "{:?} off={off:#x} size={size:#x} prev_len={} new_len={}",
+                                    String::from_utf8_lossy(&s.name),
+                                    prev_bytes.len(),
+                                    new_bytes.len(),
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
+                    if prev_bytes[off..off + size] == new_bytes[off..off + size] {
+                        byte_matched += 1;
+                        bytes_verified += size as u64;
+                    } else if first_diverged.is_none() {
+                        // Find the first byte that differs for the
+                        // diagnostic — diff::maybe_diff is global
+                        // but the canary wants section-local detail.
+                        let first_byte_off = (0..size)
+                            .find(|j| prev_bytes[off + j] != new_bytes[off + j])
+                            .unwrap_or(0);
+                        first_diverged = Some((
+                            i,
+                            format!(
+                                "{:?} off={off:#x} size={size:#x} first_diff_at=+{first_byte_off:#x}",
+                                String::from_utf8_lossy(&s.name)
+                            ),
+                        ));
+                    }
+                }
+                eprintln!(
+                    "wild tier-3 canary: {byte_matched}/{total_reusable} sections \
+                     byte-identical, {bytes_verified} bytes verified safe to reuse"
+                );
+                if let Some((idx, detail)) = first_diverged
+                    && byte_matched != total_reusable
+                {
+                    eprintln!("wild tier-3 canary: first divergence at section #{idx}: {detail}");
+                }
+            }
+        }
+
+        // --emit-patch=<path>: write a byte-level diff between the
+        // previous output and the freshly-written one so a debugger
+        // (BugStalker on Linux; mach_vm_write equivalent on macOS) can
+        // splice the changed bytes into a still-running process for
+        // AOT edit-and-continue. Wild already has prev_output_mmap; we
+        // re-mmap the new output and walk the two in parallel,
+        // coalescing adjacent differing bytes into runs.
+        if let Some(patch_path) = args.common().emit_patch.as_ref() {
+            if let Some(note) = prev_output_capture.note.as_deref() {
+                eprintln!("{note}");
+                write_emit_patch_diagnostic(patch_path, note);
+            }
+            match prev_output_mmap {
+                Some(prev_bytes) => match std::fs::File::open(args.output()) {
+                    Ok(file) => match unsafe { memmap2::Mmap::map(&file) } {
+                        Ok(new_mmap) => {
+                            let old_source = prev_output_capture
+                                .source
+                                .as_deref()
+                                .unwrap_or_else(|| args.output());
+                            let msg = format!(
+                                "wild --emit-patch: diffing old {} ({} bytes) against new {} ({} bytes) -> {}",
+                                old_source.display(),
+                                prev_bytes.len(),
+                                args.output().display(),
+                                new_mmap.len(),
+                                patch_path.display()
+                            );
+                            eprintln!("{msg}");
+                            write_emit_patch_diagnostic(patch_path, &msg);
+                            match emit_patch_file(prev_bytes, &new_mmap, patch_path) {
+                                Ok(()) => {
+                                    let msg = format!(
+                                        "wild --emit-patch: wrote {}",
+                                        patch_path.display()
+                                    );
+                                    eprintln!("{msg}");
+                                    write_emit_patch_diagnostic(patch_path, &msg);
+                                }
+                                Err(e) => {
+                                    let msg = format!("wild --emit-patch failed: {e}");
+                                    eprintln!("{msg}");
+                                    write_emit_patch_diagnostic(patch_path, &msg);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!(
+                                "wild --emit-patch skipped: failed to mmap new output {}: {e}",
+                                args.output().display()
+                            );
+                            eprintln!("{msg}");
+                            write_emit_patch_diagnostic(patch_path, &msg);
+                        }
+                    },
+                    Err(e) => {
+                        let msg = format!(
+                            "wild --emit-patch skipped: failed to open new output {}: {e}",
+                            args.output().display()
+                        );
+                        eprintln!("{msg}");
+                        write_emit_patch_diagnostic(patch_path, &msg);
+                    }
+                },
+                None => {
+                    let reason = prev_output_capture
+                        .missing_reason
+                        .as_deref()
+                        .unwrap_or("previous output unavailable");
+                    let msg = format!(
+                        "wild --emit-patch skipped: {reason}; \
+                     this link seeds the baseline and the next changed link can emit a patch to {}",
+                        patch_path.display()
+                    );
+                    eprintln!("{msg}");
+                    write_emit_patch_diagnostic(patch_path, &msg);
+                }
+            }
+            match refresh_emit_patch_baseline(args.output()) {
+                Ok(sidecar_path) => {
+                    let msg = format!(
+                        "wild --emit-patch: updated previous-output baseline at {}",
+                        sidecar_path.display()
+                    );
+                    eprintln!("{msg}");
+                    write_emit_patch_diagnostic(patch_path, &msg);
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "wild --emit-patch: failed to update previous-output baseline from {}: {e}",
+                        args.output().display()
+                    );
+                    eprintln!("{msg}");
+                    write_emit_patch_diagnostic(patch_path, &msg);
+                }
+            }
+        }
+
         diff::maybe_diff()?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
@@ -350,6 +1105,227 @@ impl Linker {
 impl Default for Linker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pre-load variant of [`try_whole_link_skip`] — runs before
+/// `load_inputs` has opened a single file. Verifies the cache's
+/// paths + fingerprints + output size directly against the
+/// filesystem, bypassing wild's input-resolution pipeline.
+///
+/// Trade-offs vs the post-load version:
+///   * Wins ~130 ms (skip mmap + archive-member extract + symbol parse) when the cache is clean.
+///   * May false-miss if the cache is slightly stale — e.g. user changed a `-L` search path such
+///     that argv still hashes the same but the resolved input set would differ. In practice
+///     argv-hash equality is a strong signal because cargo's invocation is deterministic; if the
+///     argv changed, args_hash catches it.
+///
+/// Returns `true` on a safe skip. Never returns `true` without
+/// output-file size + existence + every cached input present.
+fn try_pre_load_skip<P: Platform>(args: &P::Args) -> bool {
+    let argv: Vec<String> = std::env::args().collect();
+    let args_hash = incremental_cache::compute_args_hash(&argv);
+    let hashes_path = incremental_cache::hashes_path_for_output(args.output());
+    let Some(cached) = incremental_cache::read_link_cache(&hashes_path) else {
+        return false;
+    };
+    if cached.wild_version != incremental_cache::WILD_VERSION {
+        return false;
+    }
+    if cached.args_hash != args_hash {
+        return false;
+    }
+    // Every cached input path must still be present with a matching
+    // fingerprint. This catches content changes AND missing / moved
+    // inputs without going through wild's own resolver.
+    if incremental_cache::verify_cached_inputs_unchanged(&cached.inputs).is_none() {
+        return false;
+    }
+    // Output still on disk at expected size — defence against
+    // manual edits / deletes since last link.
+    let output_path = args.output();
+    match std::fs::metadata(output_path) {
+        Ok(m) if m.len() == cached.output_size => {
+            eprintln!(
+                "wild incremental: PRE-LOAD SKIP — output at {} reused, \
+                 load_inputs bypassed",
+                output_path.display()
+            );
+            true
+        }
+        Ok(_) | Err(_) => false,
+    }
+}
+
+/// Returns `true` when the current link's signature (inputs + args +
+/// wild version) matches the cached one and the previous output file
+/// is still on disk at the expected size — i.e. when the caller is
+/// safe to return `Ok(LinkerOutput { layout: None })` without running
+/// resolve / layout / write. Returns `false` on any mismatch, missing
+/// cache, missing output, or size disagreement.
+///
+/// Emits a terse stderr line explaining the decision so users running
+/// with `WILD_INCREMENTAL_DEBUG=1` can see why a skip did or didn't
+/// fire.
+fn try_whole_link_skip<P: Platform>(file_loader: &FileLoader<'_>, args: &P::Args) -> bool {
+    let inputs: Vec<(&std::path::Path, &[u8])> = file_loader
+        .loaded_files
+        .iter()
+        .map(|f| (f.filename.as_path(), f.data()))
+        .collect();
+    let current_inputs = incremental_cache::hash_loaded_inputs(inputs);
+    let argv: Vec<String> = std::env::args().collect();
+    let current_args_hash = incremental_cache::compute_args_hash(&argv);
+
+    let hashes_path = incremental_cache::hashes_path_for_output(args.output());
+    let Some(cached) = incremental_cache::read_link_cache(&hashes_path) else {
+        eprintln!(
+            "wild incremental: no cache at {} — cold link (baseline will be \
+             captured afterwards)",
+            hashes_path.display()
+        );
+        return false;
+    };
+
+    let verdict =
+        incremental_cache::classify_signature(&current_args_hash, &current_inputs, &cached);
+    match verdict {
+        incremental_cache::SignatureVerdict::FullMatch => {
+            // Defence-in-depth: the cache believes the output is
+            // intact, but verify against the filesystem before
+            // trusting it. User could have deleted / truncated the
+            // binary; size mismatch forces a cold link.
+            let output_path = args.output();
+            let size_ok = match std::fs::metadata(output_path) {
+                Ok(m) if m.len() == cached.output_size => true,
+                Ok(m) => {
+                    eprintln!(
+                        "wild incremental: signature matched but output size \
+                         differs ({} on disk vs {} cached) — cold link",
+                        m.len(),
+                        cached.output_size
+                    );
+                    false
+                }
+                Err(e) => {
+                    eprintln!(
+                        "wild incremental: signature matched but output missing \
+                         ({}: {}) — cold link",
+                        output_path.display(),
+                        e
+                    );
+                    false
+                }
+            };
+            if size_ok {
+                eprintln!(
+                    "wild incremental: FULL LINK SKIP — output at {} reused",
+                    output_path.display()
+                );
+                return true;
+            }
+            false
+        }
+        incremental_cache::SignatureVerdict::Mismatch(why) => {
+            eprintln!("wild incremental: link signature mismatch: {why:?}");
+            false
+        }
+    }
+}
+
+/// Build a set of input paths whose content bytes fingerprint to the
+/// same value they had at the last link — i.e. *safe to replay from
+/// cache* under the tier-1 parse-skip read path. Mirrors
+/// `classify_dirty`'s logic but returns the complement (clean rather
+/// than dirty) and keyed by PathBuf for O(1) lookup during
+/// `run_object_parse_skip`.
+///
+/// Returns `None` when no parse-skip gate is active — skips the
+/// hashing work entirely on default-off links. Returns `Some(empty)`
+/// when gates are active but there's no prior cache on disk, which
+/// treats every input as dirty (the safe default — a first-link run
+/// populates caches; subsequent runs can replay).
+///
+/// Archive members inherit their parent `.rlib`'s verdict because
+/// `.wild-hashes` tracks whole-file fingerprints: a clean `.rlib`
+/// means every member is cacheable; a dirty one forces a re-parse of
+/// all members.
+fn compute_clean_input_paths<P: Platform>(
+    file_loader: &FileLoader<'_>,
+    args: &P::Args,
+) -> Option<std::collections::HashSet<std::path::PathBuf>> {
+    // Fast path: no gate active → don't hash inputs at all.
+    let canary = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some();
+    let read = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some();
+    if !canary && !read {
+        return None;
+    }
+
+    let inputs: Vec<(&std::path::Path, &[u8])> = file_loader
+        .loaded_files
+        .iter()
+        .map(|f| (f.filename.as_path(), f.data()))
+        .collect();
+    let current_inputs = incremental_cache::hash_loaded_inputs(inputs);
+
+    let hashes_path = incremental_cache::hashes_path_for_output(args.output());
+    let Some(cached) = incremental_cache::read_link_cache(&hashes_path) else {
+        // No prior link cache → every input is dirty. Returning an
+        // empty set (rather than None) keeps callers on the
+        // dirty-by-default branch without forcing an extra
+        // is-gate-active check.
+        return Some(std::collections::HashSet::new());
+    };
+
+    let mut clean = std::collections::HashSet::with_capacity(current_inputs.len());
+    for (path, hash) in &current_inputs {
+        if let Some(cached_hash) = cached.inputs.get(path)
+            && cached_hash == hash
+        {
+            clean.insert(path.clone());
+        }
+    }
+    Some(clean)
+}
+
+/// Persist this link's signature next to the output binary so the
+/// next link can check for whole-link-skip eligibility. Called only
+/// from the successful-link path; errors are non-fatal (a missing
+/// cache just forces the next link to cold-baseline).
+///
+/// If `file_loader.loaded_files` is empty the current link took the
+/// pre-load-skip path — there are no inputs to hash and the previous
+/// cache is already correct. Return without rewriting, otherwise we'd
+/// overwrite a valid cache with an empty input set and the next skip
+/// decision would falsely succeed with zero inputs to check.
+fn persist_link_cache<'data, P: Platform>(file_loader: &FileLoader<'data>, args: &P::Args) {
+    if file_loader.loaded_files.is_empty() {
+        return;
+    }
+    let inputs: Vec<(&std::path::Path, &[u8])> = file_loader
+        .loaded_files
+        .iter()
+        .map(|f| (f.filename.as_path(), f.data()))
+        .collect();
+    let current_inputs = incremental_cache::hash_loaded_inputs(inputs);
+    let argv: Vec<String> = std::env::args().collect();
+    let args_hash = incremental_cache::compute_args_hash(&argv);
+    let output_size = std::fs::metadata(args.output())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let cache = incremental_cache::LinkCache {
+        args_hash,
+        output_size,
+        wild_version: incremental_cache::WILD_VERSION.to_owned(),
+        inputs: current_inputs,
+    };
+    let hashes_path = incremental_cache::hashes_path_for_output(args.output());
+    if let Err(e) = incremental_cache::write_link_cache(&hashes_path, &cache) {
+        eprintln!(
+            "wild incremental: failed to persist cache to {}: {}",
+            hashes_path.display(),
+            e
+        );
     }
 }
 
@@ -421,4 +1397,657 @@ pub fn should_fork(args: &Args) -> bool {
 
 pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> {
     args.common_mut().activate_thread_pool()
+}
+
+#[derive(Default)]
+struct PreviousOutputCapture {
+    bytes: Option<&'static [u8]>,
+    source: Option<std::path::PathBuf>,
+    source_is_current_output: bool,
+    note: Option<String>,
+    missing_reason: Option<String>,
+}
+
+fn mmap_previous_output(output: &std::path::Path, allow_sidecar: bool) -> PreviousOutputCapture {
+    let mut attempts = Vec::new();
+    match mmap_existing_file(output) {
+        Ok(bytes) => {
+            return PreviousOutputCapture {
+                bytes: Some(bytes),
+                source: Some(output.to_path_buf()),
+                source_is_current_output: true,
+                ..PreviousOutputCapture::default()
+            };
+        }
+        Err(e) => attempts.push(format!("{}: {e}", output.display())),
+    }
+
+    if allow_sidecar {
+        let sidecar = emit_patch_baseline_path(output);
+        match mmap_existing_file(&sidecar) {
+            Ok(bytes) => {
+                return PreviousOutputCapture {
+                    bytes: Some(bytes),
+                    source: Some(sidecar.clone()),
+                    source_is_current_output: false,
+                    note: Some(format!(
+                        "wild --emit-patch: previous output at {} unavailable; using baseline {}",
+                        output.display(),
+                        sidecar.display()
+                    )),
+                    ..PreviousOutputCapture::default()
+                };
+            }
+            Err(e) => attempts.push(format!("{}: {e}", sidecar.display())),
+        }
+    }
+
+    PreviousOutputCapture {
+        missing_reason: Some(format!(
+            "no previous output available to diff against ({})",
+            attempts.join("; ")
+        )),
+        ..PreviousOutputCapture::default()
+    }
+}
+
+fn mmap_existing_file(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+    Ok(leaked.as_ref() as &'static [u8])
+}
+
+fn refresh_emit_patch_baseline(output: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let sidecar = emit_patch_baseline_path(output);
+    std::fs::copy(output, &sidecar)?;
+    Ok(sidecar)
+}
+
+fn emit_patch_baseline_path(output: &std::path::Path) -> std::path::PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".wild-prev-output");
+    std::path::PathBuf::from(path)
+}
+
+/// Write a wild-patch text file describing every byte run that differs
+/// between `prev` (the previous link's output) and `new` (this link's
+/// output). Adjacent differing bytes are coalesced into a single run.
+/// Designed to be consumed by an external patcher (e.g. BugStalker) that
+/// ptrace-writes each run into a still-running process.
+///
+/// File format (v3):
+/// ```text
+/// # wild-patch v3
+/// # old-size: <N>
+/// # new-size: <M>
+/// # old-blake3: <64-hex>
+/// # new-blake3: <64-hex>
+/// # entries: <K>
+/// # fn: <symbol-name>
+/// <hex-offset> <length> <hex-old-bytes> <hex-new-bytes>
+/// ...
+/// ```
+///
+/// Each data line carries BOTH the bytes that were at that offset in the
+/// previous link and the bytes that are there in this link. The patcher
+/// verifies the old bytes against the running process before writing —
+/// if the running process has drifted (someone else patched it, an
+/// earlier patch failed, the binary on disk is different from what's
+/// running), the patcher reports a clear diagnostic instead of silently
+/// corrupting the program.
+///
+/// `<hex-offset>` is the file offset (== virtual offset within the
+/// `__TEXT` segment for typical Mach-O / `.text` for typical ELF)
+/// where the run starts. `<length>` is its byte count. Both byte
+/// strings are exactly `length * 2` hex chars.
+///
+/// On a tail entry (when `new.len() > prev.len()`), the old bytes that
+/// extend beyond `prev.len()` are emitted as zeros — a fresh tail page
+/// in a live process will read as zeros too, so the verification still
+/// works in the typical case.
+fn emit_patch_file(prev: &[u8], new: &[u8], path: &std::path::Path) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let common = prev.len().min(new.len());
+    let mut i = 0;
+    while i < common {
+        if prev[i] == new[i] {
+            i += 1;
+        } else {
+            let start = i;
+            while i < common && prev[i] != new[i] {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        }
+    }
+    if new.len() > prev.len() {
+        runs.push((prev.len(), new.len() - prev.len()));
+    }
+
+    // Drop runs that fall in segments the consumer can never write
+    // to at runtime. On Mach-O that means any segment whose
+    // `maxprot` is read-only (typically `__LINKEDIT`, which holds
+    // the LC_CODE_SIGNATURE blob wild re-emits on every link).
+    // Emitting those bytes in the patch is pointless — the running
+    // process already validated the signature at load time, and the
+    // kernel refuses to let *anyone* modify those pages — and
+    // surfaces as a noisy `apply-patch` skip (or, before that fix,
+    // a hard `vm_write_word` failure).
+    let (runs, dropped_readonly) = filter_unpatchable_runs(runs, new);
+    if dropped_readonly > 0 {
+        write_emit_patch_diagnostic(
+            path,
+            &format!(
+                "wild --emit-patch: dropped {dropped_readonly} run(s) in read-only segments \
+                 (typically __LINKEDIT / codesign blob)"
+            ),
+        );
+    }
+
+    let symbol_ranges = patch_symbol_ranges(new);
+
+    let mut out = String::new();
+    writeln!(out, "# wild-patch v3").unwrap();
+    writeln!(out, "# old-size: {}", prev.len()).unwrap();
+    writeln!(out, "# new-size: {}", new.len()).unwrap();
+    writeln!(out, "# old-blake3: {}", blake3::hash(prev).to_hex()).unwrap();
+    writeln!(out, "# new-blake3: {}", blake3::hash(new).to_hex()).unwrap();
+    writeln!(out, "# entries: {}", runs.len()).unwrap();
+    for &(offset, length) in &runs {
+        if let Some(symbol) = symbol_for_offset(&symbol_ranges, offset as u64) {
+            writeln!(out, "# fn: {}", sanitize_patch_comment(symbol)).unwrap();
+        }
+        write!(out, "{offset:x} {length} ").unwrap();
+        // old bytes (zero-padded for any tail beyond prev.len())
+        for j in 0..length {
+            let b = prev.get(offset + j).copied().unwrap_or(0);
+            write!(out, "{b:02x}").unwrap();
+        }
+        write!(out, " ").unwrap();
+        // new bytes
+        for b in &new[offset..offset + length] {
+            write!(out, "{b:02x}").unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
+    std::fs::write(path, out)
+}
+
+/// Return file-offset ranges (`[start, end)`) of segments in a 64-bit
+/// Mach-O image whose `max_protection` permits neither write nor
+/// execute — i.e., regions the kernel will never let a debugger
+/// modify, even via `mach_vm_protect(VM_PROT_COPY)`.
+///
+/// On a typical macOS binary this is `__LINKEDIT` (`max_prot=0x1`);
+/// `__PAGEZERO` is also `max_prot=0x0` but has no file backing.
+/// Returns an empty vec for non-Mach-O inputs (ELF, raw binary,
+/// truncated data) — callers fall through to no filtering, which is
+/// correct since ELF runtime-immutability is a different question
+/// (handled at the consumer if at all).
+fn readonly_macho_segment_ranges(bytes: &[u8]) -> Vec<(u64, u64)> {
+    use object::macho;
+    use object::read::macho::MachHeader as _;
+
+    let le = object::Endianness::Little;
+    let Ok(header) = macho::MachHeader64::<object::Endianness>::parse(bytes, 0) else {
+        return Vec::new();
+    };
+    let Ok(mut cmds) = header.load_commands(le, bytes, 0) else {
+        return Vec::new();
+    };
+
+    const VM_PROT_WRITE: u32 = 0x2;
+    const VM_PROT_EXECUTE: u32 = 0x4;
+    const KERNEL_RESCUABLE: u32 = VM_PROT_WRITE | VM_PROT_EXECUTE;
+
+    let mut ranges = Vec::new();
+    while let Ok(Some(cmd)) = cmds.next() {
+        let Ok(Some((seg, _seg_data))) = cmd.segment_64() else {
+            continue;
+        };
+        let maxprot = seg.maxprot.get(le);
+        if maxprot & KERNEL_RESCUABLE != 0 {
+            // max_prot includes WRITE (we can write directly) or
+            // EXECUTE (we can VM_PROT_COPY → R+W → write → restore).
+            // Either way the consumer can patch this region.
+            continue;
+        }
+        let fileoff = seg.fileoff.get(le);
+        let filesize = seg.filesize.get(le);
+        if filesize == 0 {
+            // __PAGEZERO has filesize=0; nothing to filter.
+            continue;
+        }
+        ranges.push((fileoff, fileoff + filesize));
+    }
+    ranges
+}
+
+/// Drop any byte run that intersects a runtime-unwritable segment
+/// (per [`readonly_macho_segment_ranges`]). Returns the kept runs
+/// plus the count of dropped runs so the caller can report it.
+fn filter_unpatchable_runs(runs: Vec<(usize, usize)>, new: &[u8]) -> (Vec<(usize, usize)>, usize) {
+    let readonly = readonly_macho_segment_ranges(new);
+    if readonly.is_empty() {
+        return (runs, 0);
+    }
+    let mut kept = Vec::with_capacity(runs.len());
+    let mut dropped = 0usize;
+    for (off, len) in runs {
+        let run_start = off as u64;
+        let run_end = run_start + len as u64;
+        let intersects = readonly
+            .iter()
+            .any(|&(rs, re)| run_start < re && rs < run_end);
+        if intersects {
+            dropped += 1;
+        } else {
+            kept.push((off, len));
+        }
+    }
+    (kept, dropped)
+}
+
+fn write_emit_patch_diagnostic(patch_path: &std::path::Path, message: &str) {
+    use std::io::Write as _;
+
+    let path = emit_patch_diagnostic_path(patch_path);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{message}");
+}
+
+fn emit_patch_diagnostic_path(patch_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = patch_path.as_os_str().to_os_string();
+    path.push(".log");
+    std::path::PathBuf::from(path)
+}
+
+#[derive(Debug)]
+struct PatchSymbolRange {
+    file_start: u64,
+    file_end: u64,
+    name: String,
+}
+
+fn patch_symbol_ranges(bytes: &[u8]) -> Vec<PatchSymbolRange> {
+    use object::Object;
+    use object::ObjectSection;
+    use object::ObjectSymbol;
+    use object::SymbolKind;
+
+    let Ok(file) = object::File::parse(bytes) else {
+        return Vec::new();
+    };
+
+    #[derive(Debug)]
+    struct Candidate {
+        file_start: u64,
+        explicit_size: u64,
+        section_end: u64,
+        name: String,
+    }
+
+    let mut candidates = Vec::new();
+    for symbol in file.symbols() {
+        if !symbol.is_definition() || symbol.kind() != SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(section_index) = symbol.section_index() else {
+            continue;
+        };
+        let Ok(section) = file.section_by_index(section_index) else {
+            continue;
+        };
+        if section.kind() != object::SectionKind::Text {
+            continue;
+        }
+        let Some((section_file_start, section_file_size)) = section.file_range() else {
+            continue;
+        };
+        let section_addr = section.address();
+        let section_size = section.size();
+        let symbol_addr = symbol.address();
+        if symbol_addr < section_addr || symbol_addr >= section_addr.saturating_add(section_size) {
+            continue;
+        }
+        let section_offset = symbol_addr - section_addr;
+        if section_offset >= section_file_size {
+            continue;
+        }
+        candidates.push(Candidate {
+            file_start: section_file_start + section_offset,
+            explicit_size: symbol.size(),
+            section_end: section_file_start + section_file_size,
+            name: name.to_owned(),
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        a.file_start
+            .cmp(&b.file_start)
+            .then_with(|| b.explicit_size.cmp(&a.explicit_size))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    candidates.dedup_by(|a, b| a.file_start == b.file_start);
+
+    let mut ranges = Vec::with_capacity(candidates.len());
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let inferred_end = candidates
+            .iter()
+            .skip(idx + 1)
+            .find(|next| next.file_start > candidate.file_start)
+            .map_or(candidate.section_end, |next| next.file_start);
+        let explicit_end = candidate
+            .explicit_size
+            .checked_add(candidate.file_start)
+            .filter(|end| *end > candidate.file_start);
+        let file_end = explicit_end
+            .unwrap_or(inferred_end)
+            .min(candidate.section_end);
+        if file_end > candidate.file_start {
+            ranges.push(PatchSymbolRange {
+                file_start: candidate.file_start,
+                file_end,
+                name: candidate.name.clone(),
+            });
+        }
+    }
+    ranges
+}
+
+fn symbol_for_offset(ranges: &[PatchSymbolRange], offset: u64) -> Option<&str> {
+    let idx = ranges
+        .partition_point(|range| range.file_start <= offset)
+        .checked_sub(1)?;
+    let range = &ranges[idx];
+    (offset < range.file_end).then_some(range.name.as_str())
+}
+
+fn sanitize_patch_comment(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\r' => ' ',
+            _ => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod emit_patch_tests {
+    use super::*;
+
+    /// Build a minimal 64-bit Mach-O header + two LC_SEGMENT_64
+    /// commands. Returns the bytes; segments don't need to point at
+    /// real content — `readonly_macho_segment_ranges` only reads the
+    /// load-command headers.
+    ///
+    /// `segs`: list of `(name, fileoff, filesize, maxprot)`.
+    fn make_macho_with_segments(segs: &[(&[u8], u64, u64, u32)]) -> Vec<u8> {
+        const MH_MAGIC_64: u32 = 0xfeed_facf;
+        const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+        const MH_EXECUTE: u32 = 0x2;
+        const LC_SEGMENT_64: u32 = 0x19;
+        const SEGMENT_CMD_SIZE: u32 = 72;
+
+        let total_cmd_size = SEGMENT_CMD_SIZE * segs.len() as u32;
+        let mut out = Vec::with_capacity(32 + total_cmd_size as usize);
+
+        // mach_header_64 (32 bytes).
+        out.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+        out.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // cpusubtype
+        out.extend_from_slice(&MH_EXECUTE.to_le_bytes());
+        out.extend_from_slice(&(segs.len() as u32).to_le_bytes()); // ncmds
+        out.extend_from_slice(&total_cmd_size.to_le_bytes()); // sizeofcmds
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        // segment_command_64 (72 bytes each, 0 sections).
+        for (name, fileoff, filesize, maxprot) in segs {
+            out.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+            out.extend_from_slice(&SEGMENT_CMD_SIZE.to_le_bytes());
+            // segname [u8; 16] — zero-padded.
+            let mut padded = [0u8; 16];
+            padded[..name.len().min(16)].copy_from_slice(&name[..name.len().min(16)]);
+            out.extend_from_slice(&padded);
+            out.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+            out.extend_from_slice(&0u64.to_le_bytes()); // vmsize
+            out.extend_from_slice(&fileoff.to_le_bytes());
+            out.extend_from_slice(&filesize.to_le_bytes());
+            out.extend_from_slice(&maxprot.to_le_bytes());
+            out.extend_from_slice(&maxprot.to_le_bytes()); // initprot
+            out.extend_from_slice(&0u32.to_le_bytes()); // nsects
+            out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        }
+        out
+    }
+
+    #[test]
+    fn readonly_segments_only_includes_unwritable_unexecutable() {
+        // __TEXT (max_prot = R|X = 0x5) — patchable via VM_PROT_COPY.
+        // __LINKEDIT (max_prot = R = 0x1) — unpatchable.
+        // __DATA (max_prot = R|W = 0x3) — directly writable.
+        let bytes = make_macho_with_segments(&[
+            (b"__TEXT", 0x0000, 0x1000, 0x5),
+            (b"__DATA", 0x1000, 0x0100, 0x3),
+            (b"__LINKEDIT", 0x1100, 0x0200, 0x1),
+        ]);
+
+        let ranges = readonly_macho_segment_ranges(&bytes);
+        assert_eq!(ranges, vec![(0x1100, 0x1300)]);
+    }
+
+    #[test]
+    fn filter_drops_runs_in_linkedit_only() {
+        let bytes = make_macho_with_segments(&[
+            (b"__TEXT", 0x0000, 0x1000, 0x5),
+            (b"__LINKEDIT", 0x1000, 0x0100, 0x1),
+        ]);
+
+        // Three runs: one in __TEXT, one in __LINKEDIT, one
+        // straddling the boundary.
+        let runs = vec![
+            (0x0010, 4), // __TEXT only
+            (0x1020, 4), // __LINKEDIT only
+            (0x0ffe, 8), // straddles 0x1000 boundary
+        ];
+        let (kept, dropped) = filter_unpatchable_runs(runs, &bytes);
+
+        // Only the pure-__TEXT run survives. Both __LINKEDIT and
+        // the straddling run are dropped (the straddler intersects
+        // the read-only range so we err on the side of dropping —
+        // wild's tier-4 padding makes straddlers rare in practice).
+        assert_eq!(kept, vec![(0x0010, 4)]);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn non_macho_input_does_not_filter() {
+        // Random bytes — not a valid Mach-O. Falls back to the
+        // identity transform: every run is kept.
+        let bytes = vec![0xAAu8; 256];
+        let runs = vec![(0, 4), (32, 8), (200, 16)];
+        let (kept, dropped) = filter_unpatchable_runs(runs.clone(), &bytes);
+        assert_eq!(kept, runs);
+        assert_eq!(dropped, 0);
+    }
+
+    /// Build a Mach-O byte buffer with header+commands at the start
+    /// followed by the actual segment contents. Each segment's
+    /// `fileoff` points into the buffer; the buffer is sized to the
+    /// largest `fileoff + filesize`.
+    ///
+    /// `(name, content, maxprot)` triples; segments are laid out
+    /// contiguously after the load commands, page-aligned for
+    /// realism.
+    ///
+    /// Only used by the temp_dir-gated `emit_patch_includes_text_drops_linkedit`
+    /// test, so silenced on wasi (where that test is cfg'd out).
+    #[cfg_attr(target_os = "wasi", allow(dead_code))]
+    fn make_macho_with_content(
+        segs: &[(&[u8], &[u8], u32)],
+    ) -> (
+        Vec<u8>,
+        std::collections::HashMap<&'static str, std::ops::Range<usize>>,
+    ) {
+        const PAGE: usize = 0x1000;
+        const SEGMENT_CMD_SIZE: usize = 72;
+        const HEADER_SIZE: usize = 32;
+
+        // Place segments at page-aligned file offsets after the
+        // header + load commands.
+        let cmd_block_end = HEADER_SIZE + SEGMENT_CMD_SIZE * segs.len();
+        let first_seg_offset = cmd_block_end.div_ceil(PAGE) * PAGE;
+
+        // Compute layout.
+        let mut layout = Vec::with_capacity(segs.len());
+        let mut offset = first_seg_offset;
+        let mut name_for_test: std::collections::HashMap<&'static str, std::ops::Range<usize>> =
+            std::collections::HashMap::new();
+        for (name, content, _maxprot) in segs {
+            let start = offset;
+            let end = start + content.len();
+            layout.push((start as u64, content.len() as u64));
+            // Stable test-key: leak the &str via a leak-free lookup
+            // (we can't `&str -> &'static str` without unsafe, so
+            // just key by the bytes).
+            let key: &'static str = match *name {
+                b"__TEXT" => "__TEXT",
+                b"__LINKEDIT" => "__LINKEDIT",
+                b"__DATA" => "__DATA",
+                _ => "__OTHER",
+            };
+            name_for_test.insert(key, start..end);
+            offset = end.div_ceil(PAGE) * PAGE;
+        }
+
+        // Header bytes via the simpler helper, but with our chosen
+        // file offsets / sizes.
+        let mut typed: Vec<(&[u8], u64, u64, u32)> = Vec::with_capacity(segs.len());
+        for ((name, _content, maxprot), &(off, size)) in segs.iter().zip(layout.iter()) {
+            typed.push((name, off, size, *maxprot));
+        }
+        let mut bytes = make_macho_with_segments(&typed);
+
+        // Pad to the first segment offset, then write each segment's
+        // content at its declared file offset.
+        bytes.resize(first_seg_offset, 0);
+        for ((_name, content, _maxprot), &(off, _)) in segs.iter().zip(layout.iter()) {
+            let off = off as usize;
+            if off + content.len() > bytes.len() {
+                bytes.resize(off + content.len(), 0);
+            }
+            bytes[off..off + content.len()].copy_from_slice(content);
+        }
+
+        (bytes, name_for_test)
+    }
+
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn emit_patch_includes_text_drops_linkedit() {
+        // Build "prev" and "new" Mach-O fixtures that differ in BOTH
+        // __TEXT (codegen change — should appear in patch) and
+        // __LINKEDIT (codesign blob — should be filtered out).
+        let prev_text = b"old TEXT body, do not patch through";
+        let new_text = b"new TEXT body, please apply patch!!";
+        let prev_linkedit = b"old codesign blob aaaaaaaaaaaaaaaa";
+        let new_linkedit = b"new codesign blob bbbbbbbbbbbbbbbb";
+        assert_eq!(prev_text.len(), new_text.len());
+        assert_eq!(prev_linkedit.len(), new_linkedit.len());
+
+        let (prev_bytes, ranges) = make_macho_with_content(&[
+            (b"__TEXT", prev_text, 0x5),
+            (b"__LINKEDIT", prev_linkedit, 0x1),
+        ]);
+        let (new_bytes, _) = make_macho_with_content(&[
+            (b"__TEXT", new_text, 0x5),
+            (b"__LINKEDIT", new_linkedit, 0x1),
+        ]);
+
+        // Sanity: same overall layout, same total size.
+        assert_eq!(prev_bytes.len(), new_bytes.len());
+        let text_range = ranges["__TEXT"].clone();
+        let linkedit_range = ranges["__LINKEDIT"].clone();
+
+        // Emit the patch into a tempfile.
+        let tmpdir = std::env::temp_dir();
+        let patch_path = tmpdir.join(format!("wild-emit-patch-test-{}.patch", std::process::id()));
+        let _ = std::fs::remove_file(&patch_path);
+        let _ = std::fs::remove_file(emit_patch_diagnostic_path(&patch_path));
+
+        emit_patch_file(&prev_bytes, &new_bytes, &patch_path).expect("emit_patch_file");
+        let patch = std::fs::read_to_string(&patch_path).expect("read patch");
+
+        // The patch must contain at least one entry whose offset
+        // falls inside __TEXT, AND no entries whose offset falls
+        // inside __LINKEDIT.
+        let mut text_entries = 0usize;
+        let mut linkedit_entries = 0usize;
+        for line in patch.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            // data lines are: "<hex offset> <length> <hex old> <hex new>"
+            let mut parts = line.split_whitespace();
+            let off_str = parts.next().expect("offset field");
+            let off = usize::from_str_radix(off_str, 16).expect("hex offset");
+            if text_range.contains(&off) {
+                text_entries += 1;
+            } else if linkedit_range.contains(&off) {
+                linkedit_entries += 1;
+            }
+        }
+        assert!(
+            text_entries > 0,
+            "expected at least one __TEXT entry in patch, got 0\npatch:\n{patch}"
+        );
+        assert_eq!(
+            linkedit_entries, 0,
+            "expected zero __LINKEDIT entries in patch (filter must drop them), got {linkedit_entries}\npatch:\n{patch}"
+        );
+
+        // The diagnostic .log sidecar should mention the drop.
+        let log_path = emit_patch_diagnostic_path(&patch_path);
+        let log = std::fs::read_to_string(&log_path).expect("read .log sidecar");
+        assert!(
+            log.contains("dropped") && log.contains("read-only"),
+            "expected drop-count message in .log; got:\n{log}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&patch_path);
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn pagezero_with_zero_filesize_is_skipped() {
+        // __PAGEZERO has max_prot = 0 but filesize = 0 — there are
+        // no file bytes to filter, so it must NOT generate a range
+        // (an empty range would exclude offset 0 incorrectly).
+        let bytes =
+            make_macho_with_segments(&[(b"__PAGEZERO", 0, 0, 0), (b"__TEXT", 0, 0x1000, 0x5)]);
+        let ranges = readonly_macho_segment_ranges(&bytes);
+        assert!(
+            ranges.is_empty(),
+            "expected no read-only ranges, got {ranges:?}"
+        );
+    }
 }

@@ -239,6 +239,7 @@ struct LoadedLinkerScript<'data> {
 pub(crate) struct AuxiliaryFiles<'data> {
     pub(crate) version_script_data: Option<ScriptData<'data>>,
     pub(crate) export_list_data: Option<ScriptData<'data>>,
+    pub(crate) unexport_list_data: Option<ScriptData<'data>>,
 }
 
 impl<'data> AuxiliaryFiles<'data> {
@@ -263,6 +264,10 @@ impl<'data> AuxiliaryFiles<'data> {
                 .transpose()?,
             export_list_data: args
                 .export_list_path()
+                .map(|path| read_script_data(&resolve_script_path(path), inputs_arena))
+                .transpose()?,
+            unexport_list_data: args
+                .unexport_list_path()
                 .map(|path| read_script_data(&resolve_script_path(path), inputs_arena))
                 .transpose()?,
         })
@@ -615,6 +620,11 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
         let kind = FileKind::identify_bytes(&data.bytes)?;
 
         match kind {
+            FileKind::FatBinary => {
+                // TODO: Extract arm64 slice from universal binary.
+                // For now, skip fat binaries (e.g. libclang_rt.osx.a).
+                Ok(LoadedFileState::Archive(input_file, Vec::new()))
+            }
             FileKind::Archive => process_archive(input_file, &Arc::new(file), self),
             FileKind::ThinArchive => process_thin_archive(input_file, self),
             FileKind::Text => {
@@ -700,6 +710,99 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
         // supplied when actually needed, since GCC seems to pretty much always pass a plugin to the
         // linker.
         if kind.is_compiler_ir() {
+            // Wasm P3 path: lower LLVM bitcode to a wasm object via
+            // subprocess `llc` and treat the result as if it had
+            // always been a wasm object. Everything downstream
+            // (SymbolDb, Resolver, merge_inputs, …) sees only
+            // `FileKind::WasmObject` — the pipeline is unchanged.
+            // GCC bitcode never lands here (`GccIr != LlvmIr`), so
+            // the compatibility rule from wild-lto-plan.md holds.
+            if kind == FileKind::LlvmIr && self.args.wasm_bitcode_lowering_enabled() {
+                let stem = input_ref
+                    .file
+                    .filename
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("lto-input");
+                // Route through the LTO dispatcher so future phases
+                // (P4 batch / P5 unified / P8 Mach-O) plug in at a
+                // single call site. The dispatcher currently delegates
+                // to the P3 wasm lowerer for (Wasm, Llvm) — same
+                // byte-for-byte behaviour as before.
+                let ir = crate::lto::Ir::from_file_kind(kind)
+                    .expect("FileKind::LlvmIr above implies Ir::from_file_kind = Some");
+                let lowered_bytes =
+                    crate::lto::dispatch_bitcode_input(data, ir, crate::args::PlatformKind::Wasm)?;
+                // Persist the lowered object under a per-process temp
+                // dir so wild can mmap it with the usual lifetime.
+                let cache_dir =
+                    std::env::temp_dir().join(format!("wild-lto-{}", std::process::id()));
+                std::fs::create_dir_all(&cache_dir).map_err(|e| {
+                    crate::error!("create LTO object cache dir {}: {e}", cache_dir.display())
+                })?;
+                let obj_path = cache_dir.join(format!("{stem}.wasm32.o"));
+                std::fs::write(&obj_path, &lowered_bytes).map_err(|e| {
+                    crate::error!("write lowered object {}: {e}", obj_path.display())
+                })?;
+                let native_file_data = FileData::new(&obj_path, false)?;
+                let native_data = self.inputs_arena.alloc(InputFile {
+                    filename: input_ref.file.filename.clone(),
+                    original_filename: input_ref.file.original_filename.clone(),
+                    modifiers: input_ref.file.modifiers,
+                    data: Some(native_file_data),
+                });
+                let native_kind = FileKind::identify_bytes(native_data.data())?;
+                let native_ref = InputRef {
+                    file: native_data,
+                    entry: input_ref.entry,
+                };
+                let input_bytes = InputBytes {
+                    kind: native_kind,
+                    input: native_ref,
+                    data: native_data.data(),
+                    modifiers: input_ref.file.modifiers,
+                };
+                return Ok(InputRecord::Object(ParsedInputObject::new(
+                    &input_bytes,
+                    self.args,
+                )));
+            }
+            // If the platform provides a native LTO library (Mach-O libLTO.dylib),
+            // compile bitcode to native code immediately and treat as a regular object.
+            // Matches the gating on `pub(crate) mod macho_lto;` in lib.rs.
+            #[cfg(all(feature = "macho-lto", any(unix, windows)))]
+            if let Some(lto_lib_path) = self.args.lto_library_path() {
+                let filename = input_ref.file.filename.to_string_lossy().into_owned();
+                let obj_path = crate::macho_lto::compile_bitcode_to_file(
+                    data,
+                    lto_lib_path,
+                    &filename,
+                    self.args,
+                )?;
+                let native_file_data = FileData::new(&obj_path, false)?;
+                let native_data = self.inputs_arena.alloc(InputFile {
+                    filename: input_ref.file.filename.clone(),
+                    original_filename: input_ref.file.original_filename.clone(),
+                    modifiers: input_ref.file.modifiers,
+                    data: Some(native_file_data),
+                });
+                let native_kind = FileKind::identify_bytes(native_data.data())?;
+                let native_ref = InputRef {
+                    file: native_data,
+                    entry: input_ref.entry,
+                };
+                let input_bytes = InputBytes {
+                    kind: native_kind,
+                    input: native_ref,
+                    data: native_data.data(),
+                    modifiers: input_ref.file.modifiers,
+                };
+                return Ok(InputRecord::Object(ParsedInputObject::new(
+                    &input_bytes,
+                    self.args,
+                )));
+            }
+
             return Ok(InputRecord::LtoInput(Box::new(UnclaimedLtoInput {
                 input_ref,
                 file: Arc::clone(file),
@@ -707,7 +810,11 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
             })));
         }
 
-        if input_ref.is_archive_entry() && kind != FileKind::ElfObject {
+        if input_ref.is_archive_entry()
+            && kind != FileKind::ElfObject
+            && kind != FileKind::MachOObject
+            && kind != FileKind::WasmObject
+        {
             bail!("Unexpected archive member of kind {kind:?}: {input_ref}");
         }
 

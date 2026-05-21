@@ -1,0 +1,25 @@
+[package]
+name = "wilt"
+description = "WebAssembly In Link Time — a zero-copy WASM optimizer"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Per-body parallelism on multi-core hosts. See passes/* — the
+# gather-then-apply pattern keeps MutModule's API mutation-free during
+# the parallel phase.
+rayon = { workspace = true }
+# DWARF .debug_line parsing + emission for the `lines` debug tier.
+# Used only when a caller opts into `DebugLevel::Lines`; otherwise dead
+# code that LTO/DCE will strip. Apache-2.0/MIT; Rust compiler team.
+gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
+
+[dev-dependencies]
+wasmparser = "0.221"
+wat = "1.221"
+wasm-smith = "0.221"
+arbitrary = "1.1.0"
+proptest = "1"

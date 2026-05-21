@@ -100,11 +100,20 @@ pub(crate) const SYMTAB_SHNDX_LOCAL: OutputSectionId =
     part_id::SYMTAB_SHNDX_LOCAL.output_section_id();
 pub(crate) const SYMTAB_SHNDX_GLOBAL: OutputSectionId =
     part_id::SYMTAB_SHNDX_GLOBAL.output_section_id();
-// Mach-O specific sections
+// Mach-O specific sections (used by the Mach-O writer pipeline)
+#[allow(dead_code)]
+pub(crate) const OBJC_SELREFS: OutputSectionId = part_id::OBJC_SELREFS.output_section_id();
+#[allow(dead_code)]
+pub(crate) const OBJC_IMAGEINFO: OutputSectionId = part_id::OBJC_IMAGEINFO.output_section_id();
+#[allow(dead_code)]
 pub(crate) const PAGEZERO_SEGMENT: OutputSectionId = part_id::PAGEZERO_SEGMENT.output_section_id();
+#[allow(dead_code)]
 pub(crate) const TEXT_SEGMENT: OutputSectionId = part_id::TEXT_SEGMENT.output_section_id();
+#[allow(dead_code)]
 pub(crate) const DATA_SEGMENT: OutputSectionId = part_id::DATA_SEGMENT.output_section_id();
+#[allow(dead_code)]
 pub(crate) const ENTRY_POINT: OutputSectionId = part_id::ENTRY_POINT.output_section_id();
+#[allow(dead_code)]
 pub(crate) const LINK_EDIT_SEGMENT: OutputSectionId =
     part_id::LINK_EDIT_SEGMENT.output_section_id();
 
@@ -125,6 +134,7 @@ pub(crate) const GCC_EXCEPT_TABLE: OutputSectionId = OutputSectionId::regular(12
 pub(crate) const NOTE_ABI_TAG: OutputSectionId = OutputSectionId::regular(13);
 pub(crate) const DATA_REL_RO: OutputSectionId = OutputSectionId::regular(14);
 // Mach-O specific sections
+#[allow(dead_code)]
 pub(crate) const CSTRING: OutputSectionId = OutputSectionId::regular(15);
 
 pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 16;
@@ -657,6 +667,7 @@ impl<'data, P: Platform> OutputSections<'data, P> {
     pub(crate) fn output_order(
         &self,
         output_kind: OutputKind,
+        args: &P::Args,
     ) -> (OutputOrder, ProgramSegments<P::ProgramSegmentDef>) {
         timing_phase!("Compute output order");
 
@@ -694,7 +705,7 @@ impl<'data, P: Platform> OutputSections<'data, P> {
             }
         });
 
-        P::build_output_order_and_program_segments(&custom, output_kind, self, &secondary)
+        P::build_output_order_and_program_segments(&custom, output_kind, self, &secondary, args)
     }
 
     #[must_use]

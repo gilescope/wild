@@ -99,6 +99,13 @@ bitflags! {
         /// contains the PLT stub address (for address equality), rather than the IRELATIVE GOT
         /// entry which will be resolved to the actual function address at runtime.
         const IFUNC_GOT_FOR_ADDRESS = 1 << 14;
+
+        /// Mach-O only: this symbol is a `_objc_msgSend$<selector>` stub
+        /// reference. The linker synthesises a 32-byte selector-loading
+        /// stub plus an inline NUL-terminated methname string, with the
+        /// GOT slot rebased to the methname's address (acting as the
+        /// per-selector selref pointer the stub loads into x1).
+        const OBJC_STUB = 1 << 15;
     }
 }
 

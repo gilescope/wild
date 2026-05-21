@@ -1,0 +1,18 @@
+[package]
+name = "wild-client"
+description = "Thin client for the wild linker daemon — speaks the daemon's wire protocol with no libwild dependency, so client startup stays small (~5 ms) compared to the full wild binary."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "wild-client"
+path = "src/main.rs"
+
+[dependencies]
+# No deps. The wire protocol is included via #[path] from libwild's
+# daemon_protocol.rs to keep one source of truth without needing a
+# Cargo dependency edge.

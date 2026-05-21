@@ -5,8 +5,10 @@ members = [
     "linker-trace",
     "linker-utils",
     "wild",
+    "wild-client",
     "libwild",
     "benchmarks/runner",
+    "wilt",
 ]
 resolver = "2"
 
@@ -26,15 +28,17 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.97"
+sha2 = "0.10"
 ar = "0.9.0"
 atomic-take = "1.0.0"
-bitflags = "2.4.0"
+bitflags = "2.4.1"
 blake3 = { version = "1.0.0", features = ["rayon"] }
 bumpalo-herd = "0.1.2"
 bytesize = "2.0.0"
 clap = { version = "4.1.0", features = ["derive"] }
 colored = "3.0.0"
 colosseum = "0.2.2"
+addr2line = "0.25.1"
 crossbeam-queue = "0.3.10"
 crossbeam-utils = "0.8.18"
 derive_more = { version = "2.0.1", features = ["debug", "display"] }
@@ -59,11 +63,12 @@ libc = "0.2.171"
 libloading = "0.9.0"
 libtest-mimic = "0.8.2"
 memchr = "2.7.0"
-memmap2 = "0.9.0"
+memmap2 = "0.9.4"
 mimalloc = { version = "0.1", default-features = false }
 object = { version = "0.39.0", default-features = false, features = [
     "elf",
     "macho",
+    "wasm",
     "read_core",
     "std",
     "unaligned",
@@ -105,6 +110,16 @@ zstd = "0.13.0"
 
 [profile.release]
 codegen-units = 1
+
+# Custom profile used to build the thin daemon-client binary
+# (`wild-client`). Aggressive size + startup optimisations: full LTO,
+# `panic = "abort"` to drop unwind tables, and symbol strip. Inherits
+# release for everything else (codegen-units = 1, opt-level = 3).
+[profile.thin-bin]
+inherits = "release"
+panic = "abort"
+lto = "fat"
+strip = "symbols"
 
 [profile.release-debug]
 inherits = "release"

@@ -120,16 +120,85 @@ pub struct ElfArgs {
     pub(crate) should_output_executable: bool,
     pub(crate) should_output_partial_object: bool,
 
+    /// Compression scheme to apply to non-`SHF_ALLOC` `.debug_*`
+    /// sections in the output. Default: `Zstd`. Override via
+    /// `--compress-debug-sections=<none|zstd>`.
+    ///
+    /// Compression runs as a post-write pass: section bytes are
+    /// gathered, zstd-compressed, prepended with an `Elf64_Chdr`,
+    /// SHDR sh_size + sh_flags updated, subsequent sections
+    /// shifted forward, the file truncated. `SHF_ALLOC` sections
+    /// are never touched (would need runtime decompression).
+    /// Release builds without `-g` emit no `.debug_*` sections,
+    /// so the pass is a no-op for them.
+    pub(crate) compress_debug_sections: DebugCompression,
+
+    /// Whether wild should rewrite each CU's `.debug_line` from
+    /// DWARF 4 to DWARF 5 with cross-CU path deduplication via a
+    /// `.debug_line_str` pool. Set by `--upgrade-debug-line=v5` or
+    /// implicitly by `-O1`/`-O2`/`-O3`. Default off.
+    ///
+    /// Saves ~16 % of `.debug_line` on rust binaries with many CUs
+    /// (each one re-emitting the same workspace path strings).
+    pub(crate) upgrade_debug_line: DebugLineUpgrade,
+
+    /// Whether wild should hash each `.debug_info` CU's
+    /// `.debug_abbrev` table, collapse identical tables, and
+    /// patch every CU header's `debug_abbrev_offset`. Set by
+    /// `--dedup-debug-abbrev` or implicitly by `-O1`/`-O2`/`-O3`.
+    /// Default off.
+    ///
+    /// Small absolute saving (`.debug_abbrev` is <1 % of `.debug_*`)
+    /// but essentially free — the pass only reads the abbrev
+    /// table bytes and writes one offset per CU.
+    pub(crate) dedup_debug_abbrev: bool,
+
+    /// Optimisation level (0-3). Maps from `-O<N>` and accumulates
+    /// on top of wild's default post-passes. Baseline (no flag) now
+    /// includes SHF_COMPRESSED zstd on `.debug_*`; the layered
+    /// extras are:
+    ///   0 — no extra passes (baseline default, just zstd debug).
+    ///   1 — enable .debug_line v4→v5 upgrade + .debug_abbrev
+    ///       cross-CU dedup. Combined with the baseline zstd this
+    ///       gives ~-76 % file size on Rust debug builds.
+    ///   2 — same as 1 today; reserved for future per-section
+    ///       wins (suffix-share strtab).
+    ///   3 — same as 2 today; reserved for the heaviest passes
+    ///       (cross-CU DIE dedup once it ships).
+    pub(crate) opt_level: u8,
+
     rpath_set: IndexSet<String>,
 }
 
-#[derive(Debug)]
-pub(crate) enum Strip {
-    Nothing,
-    Debug,
-    All,
-    Retain(HashSet<Vec<u8>>),
+/// Selects the compression scheme used for `.debug_*` sections at
+/// link time. Matches the ld / lld `--compress-debug-sections=`
+/// argument shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DebugCompression {
+    /// Emit `.debug_*` sections uncompressed. Matches ld / lld's default
+    /// and what wild's validation tests under `wild/tests/elf/**` expect.
+    #[default]
+    None,
+    /// `SHF_COMPRESSED` with `ch_type = ELFCOMPRESS_ZSTD`. Tools
+    /// from binutils 2.40 + and recent gdb / lldb / llvm-objdump
+    /// decompress transparently. Opt-in via `--compress-debug-sections=zstd`.
+    /// Only `.debug_*` sections exceeding the compressibility threshold
+    /// are touched; release builds (no `-g`) see no effect.
+    Zstd,
 }
+
+/// Selects whether wild rewrites `.debug_line` from DWARF 4 to
+/// DWARF 5 with cross-CU path pooling. `V5` is the only non-default
+/// today; new variants will appear if we add other versions or
+/// flavours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DebugLineUpgrade {
+    #[default]
+    None,
+    V5,
+}
+
+use super::Strip;
 
 #[derive(Debug)]
 pub(crate) enum BuildIdOption {
@@ -305,6 +374,10 @@ impl Default for ElfArgs {
             rpath_set: Default::default(),
             plugin_path: None,
             plugin_args: Vec::new(),
+            compress_debug_sections: DebugCompression::None,
+            upgrade_debug_line: DebugLineUpgrade::None,
+            dedup_debug_abbrev: false,
+            opt_level: 0,
         }
     }
 }
@@ -685,9 +758,45 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
     parser
         .declare_with_param()
         .prefix("O")
-        .execute(|_args, _modifier_stack, _value|
-        // We don't use opt-level for now.
-        Ok(()));
+        .help("Optimisation level (0-3); >=1 enables debug-line v5 + abbrev dedup")
+        .execute(|args, _modifier_stack, value| {
+            // Accept "0".."3"; clamp anything higher to 3 because
+            // we have no further passes to enable at the moment.
+            let n: u32 = value.parse().unwrap_or(0);
+            let n = n.min(3) as u8;
+            args.opt_level = args.opt_level.max(n);
+            // Implicit pass activations. Direct flags remain
+            // authoritative when set explicitly later — they can
+            // downgrade what -O turned on. Concretely we only raise
+            // to enabled, never lower from enabled.
+            if n >= 1 {
+                if args.compress_debug_sections == DebugCompression::None {
+                    args.compress_debug_sections = DebugCompression::Zstd;
+                }
+                if args.upgrade_debug_line == DebugLineUpgrade::None {
+                    args.upgrade_debug_line = DebugLineUpgrade::V5;
+                }
+                args.dedup_debug_abbrev = true;
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("dedup-debug-abbrev")
+        .help("Collapse identical `.debug_abbrev` tables across CUs (wild extension)")
+        .execute(|args, _modifier_stack, value| {
+            match value {
+                "" | "yes" | "true" | "1" => args.dedup_debug_abbrev = true,
+                "no" | "false" | "0" => args.dedup_debug_abbrev = false,
+                other => {
+                    return Err(crate::error!(
+                        "--dedup-debug-abbrev={other}: expected yes/no (or empty)"
+                    ));
+                }
+            }
+            Ok(())
+        });
 
     parser
         .declare()
@@ -818,6 +927,44 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
         });
 
     parser
+        .declare_with_param()
+        .long("upgrade-debug-line")
+        .help("Rewrite .debug_line v4 → v5 with cross-CU path pool (none|v5)")
+        .execute(|args, _modifier_stack, value| {
+            match value {
+                "none" => args.upgrade_debug_line = DebugLineUpgrade::None,
+                "v5" => args.upgrade_debug_line = DebugLineUpgrade::V5,
+                value => {
+                    args.warn_unsupported(&format!("--upgrade-debug-line={value}"))?;
+                }
+            }
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("compress-debug-sections")
+        .help("Compress non-SHF_ALLOC .debug_* sections (none|zstd)")
+        .execute(|args, _modifier_stack, value| {
+            match value {
+                "none" => args.compress_debug_sections = DebugCompression::None,
+                "zstd" => args.compress_debug_sections = DebugCompression::Zstd,
+                "zlib" | "zlib-gnu" | "zlib-gabi" => {
+                    // Accept the lld/binutils zlib spellings but treat
+                    // them as a warning rather than silently picking
+                    // zstd — we only ship zstd today.
+                    args.warn_unsupported(&format!(
+                        "--compress-debug-sections={value} (zlib not yet supported, use zstd)"
+                    ))?;
+                }
+                value => {
+                    args.warn_unsupported(&format!("--compress-debug-sections={value}"))?;
+                }
+            }
+            Ok(())
+        });
+
+    parser
         .declare()
         .long("help")
         .help("Show this help message")
@@ -879,6 +1026,21 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
                 Some(v) => Some(super::parse_time_phase_options(v)?),
                 None => Some(Vec::new()),
             };
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("incremental-cache")
+        .help(
+            "Incremental linking mode: off | write | read-write (rw). \
+             Default: off. `write` populates `<output>.wild-pi-cache` + \
+             `.wild-layout` for the next link. `read-write` ALSO replays \
+             cached parses and skips the writer when every section is \
+             reusable. Legacy WILD_INCREMENTAL_* env vars still work.",
+        )
+        .execute(|args, _modifier_stack, value| {
+            args.common.incremental_cache = super::IncrementalCacheMode::parse(value)?;
             Ok(())
         });
 

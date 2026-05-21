@@ -89,6 +89,7 @@ pub struct SymbolDb<'data, P: Platform> {
 
     pub(crate) version_script: VersionScript<'data>,
     pub(crate) export_list: Option<ExportList<'data>>,
+    pub(crate) unexport_list: Option<ExportList<'data>>,
 
     /// The name of the entry symbol if overridden by a linker script.
     entry: Option<&'data [u8]>,
@@ -127,15 +128,38 @@ struct SymbolBucket<'data> {
 
 /// A global symbol that hasn't been put into our database yet.
 #[derive(Clone, Copy)]
-struct PendingSymbol<'data> {
+pub(crate) struct PendingSymbol<'data> {
     symbol_id: SymbolId,
     name: PreHashed<UnversionedSymbolName<'data>>,
 }
 
 #[derive(Clone, Copy)]
-struct PendingVersionedSymbol<'data> {
+pub(crate) struct PendingVersionedSymbol<'data> {
     symbol_id: SymbolId,
     name: PreHashed<VersionedSymbolName<'data>>,
+}
+
+impl<'data> PendingSymbol<'data> {
+    pub(crate) fn name(&self) -> &PreHashed<UnversionedSymbolName<'data>> {
+        &self.name
+    }
+
+    #[allow(dead_code)] // used only on debug-canary builds.
+    pub(crate) fn symbol_id(&self) -> SymbolId {
+        self.symbol_id
+    }
+}
+
+impl<'data> PendingVersionedSymbol<'data> {
+    #[allow(dead_code)] // used only on debug-canary builds.
+    pub(crate) fn name(&self) -> &PreHashed<VersionedSymbolName<'data>> {
+        &self.name
+    }
+
+    #[allow(dead_code)] // used only on debug-canary builds.
+    pub(crate) fn symbol_id(&self) -> SymbolId {
+        self.symbol_id
+    }
 }
 
 /// An ID for a symbol. All symbols from all input files are allocated a unique symbol ID. The
@@ -271,7 +295,12 @@ impl Iterator for SymbolIdRangeIterator {
     }
 }
 
-struct SymbolLoadOutputs<'data> {
+/// New `(key, bytes)` rows that the parsed-input cache should adopt as a
+/// side-effect of reading a group's symbols. Returned alongside
+/// [`SymbolLoadOutputs`] from the group-read path.
+pub(crate) type BundleAdditions = Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)>;
+
+pub(crate) struct SymbolLoadOutputs<'data> {
     /// Pending non-versioned symbols, grouped by hash bucket.
     pending_symbols_by_bucket: Vec<PendingSymbolHashBucket<'data>>,
 }
@@ -335,6 +364,11 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             .map(ExportList::parse)
             .transpose()?;
 
+        let unexport_list = auxiliary
+            .unexport_list_data
+            .map(ExportList::parse)
+            .transpose()?;
+
         let num_buckets = num_symbol_hash_buckets(args);
         let mut buckets = Vec::new();
         buckets.resize_with(num_buckets, || SymbolBucket {
@@ -353,6 +387,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             start_stop_symbol_names: Default::default(),
             version_script,
             export_list,
+            unexport_list,
             entry: None,
             output_kind,
             herd,
@@ -361,6 +396,13 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         for symbol in args.force_export_symbol_names() {
             symbol_db
                 .export_list
+                .get_or_insert_default()
+                .add_symbol(symbol, true)?;
+        }
+
+        for symbol in args.force_unexport_symbol_names() {
+            symbol_db
+                .unexport_list
                 .get_or_insert_default()
                 .add_symbol(symbol, true)?;
         }
@@ -374,6 +416,8 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         output_sections: &mut OutputSections<'data, P>,
         layout_rules_builder: &mut LayoutRulesBuilder<'data>,
         loaded: LoadedInputs<'data, P>,
+        clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+        bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
     ) -> Result {
         timing_phase!("Load inputs into symbol DB");
 
@@ -426,6 +470,8 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             self.args,
             &self.export_list,
             self.output_kind,
+            clean_input_paths,
+            bundle,
         )?;
 
         populate_symbol_db(&mut self.buckets, &per_group_outputs);
@@ -899,6 +945,10 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         self.args.entry_symbol_name(self.entry)
     }
 
+    pub(crate) fn has_explicit_entry(&self) -> bool {
+        self.args.has_explicit_entry()
+    }
+
     pub(crate) fn defsym_defined_via_cli_option(&self, symbol_name: &[u8]) -> bool {
         self.args
             .defsym()
@@ -1015,12 +1065,35 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         }
     }
 
+    /// Returns whether the symbol is a weak reference (N_WEAK_REF on Mach-O).
+    pub(crate) fn is_weak_ref(&self, symbol_id: SymbolId) -> bool {
+        let file_id = self.file_id_for_symbol(symbol_id);
+        match &self.groups[file_id.group()] {
+            Group::Objects(objects) => {
+                let file = &objects[file_id.file()];
+                let local_index = file.symbol_id_range.id_to_input(symbol_id);
+                file.parsed
+                    .object
+                    .symbol(local_index)
+                    .is_ok_and(|sym| sym.is_weak())
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn warning(&self, message: impl Into<String>) {
         self.args.warning(message);
     }
 }
 
 pub(crate) fn linker_plugin_disabled_error() -> Error {
+    // Original upstream wording. Integration tests in
+    // `wild/tests/sources/elf/linker-plugin-lto/` assert this line as
+    // the fallback a plugin-less wild emits when it sees LLVM bitcode
+    // or GCC LTO sections — changing it silently breaks those tests.
+    // If we want to surface extra platform-specific advice (wasm-LTO
+    // workarounds etc.) that should go in a caller close to the
+    // platform, not baked into this shared error.
     error!("Wild was compiled without linker-plugin support, but LTO inputs were detected")
 }
 
@@ -1171,7 +1244,7 @@ pub(crate) fn resolve_alternative_symbol_definitions<'data, P: Platform>(
             .collect_vec()
             .join("\n");
 
-        bail!("Duplicate symbols detected: {error_details}");
+        bail!("{error_details}");
     }
 
     symbol_db.buckets = buckets;
@@ -1198,11 +1271,33 @@ fn process_alternatives<'data, P: Platform>(
         // the visibility we'll use for our selected symbol. This seems like odd behaviour, but it
         // matches what GNU ld appears to do and some programs will fail to link if we don't do
         // this.
-        let visibility = alternatives
-            .iter()
-            .fold(symbol_db.input_symbol_visibility(first), |vis, id| {
-                vis.max(symbol_db.input_symbol_visibility(*id))
-            });
+        //
+        // Platform exception (Mach-O via `ALL_WEAK_MIN_VISIBILITY`): if every alternative is a
+        // weak definition, take the *least* restrictive visibility instead. Mach-O's
+        // `weak_def_can_be_hidden` directive (`N_WEAK_DEF | N_WEAK_REF`) hides the symbol only
+        // if every defining translation unit agrees; a single peer without the flag must
+        // promote the merged symbol back to default visibility. ELF has no equivalent —
+        // `STV_HIDDEN` is unconditional, so this branch stays off.
+        let all_weak = P::ALL_WEAK_MIN_VISIBILITY
+            && std::iter::once(first)
+                .chain(alternatives.iter().copied())
+                .all(|id| symbol_db.symbol_strength(id, resolved) == SymbolStrength::Weak);
+        let saw_hidden_alternative = all_weak
+            && (symbol_db.input_symbol_visibility(first) == Visibility::Hidden
+                || alternatives
+                    .iter()
+                    .any(|id| symbol_db.input_symbol_visibility(*id) == Visibility::Hidden));
+        let visibility =
+            alternatives
+                .iter()
+                .fold(symbol_db.input_symbol_visibility(first), |vis, id| {
+                    let other = symbol_db.input_symbol_visibility(*id);
+                    if all_weak {
+                        vis.min(other)
+                    } else {
+                        vis.max(other)
+                    }
+                });
 
         match select_symbol(symbol_db, per_symbol_flags, first, &alternatives, resolved) {
             Ok(selected) => {
@@ -1215,9 +1310,24 @@ fn process_alternatives<'data, P: Platform>(
                 if visibility != Visibility::Default {
                     handle_non_default_visibility(per_symbol_flags, first, visibility);
 
-                    for alt in alternatives {
-                        handle_non_default_visibility(per_symbol_flags, alt, visibility);
+                    for alt in &alternatives {
+                        handle_non_default_visibility(per_symbol_flags, *alt, visibility);
                     }
+                } else if P::PROMOTE_WEAK_TO_EXPORT_DYNAMIC && saw_hidden_alternative {
+                    // The min-visibility merge promoted at least one originally-hidden
+                    // weak alternative back to default. Clear any `DOWNGRADE_TO_LOCAL`
+                    // that load_symbols set on the originally-hidden alternatives, then
+                    // force `EXPORT_DYNAMIC` on the selected symbol. Without the export
+                    // flag, an unreferenced weak def would skip the resolution pipeline
+                    // (no `has_resolution`) and never reach the exports trie.
+                    for id in std::iter::once(first).chain(alternatives.iter().copied()) {
+                        per_symbol_flags
+                            .get_atomic(id)
+                            .remove(ValueFlags::DOWNGRADE_TO_LOCAL);
+                    }
+                    per_symbol_flags
+                        .get_atomic(selected)
+                        .or_assign(ValueFlags::EXPORT_DYNAMIC);
                 }
             }
             Err(err) => {
@@ -1305,16 +1415,23 @@ fn select_symbol<'data, P: Platform>(
             // We don't implement full COMDAT logic, however if we encounter duplicate
             // strong definitions, then we don't emit errors if all the strong definitions
             // are defined in COMDAT group sections.
-            if (!symbol_db.is_in_comdat_group(existing, resolved)
-                || !symbol_db.is_in_comdat_group(id, resolved))
-                && !symbol_db.db.args.allow_multiple_definitions()
-            {
-                bail!(
-                    "{}, defined in {} and {}",
-                    symbol_db.symbol_name_for_display(first_id),
-                    symbol_db.file(symbol_db.file_id_for_symbol(existing)),
-                    symbol_db.file(symbol_db.file_id_for_symbol(id)),
-                );
+            let comdat_protected = symbol_db.is_in_comdat_group(existing, resolved)
+                && symbol_db.is_in_comdat_group(id, resolved);
+            if !comdat_protected {
+                if !symbol_db.db.args.allow_multiple_definitions() {
+                    bail!(
+                        "duplicate symbol: {}: {}: {}",
+                        symbol_db.file(symbol_db.file_id_for_symbol(id)),
+                        symbol_db.file(symbol_db.file_id_for_symbol(existing)),
+                        symbol_db.symbol_name_for_display(first_id),
+                    );
+                }
+                if symbol_db.db.args.warn_multiple_definitions() {
+                    eprintln!(
+                        "warning: duplicate symbol: {}",
+                        symbol_db.symbol_name_for_display(first_id),
+                    );
+                }
             }
         }
 
@@ -1430,12 +1547,22 @@ fn read_symbols<'data, P: Platform>(
     args: &P::Args,
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
+    clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
 ) -> Result<Vec<SymbolLoadOutputs<'data>>> {
     timing_phase!("Read symbols");
 
     let num_buckets = num_symbol_hash_buckets(args);
 
-    shards
+    // Run all groups in parallel. Each returns the symbol outputs PLUS
+    // any (key, blob) pairs the write/canary path produced — those get
+    // merged into one bundle below instead of fanning out N file writes
+    // (which on bevy-dylib was ~200 ms of fs::write storm).
+    type GroupOutput<'d> = (
+        SymbolLoadOutputs<'d>,
+        Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)>,
+    );
+    let per_group: Vec<GroupOutput<'data>> = shards
         .par_iter_mut()
         .map(|shard| {
             read_symbols_for_group(
@@ -1445,9 +1572,207 @@ fn read_symbols<'data, P: Platform>(
                 num_buckets,
                 args,
                 output_kind,
+                clean_input_paths,
+                bundle,
             )
         })
-        .collect::<Result<Vec<SymbolLoadOutputs>>>()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut outputs = Vec::with_capacity(per_group.len());
+    let mut bundle_builder = crate::parsed_input_cache::BundleBuilder::new();
+    for (out, pending) in per_group {
+        outputs.push(out);
+        for (key, blob) in pending {
+            bundle_builder.push(key, blob);
+        }
+    }
+
+    // Write the bundle once for the whole link. Tier-1.5 win: replaces
+    // 1649-file fan-out with a single atomic write.
+    if !bundle_builder.is_empty() {
+        let bundle_path = crate::parsed_input_cache::bundle_path_for_output(args.output());
+        // Best-effort: any IO error drops the bundle silently. The
+        // next link will just re-parse — correctness invariant is "a
+        // missing or corrupt bundle MUST NOT prevent the link", so we
+        // never fail upward from here.
+        if let Err(e) = bundle_builder.write_to(&bundle_path)
+            && std::env::var_os("WILD_INCREMENTAL_DEBUG").is_some()
+        {
+            eprintln!(
+                "wild parse-skip: bundle write to {} failed: {}",
+                bundle_path.display(),
+                e
+            );
+        }
+    }
+
+    Ok(outputs)
+}
+
+/// Env-var gates for tier-1 incremental-link parse-skip. Three
+/// independent axes:
+///
+/// * `WILD_INCREMENTAL_PARSE_SKIP_WRITE=1` (alias: `WILD_INCREMENTAL_PARSE_SKIP=1`) — tee every
+///   parse into an on-disk cache file. Safe: writes are best-effort side-car files that can't
+///   affect link correctness.
+/// * `WILD_INCREMENTAL_PARSE_SKIP_CANARY=1` — ALSO load any existing cache for each input,
+///   freshly-build a cache from the live parse, and compare them byte-for-byte. Any divergence
+///   panics the link with a clear diagnostic. Implies write (a successful canary refreshes the disk
+///   cache). Intended for CI + dev canary runs.
+/// * `WILD_INCREMENTAL_PARSE_SKIP_READ=1` — SKIP the parse entirely when a cache exists, replaying
+///   the cached symbol stream. Only safe once the canary has been green across the relevant input
+///   set; wild itself never enables this implicitly.
+///
+/// Checked once per group (not per symbol) so the env lookups don't
+/// pollute the hot path.
+#[derive(Clone, Copy)]
+struct ParseSkipGates {
+    write: bool,
+    canary: bool,
+    read: bool,
+}
+
+impl ParseSkipGates {
+    fn from_env() -> Self {
+        let canary = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_CANARY").is_some();
+        let read = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_some();
+        let write_explicit = std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_some()
+            || std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_some();
+        // Canary implies write so the on-disk cache stays fresh after
+        // a clean compare. Read implies write for the same reason —
+        // a cache miss should populate the cache for next time.
+        let write = write_explicit || canary || read;
+        Self {
+            write,
+            canary,
+            read,
+        }
+    }
+}
+
+/// Orchestrates read / canary / write for a single object input. The
+/// combined logic lives here so the call-site in
+/// `read_symbols_for_group` stays a single line and the gates-driven
+/// branching is easy to audit.
+/// Returns the fresh [`CacheBuilder`] when the caller should persist
+/// it after the parse loop finishes, or `None` when replay fired or
+/// no write gate is active. Persistence is bubbled up by the caller
+/// to be merged into the per-output bundle (tier-1.5).
+fn run_object_parse_skip<'data, 'view, P: Platform>(
+    obj: &SequencedInputObject<'data, P>,
+    version_script: &VersionScript,
+    sink: &mut DefaultSymbolSink<'_, '_, '_, 'data, P>,
+    args: &P::Args,
+    export_list: &Option<ExportList<'data>>,
+    output_kind: OutputKind,
+    gates: ParseSkipGates,
+    cached_view: Option<&'view crate::parsed_input_cache::CacheView<'data>>,
+) -> Result<Option<crate::parsed_input_cache::CacheBuilder>> {
+    // READ path (no canary): if a cache was pre-fetched for this
+    // input, replay and skip the parse entirely. The caller has
+    // already verified per-input cleanness via `.wild-hashes` before
+    // building `cached_view`, and the mmap loader validated the
+    // header — so presence here implies safety to reuse without a
+    // third validation.
+    if gates.read
+        && !gates.canary
+        && let Some(view) = cached_view
+    {
+        crate::parse_skip::replay_cached_symbols(view, obj.file_id, sink);
+        crate::parse_skip::STATS
+            .replayed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+
+    // From this point we're re-parsing — count the re-parse before
+    // the heavy work starts so the counter reflects intent even on
+    // error-return paths below.
+    crate::parse_skip::STATS
+        .reparsed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Parse normally. Under write/canary, tee into a fresh
+    // CacheBuilder; its bytes become both the canary's reference and
+    // the persisted cache.
+    let mut tee = crate::parse_skip::TeeSink::new(
+        sink as &mut dyn SymbolSink<'data>,
+        if gates.write {
+            Some(crate::parsed_input_cache::CacheBuilder::default())
+        } else {
+            None
+        },
+    );
+
+    load_symbols_from_file(
+        obj,
+        version_script,
+        &mut tee,
+        args,
+        export_list,
+        output_kind,
+    )
+    .with_context(|| format!("Failed to load symbols from `{}`", obj.parsed.input))?;
+
+    let Some(builder) = tee.take_cache() else {
+        return Ok(None);
+    };
+
+    // CANARY: compare against the pre-fetched disk cache. `cached_view`
+    // is `Some` only for clean inputs (caller-gated), so any divergence
+    // here is a schema or cache-file bug, not a content-changed
+    // false-positive.
+    if gates.canary
+        && let Some(view) = cached_view
+    {
+        let fresh_bytes = builder.clone_bytes();
+        let disk_bytes = view.as_bytes();
+        if fresh_bytes != disk_bytes {
+            panic_canary_diff(obj, &fresh_bytes, disk_bytes);
+        }
+        crate::parse_skip::STATS
+            .canary_matched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Defer the disk write to the caller — it batches all builders
+    // from the group and fans them out across rayon workers.
+    Ok(Some(builder))
+}
+
+/// Emit a rustc-style diff between the freshly-parsed stream and the
+/// on-disk cache, then panic. Called only under canary mode, at the
+/// first point of divergence per-input. Intentionally chatty — this
+/// message is what alerts CI / dev to a broken cache invariant.
+fn panic_canary_diff<'data, P: Platform>(
+    obj: &SequencedInputObject<'data, P>,
+    fresh: &[u8],
+    disk: &[u8],
+) {
+    let path = obj.parsed.input.file.filename.as_path().display();
+    let entry = obj
+        .parsed
+        .input
+        .entry
+        .as_ref()
+        .map(|e| String::from_utf8_lossy(e.identifier.as_slice()).into_owned())
+        .unwrap_or_default();
+    panic!(
+        "wild parse-skip canary mismatch for `{path}`{entry_tag}:\n  \
+         fresh parse emitted {fresh_len} bytes\n  \
+         cached file holds  {disk_len} bytes\n\
+         This indicates the parsed-input cache format cannot round-trip \
+         this input losslessly (or the on-disk cache is stale). Delete \
+         ~/.cache/wild/parsed-inputs/ to force a refresh and retry; if \
+         it reproduces, the schema needs a bump.",
+        entry_tag = if entry.is_empty() {
+            String::new()
+        } else {
+            format!(" (archive entry `{entry}`)")
+        },
+        fresh_len = fresh.len(),
+        disk_len = disk.len(),
+    );
 }
 
 fn read_symbols_for_group<'data, P: Platform>(
@@ -1457,7 +1782,9 @@ fn read_symbols_for_group<'data, P: Platform>(
     num_buckets: usize,
     args: &P::Args,
     output_kind: OutputKind,
-) -> Result<SymbolLoadOutputs<'data>> {
+    clean_input_paths: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    bundle: Option<&'static crate::parsed_input_cache::BundleView<'static>>,
+) -> Result<(SymbolLoadOutputs<'data>, BundleAdditions)> {
     verbose_timing_phase!(
         "Read group symbols",
         group_id = shard.group.group_id(),
@@ -1468,27 +1795,100 @@ fn read_symbols_for_group<'data, P: Platform>(
         pending_symbols_by_bucket: vec![PendingSymbolHashBucket::default(); num_buckets],
     };
 
-    match shard.group {
+    // (key, blob_bytes) pairs to merge into the bundle at end of link.
+    // Local to this group; merged into the global bundle by the
+    // caller. Allocated empty so non-Objects groups return cleanly.
+    let mut pending_blobs: Vec<([u8; crate::parsed_input_cache::BUNDLE_KEY_LEN], Vec<u8>)> =
+        Vec::new();
+
+    // Pull `group` out of the shard as a Copy ref before we hand the
+    // shard into the sink's &mut. Matching on `shard.group` after the
+    // sink owns &mut shard would conflict with the sink's reservation.
+    let group = shard.group;
+    let mut sink = DefaultSymbolSink::new(shard, &mut outputs);
+
+    match group {
         Group::Prelude(prelude) => {
-            prelude.load_symbols(shard, &mut outputs);
+            prelude.load_symbols(&mut sink);
         }
         Group::Objects(parsed_input_objects) => {
-            for obj in *parsed_input_objects {
-                load_symbols_from_file(
+            let gates = ParseSkipGates::from_env();
+            // Tier-1.5 read path: one bundle for the whole link, mmap'd
+            // once at link start and passed in here. Per-input lookup
+            // is an O(1) `HashMap` hit on `bundle_key`. No filesystem
+            // I/O on the prefetch hot path — the only syscalls left
+            // are the single bundle mmap done once before
+            // `read_symbols`.
+            let cached_views: Vec<Option<crate::parsed_input_cache::CacheView<'data>>> = if (gates
+                .read
+                || gates.canary)
+                && let Some(b) = bundle
+            {
+                parsed_input_objects
+                    .iter()
+                    .map(|obj| {
+                        let input_is_clean = match clean_input_paths {
+                            Some(clean) => clean.contains(obj.parsed.input.file.filename.as_path()),
+                            None => false,
+                        };
+                        if !input_is_clean {
+                            return None;
+                        }
+                        let path = obj.parsed.input.file.filename.as_path();
+                        if path.as_os_str().is_empty() {
+                            return None;
+                        }
+                        let entry_id = obj
+                            .parsed
+                            .input
+                            .entry
+                            .as_ref()
+                            .map(|e| e.identifier.as_slice());
+                        let key = crate::parsed_input_cache::bundle_key_for(path, entry_id);
+                        let blob = b.lookup(&key)?;
+                        crate::parsed_input_cache::CacheView::from_bytes(blob)
+                    })
+                    .collect()
+            } else {
+                (0..parsed_input_objects.len()).map(|_| None).collect()
+            };
+
+            // Serial parse-or-replay loop. Builders captured here are
+            // BUBBLED UP via `pending_blobs` so the caller can merge
+            // ALL groups' caches into a single bundle write at end of
+            // link.
+            for (obj, cached) in parsed_input_objects.iter().zip(cached_views.iter()) {
+                if let Some(builder) = run_object_parse_skip(
                     obj,
                     version_script,
-                    shard,
-                    &mut outputs,
+                    &mut sink,
                     args,
                     export_list,
                     output_kind,
-                )
-                .with_context(|| format!("Failed to load symbols from `{}`", obj.parsed.input))?;
+                    gates,
+                    cached.as_ref(),
+                )? {
+                    let path = obj.parsed.input.file.filename.as_path();
+                    if path.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let entry_id = obj
+                        .parsed
+                        .input
+                        .entry
+                        .as_ref()
+                        .map(|e| e.identifier.as_slice());
+                    let key = crate::parsed_input_cache::bundle_key_for(path, entry_id);
+                    pending_blobs.push((key, builder.finish()));
+                    crate::parse_skip::STATS
+                        .written
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         Group::LinkerScripts(scripts) => {
             for script in scripts {
-                load_linker_script_symbols(script, shard, &mut outputs);
+                load_linker_script_symbols(script, &mut sink);
             }
         }
         Group::SyntheticSymbols(_) => {
@@ -1497,34 +1897,33 @@ fn read_symbols_for_group<'data, P: Platform>(
         #[cfg(feature = "plugins")]
         Group::LtoInputs(lto_objects) => {
             for obj in lto_objects {
-                load_lto_symbols(shard, &mut outputs, obj);
+                load_lto_symbols(&mut sink, obj);
             }
         }
     }
 
-    Ok(outputs)
+    Ok((outputs, pending_blobs))
 }
 
 #[cfg(feature = "plugins")]
-fn load_lto_symbols<'data, P: Platform>(
-    symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-    outputs: &mut SymbolLoadOutputs<'data>,
+fn load_lto_symbols<'data>(
+    sink: &mut dyn SymbolSink<'data>,
     obj: &crate::linker_plugins::LtoInput<'data>,
 ) {
     for (symbol_id, sym) in obj.symbols_iter() {
         if sym.is_definition() {
             if let Some(version) = sym.version {
-                outputs.add_versioned(PendingVersionedSymbol::from_prehashed(
+                sink.add_versioned(PendingVersionedSymbol::from_prehashed(
                     symbol_id,
                     UnversionedSymbolName::prehashed(sym.name.bytes()),
                     version,
                 ));
             } else {
-                outputs.add_non_versioned(PendingSymbol::new(symbol_id, sym.name.bytes()));
+                sink.add_non_versioned(PendingSymbol::new(symbol_id, sym.name.bytes()));
             }
-            symbols_out.set_next(ValueFlags::empty(), symbol_id, obj.file_id);
+            sink.set_next(ValueFlags::empty(), symbol_id, obj.file_id);
         } else {
-            symbols_out.set_next(ValueFlags::empty(), SymbolId::undefined(), obj.file_id);
+            sink.set_next(ValueFlags::empty(), SymbolId::undefined(), obj.file_id);
         }
     }
 }
@@ -1561,15 +1960,14 @@ fn populate_symbol_db<'data>(
     });
 }
 
-fn load_linker_script_symbols<'data, P: Platform>(
+fn load_linker_script_symbols<'data>(
     script: &SequencedLinkerScript<'data>,
-    symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-    outputs: &mut SymbolLoadOutputs<'data>,
+    sink: &mut dyn SymbolSink<'data>,
 ) {
     for (offset, definition) in script.parsed.symbol_defs.iter().enumerate() {
         let symbol_id = script.symbol_id_range.offset_to_id(offset);
 
-        outputs.add_non_versioned(PendingSymbol::from_prehashed(
+        sink.add_non_versioned(PendingSymbol::from_prehashed(
             symbol_id,
             PreHashed::new(
                 UnversionedSymbolName::new(definition.name),
@@ -1583,27 +1981,23 @@ fn load_linker_script_symbols<'data, P: Platform>(
         if definition.is_hidden {
             flags |= ValueFlags::DOWNGRADE_TO_LOCAL;
         }
-        symbols_out.set_next(flags, symbol_id, script.file_id);
+        sink.set_next(flags, symbol_id, script.file_id);
     }
 }
 
 fn load_symbols_from_file<'data, P: Platform>(
     s: &SequencedInputObject<'data, P>,
     version_script: &VersionScript,
-    symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-    outputs: &mut SymbolLoadOutputs<'data>,
+    sink: &mut dyn SymbolSink<'data>,
     args: &P::Args,
     export_list: &Option<ExportList<'data>>,
     output_kind: OutputKind,
 ) -> Result {
     if s.is_dynamic() {
-        DynamicObjectSymbolLoader::new(&s.parsed.object)?.load_symbols(
-            s.file_id,
-            symbols_out,
-            outputs,
-        )
+        DynamicObjectSymbolLoader::<'_, 'data, P>::new(&s.parsed.object)?
+            .load_symbols(s.file_id, sink)
     } else {
-        RegularObjectSymbolLoader {
+        RegularObjectSymbolLoader::<'_, 'data, P> {
             object: &s.parsed.object,
             args,
             version_script,
@@ -1612,11 +2006,11 @@ fn load_symbols_from_file<'data, P: Platform>(
             export_list,
             output_kind,
         }
-        .load_symbols(s.file_id, symbols_out, outputs)
+        .load_symbols(s.file_id, sink)
     }
 }
 
-struct SymbolWriterShard<'out, 'group, 'data, P: Platform> {
+pub(crate) struct SymbolWriterShard<'out, 'group, 'data, P: Platform> {
     group: &'group Group<'data, P>,
     resolutions: sharded_vec_writer::Shard<'out, SymbolId>,
     flags: sharded_vec_writer::Shard<'out, RawFlags>,
@@ -1633,30 +2027,90 @@ impl<'out, 'group, 'data, P: Platform> SymbolWriterShard<'out, 'group, 'data, P>
     }
 }
 
+/// Abstraction over "where the symbol-load loop puts its outputs". The
+/// original loop wrote directly into a `SymbolWriterShard` + a
+/// `SymbolLoadOutputs` pair; the trait makes that call-path pluggable so
+/// tier-1 incremental linking can tee symbols into a `CacheBuilder`
+/// (write path) or replay them from a `CacheView` (read path) without
+/// touching the object-crate iteration logic.
+///
+/// Implementations must keep `next_symbol_id` equal to the `symbol_id`
+/// assigned by the next `set_next` call — mirrors
+/// `SymbolWriterShard::next`.
+pub(crate) trait SymbolSink<'data> {
+    fn next_symbol_id(&self) -> SymbolId;
+    fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId);
+    fn add_non_versioned(&mut self, pending: PendingSymbol<'data>);
+    fn add_versioned(&mut self, pending: PendingVersionedSymbol<'data>);
+}
+
+/// The production sink — forwards every call directly into the
+/// (shard, outputs) pair. Represents the original pre-trait behaviour
+/// and always lives behind a `&mut` in the hot path, so the vtable
+/// dispatch cost is a single indirect call per symbol (~1 ns on
+/// aarch64, lost in the object-crate iteration noise).
+pub(crate) struct DefaultSymbolSink<'a, 'out, 'group, 'data, P: Platform> {
+    shard: &'a mut SymbolWriterShard<'out, 'group, 'data, P>,
+    outputs: &'a mut SymbolLoadOutputs<'data>,
+}
+
+impl<'a, 'out, 'group, 'data, P: Platform> DefaultSymbolSink<'a, 'out, 'group, 'data, P> {
+    pub(crate) fn new(
+        shard: &'a mut SymbolWriterShard<'out, 'group, 'data, P>,
+        outputs: &'a mut SymbolLoadOutputs<'data>,
+    ) -> Self {
+        Self { shard, outputs }
+    }
+}
+
+impl<'data, P: Platform> SymbolSink<'data> for DefaultSymbolSink<'_, '_, '_, 'data, P> {
+    fn next_symbol_id(&self) -> SymbolId {
+        self.shard.next
+    }
+
+    fn set_next(&mut self, flags: ValueFlags, resolution: SymbolId, file_id: FileId) {
+        self.shard.set_next(flags, resolution, file_id);
+    }
+
+    fn add_non_versioned(&mut self, pending: PendingSymbol<'data>) {
+        self.outputs.add_non_versioned(pending);
+    }
+
+    fn add_versioned(&mut self, pending: PendingVersionedSymbol<'data>) {
+        self.outputs.add_versioned(pending);
+    }
+}
+
 trait SymbolLoader<'data, P: Platform> {
-    fn load_symbols(
-        &self,
-        file_id: FileId,
-        symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-        outputs: &mut SymbolLoadOutputs<'data>,
-    ) -> Result {
-        let base_symbol_id = symbols_out.next;
+    fn load_symbols(&self, file_id: FileId, sink: &mut dyn SymbolSink<'data>) -> Result {
+        let base_symbol_id = sink.next_symbol_id();
 
         for symbol in self.object().symbols_iter() {
-            let symbol_id = symbols_out.next;
+            let symbol_id = sink.next_symbol_id();
             let mut flags = self.compute_value_flags(symbol);
             let local_index = symbol_id.offset_from(base_symbol_id);
 
             if symbol.is_undefined() || self.should_ignore_symbol(symbol) {
-                symbols_out.set_next(flags, SymbolId::undefined(), file_id);
+                sink.set_next(flags, SymbolId::undefined(), file_id);
                 continue;
             }
 
             let resolution = symbol_id;
 
             if symbol.is_local() {
-                symbols_out.set_next(flags, resolution, file_id);
+                sink.set_next(flags, resolution, file_id);
                 continue;
+            }
+
+            // Mach-O: a defined external whose input visibility is `Hidden` (either
+            // `N_PEXT` or `weak_def_can_be_hidden` = `N_WEAK_DEF | N_WEAK_REF`) must not
+            // leak into the exports trie. Apply `DOWNGRADE_TO_LOCAL | NON_INTERPOSABLE`
+            // here so the writer's trie loop (which keys on `is_downgraded_to_local`)
+            // can filter it out without a separate visibility lookup. The merge in
+            // `process_alternatives` clears these flags again if a peer definition
+            // promotes the merged visibility back to default.
+            if P::APPLY_HIDDEN_VIS_DOWNGRADE_TO_DEFS && symbol.visibility() == Visibility::Hidden {
+                flags |= ValueFlags::DOWNGRADE_TO_LOCAL | ValueFlags::NON_INTERPOSABLE;
             }
 
             let info = self.get_symbol_name_and_version(symbol, local_index)?;
@@ -1676,15 +2130,15 @@ trait SymbolLoader<'data, P: Platform> {
 
             if info.is_default() {
                 let pending = PendingSymbol::from_prehashed(symbol_id, name);
-                outputs.add_non_versioned(pending);
+                sink.add_non_versioned(pending);
             }
 
             if let Some(version) = info.version_name() {
                 let pending = PendingVersionedSymbol::from_prehashed(symbol_id, name, version);
-                outputs.add_versioned(pending);
+                sink.add_versioned(pending);
             }
 
-            symbols_out.set_next(flags, resolution, file_id);
+            sink.set_next(flags, resolution, file_id);
         }
 
         Ok(())
@@ -1990,19 +2444,15 @@ impl TryFrom<usize> for SymbolId {
 }
 
 impl<'data> Prelude<'data> {
-    fn load_symbols<P: Platform>(
-        &self,
-        symbols_out: &mut SymbolWriterShard<'_, '_, 'data, P>,
-        outputs: &mut SymbolLoadOutputs<'data>,
-    ) {
+    fn load_symbols(&self, sink: &mut dyn SymbolSink<'data>) {
         for definition in &self.symbol_definitions {
-            let symbol_id = symbols_out.next;
+            let symbol_id = sink.next_symbol_id();
             let mut flags = match definition.placement {
                 SymbolPlacement::Undefined
                 | SymbolPlacement::ForceUndefined
                 | SymbolPlacement::ImportDynamicSymbol => ValueFlags::ABSOLUTE,
                 SymbolPlacement::DefsymAbsolute(_) => {
-                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
+                    sink.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
                     ValueFlags::NON_INTERPOSABLE | ValueFlags::ABSOLUTE
                 }
                 SymbolPlacement::SectionStart(_)
@@ -2010,14 +2460,14 @@ impl<'data> Prelude<'data> {
                 | SymbolPlacement::SectionGroupEnd(_)
                 | SymbolPlacement::DefsymSymbol(_, _)
                 | SymbolPlacement::LoadBaseAddress => {
-                    outputs.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
+                    sink.add_non_versioned(PendingSymbol::new(symbol_id, definition.name));
                     ValueFlags::NON_INTERPOSABLE
                 }
             };
             if definition.is_hidden {
                 flags |= ValueFlags::DOWNGRADE_TO_LOCAL;
             }
-            symbols_out.set_next(flags, symbol_id, PRELUDE_FILE_ID);
+            sink.set_next(flags, symbol_id, PRELUDE_FILE_ID);
         }
     }
 }
@@ -2048,11 +2498,11 @@ impl InternalSymDefInfo<'_> {
 }
 
 impl<'data> PendingSymbol<'data> {
-    fn new(symbol_id: SymbolId, name: &'data [u8]) -> PendingSymbol<'data> {
+    pub(crate) fn new(symbol_id: SymbolId, name: &'data [u8]) -> PendingSymbol<'data> {
         Self::from_prehashed(symbol_id, UnversionedSymbolName::prehashed(name))
     }
 
-    fn from_prehashed(
+    pub(crate) fn from_prehashed(
         symbol_id: SymbolId,
         name: PreHashed<UnversionedSymbolName<'data>>,
     ) -> PendingSymbol<'data> {
@@ -2061,7 +2511,7 @@ impl<'data> PendingSymbol<'data> {
 }
 
 impl<'data> PendingVersionedSymbol<'data> {
-    fn from_prehashed(
+    pub(crate) fn from_prehashed(
         symbol_id: SymbolId,
         name: PreHashed<UnversionedSymbolName<'data>>,
         version: &'data [u8],

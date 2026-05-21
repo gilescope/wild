@@ -32,6 +32,7 @@ use std::path::PathBuf;
 
 pub mod elf;
 pub mod macho;
+pub mod wasm;
 
 use crate::error::Warning;
 use crate::platform;
@@ -85,6 +86,22 @@ pub struct CommonArgs {
     /// counters, if any.
     pub(crate) time_phase_options: Option<Vec<CounterKind>>,
 
+    /// Incremental linking mode (tiers 1 / 1.5 / 2 / 3 cache + skip
+    /// machinery). Off by default; opt-in via `--incremental-cache=MODE`
+    /// or one of the legacy `WILD_INCREMENTAL_*` env vars.
+    pub(crate) incremental_cache: IncrementalCacheMode,
+
+    /// When `Some`, after each link wild writes a text file describing
+    /// every byte range that differs between the previous output (from
+    /// the layout-snapshot's mmap) and the freshly-written output. Empty
+    /// file (with header only) on a cold link or when the outputs are
+    /// byte-identical. Designed as input to a debugger-driven AOT
+    /// edit-and-continue patcher (BugStalker on Linux; equivalent on
+    /// macOS): take each entry, ptrace-write the bytes into the running
+    /// process at the same file offset relative to its `__TEXT` base.
+    /// File format: see `emit_patch_file` in `lib.rs`.
+    pub(crate) emit_patch: Option<std::path::PathBuf>,
+
     /// Warnings that we encountered either during argument parsing, or during subsequent linker
     /// execution based on those arguments.
     #[debug(skip)]
@@ -109,14 +126,38 @@ impl Args {
     {
         let mut input = input();
 
-        // TODO: Select platform based on executable name and/or the first argument.
-        let _executable_name = input
+        let executable_name = input
             .next()
             .ok_or_else(|| crate::error!("Failed to determine executable name"))?;
+
+        // Select platform based on executable name or --target argument.
+        let exe = executable_name.as_ref();
+        if exe.contains("wasm-ld") || exe.contains("wasm32") {
+            return Ok(Args::Wasm(wasm::WasmArgs::new()?));
+        }
+        // Scan remaining args for --target wasm32.
+        let mut next_is_target = false;
+        for arg in &mut input {
+            let s = arg.as_ref();
+            if next_is_target {
+                if s.contains("wasm") {
+                    return Ok(Args::Wasm(wasm::WasmArgs::new()?));
+                }
+                next_is_target = false;
+            } else if s == "--target" {
+                next_is_target = true;
+            } else if s
+                .strip_prefix("--target=")
+                .is_some_and(|t| t.contains("wasm"))
+            {
+                return Ok(Args::Wasm(wasm::WasmArgs::new()?));
+            }
+        }
 
         match PlatformKind::host() {
             PlatformKind::Elf => Ok(Args::Elf(elf::ElfArgs::new()?)),
             PlatformKind::MachO => Ok(Args::MachO(macho::MachOArgs::new()?)),
+            PlatformKind::Wasm => Ok(Args::Wasm(wasm::WasmArgs::new()?)),
         }
     }
 
@@ -134,10 +175,23 @@ impl Args {
         // Skip the program name.
         input.next();
 
-        match self {
+        let result = match self {
             Args::Elf(args) => args.parse(input),
             Args::MachO(args) => args.parse(input),
-        }
+            Args::Wasm(args) => args.parse(input),
+        };
+
+        // Translate `--incremental-cache=MODE` into the legacy
+        // WILD_INCREMENTAL_* env vars so the gate-checking sites
+        // (lib.rs whole-link skip, symbol_db.rs ParseSkipGates,
+        // tier-3 capture/skip paths) keep one source of truth.
+        // Env vars set externally by the caller take precedence —
+        // we only set what's missing. Safe: parse runs before any
+        // thread is spawned by `activate_thread_pool`, so the
+        // unsafe set_var window is single-threaded.
+        translate_incremental_flag(self.common().incremental_cache);
+
+        result
     }
 
     /// Set the version identifier of the linker.
@@ -158,6 +212,7 @@ impl Args {
         match self {
             Args::Elf(elf_args) => &elf_args.common,
             Args::MachO(macho_args) => &macho_args.common,
+            Args::Wasm(wasm_args) => &wasm_args.common,
         }
     }
 
@@ -165,13 +220,15 @@ impl Args {
         match self {
             Args::Elf(elf_args) => &mut elf_args.common,
             Args::MachO(macho_args) => &mut macho_args.common,
+            Args::Wasm(wasm_args) => &mut wasm_args.common,
         }
     }
 }
 
-enum PlatformKind {
+pub(crate) enum PlatformKind {
     Elf,
     MachO,
+    Wasm,
 }
 
 impl PlatformKind {
@@ -205,6 +262,14 @@ pub enum CounterKind {
     PageFaultsMajor,
     L1dRead,
     L1dMiss,
+}
+
+#[derive(Debug)]
+pub(crate) enum Strip {
+    Nothing,
+    Debug,
+    All,
+    Retain(HashSet<Vec<u8>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,8 +307,84 @@ impl Default for CommonArgs {
             numeric_experiments: Vec::new(),
             sym_info: None,
             time_phase_options: None,
+            incremental_cache: IncrementalCacheMode::default(),
+            emit_patch: None,
             warning_callback: Box::new(default_warning_callback),
             version: std::borrow::Cow::Borrowed("unknown version"),
+        }
+    }
+}
+
+/// User-facing incremental-cache control. The legacy
+/// `WILD_INCREMENTAL_*` env vars still work (they're how power users
+/// discovered the feature during tier-1 → tier-3 development). The
+/// flag is the canonical interface going forward; env vars override
+/// the flag when set, so a CI job can opt in at build time without
+/// rebuilding the linker driver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum IncrementalCacheMode {
+    /// Cold link every time. Layout snapshot + parse-skip cache are
+    /// not consulted, not written. Wild's behaviour matches the
+    /// pre-incremental codebase.
+    #[default]
+    Off,
+    /// Tee the parse + layout into `<output>.wild-pi-cache` /
+    /// `<output>.wild-layout` for the next link. Don't replay or
+    /// skip writer work this link.
+    Write,
+    /// Replay the parse-skip cache (skip per-input `load_symbols`)
+    /// AND do the speculative writer-skip when every section is
+    /// reusable. Implies `Write` so the next link sees fresh data.
+    ReadWrite,
+}
+
+impl IncrementalCacheMode {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
+        match s {
+            "off" | "false" | "0" => Ok(Self::Off),
+            "write" => Ok(Self::Write),
+            "read-write" | "rw" | "on" | "true" | "1" => Ok(Self::ReadWrite),
+            other => bail!(
+                "Unrecognised --incremental-cache mode `{other}`. \
+                 Expected one of: off, write, read-write"
+            ),
+        }
+    }
+
+    pub(crate) fn writes_cache(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub(crate) fn reads_cache(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
+/// Set legacy `WILD_INCREMENTAL_*` env vars from the parsed
+/// `--incremental-cache` flag. Only sets what isn't already set by
+/// the user, so an explicit env-var override (handy for CI) wins.
+/// Called from `Args::parse`, which runs before any thread spawn,
+/// so the `set_var` calls are sound.
+fn translate_incremental_flag(mode: IncrementalCacheMode) {
+    if matches!(mode, IncrementalCacheMode::Off) {
+        return;
+    }
+    // SAFETY: called from Args::parse, before any thread spawns.
+    unsafe {
+        if mode.writes_cache()
+            && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_WRITE").is_none()
+            && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP").is_none()
+        {
+            std::env::set_var("WILD_INCREMENTAL_PARSE_SKIP_WRITE", "1");
+        }
+        if mode.reads_cache() && std::env::var_os("WILD_INCREMENTAL_PARSE_SKIP_READ").is_none() {
+            std::env::set_var("WILD_INCREMENTAL_PARSE_SKIP_READ", "1");
+        }
+        // ReadWrite implies the speculative writer-skip too — that's
+        // the actual perf win. Users who only want parse-skip can
+        // still force it off via `WILD_INCREMENTAL_TIER3_SKIP=0`.
+        if mode.reads_cache() && std::env::var_os("WILD_INCREMENTAL_TIER3_SKIP").is_none() {
+            std::env::set_var("WILD_INCREMENTAL_TIER3_SKIP", "1");
         }
     }
 }
@@ -411,6 +552,7 @@ pub(crate) enum FileWriteMode {
 
     /// As for `UpdateInPlace`, but if we get an error opening the file for write, fallback to
     /// unlinking and replacing.
+    #[allow(dead_code)]
     UpdateInPlaceWithFallback,
 }
 
@@ -426,6 +568,7 @@ pub struct ThreadPool {
 pub enum Args {
     Elf(elf::ElfArgs),
     MachO(macho::MachOArgs),
+    Wasm(wasm::WasmArgs),
 }
 
 impl std::fmt::Debug for Args {
@@ -433,6 +576,22 @@ impl std::fmt::Debug for Args {
         match self {
             Args::Elf(args) => args.fmt(f),
             Args::MachO(args) => args.fmt(f),
+            Args::Wasm(args) => args.fmt(f),
+        }
+    }
+}
+
+impl Args {
+    /// Platform-agnostic access to the parsed output path. Useful
+    /// from top-level driver code (`libwild::run`) that wants to
+    /// look at the output without pattern-matching every platform
+    /// variant.
+    pub fn output_path(&self) -> &std::sync::Arc<std::path::Path> {
+        use crate::platform::Args as _;
+        match self {
+            Args::Elf(args) => args.output(),
+            Args::MachO(args) => args.output(),
+            Args::Wasm(args) => args.output(),
         }
     }
 }

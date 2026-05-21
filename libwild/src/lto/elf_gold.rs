@@ -211,6 +211,11 @@ impl<'data> LinkerPlugin<'data> {
             output_sections,
             layout_rules_builder,
             plugin_loaded,
+            // The plugin-driven path doesn't run the parsed-input-cache
+            // canary / bundle layer that the main path uses, so pass
+            // None for both `clean_input_paths` and `bundle`.
+            None,
+            None,
         )?;
 
         resolver.resolve_symbols_and_select_archive_entries(symbol_db, per_symbol_flags)?;

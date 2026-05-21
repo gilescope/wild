@@ -333,6 +333,10 @@ impl platform::Platform for Elf {
     type Args = ElfArgs;
     type ResolutionExt = ResolutionExt;
     type SymtabShndxEntry = SymtabShndxEntry;
+    // ELF uses `GroupLayout::strtab_start_offset` etc. for its
+    // symtab slot assignment. Migrating to the shared trait hook
+    // (with zero perf cost) is a follow-up; for now, opt out.
+    type SymtabPrecount = ();
 
     fn link_for_arch<'data>(
         linker: &'data crate::Linker,
@@ -361,10 +365,18 @@ impl platform::Platform for Elf {
     }
 
     fn write_output_file<'data, A: Arch<Platform = Self>>(
-        output: &crate::file_writer::Output,
+        output: &mut crate::file_writer::Output,
         layout: &layout::Layout<'data, Self>,
     ) -> Result {
         output.write(layout, elf_writer::write::<A>)
+    }
+
+    fn output_file_size_at_layout(
+        section_layouts: &crate::output_section_map::OutputSectionMap<
+            crate::layout::OutputRecordLayout,
+        >,
+    ) -> Option<u64> {
+        Some(crate::layout::compute_total_file_size(section_layouts))
     }
 
     fn maybe_init_linker_plugin<'data>(
@@ -533,13 +545,15 @@ impl platform::Platform for Elf {
     fn finalise_object_sizes<'data>(
         object: &mut layout::ObjectLayoutState<'data, Elf>,
         common: &mut layout::CommonGroupState<'data, Elf>,
-    ) {
+        _output_sections: &crate::output_section_id::OutputSections<'data, Elf>,
+    ) -> crate::error::Result {
         // TODO: Deduplicate CIEs from different objects, then only allocate space for those CIEs
         // that we "won".
         for cie in &object.format_specific.cies {
             object.format_specific.eh_frame_size += cie.cie.bytes.len() as u64;
         }
         common.allocate(part_id::EH_FRAME, object.format_specific.eh_frame_size);
+        Ok(())
     }
 
     fn finalise_object_layout<'data>(
@@ -1265,6 +1279,7 @@ impl platform::Platform for Elf {
         extra_sizes: &mut OutputSectionPartMap<u64>,
         dynamic_symbol_defs: &[DynamicSymbolDefinition<Self>],
         args: &ElfArgs,
+        _symbol_db: &crate::symbol_db::SymbolDb<'_, Self>,
     ) -> Result {
         if args.hash_style.includes_sysv() {
             allocate_sysv_hash(state, current_sizes, extra_sizes, dynamic_symbol_defs)?;
@@ -1693,6 +1708,8 @@ impl platform::Platform for Elf {
         sizes: &mut OutputSectionPartMap<u64>,
         header_info: &layout::HeaderInfo,
         output_sections: &OutputSections<Self>,
+        _args: &Self::Args,
+        _total_sizes: &OutputSectionPartMap<u64>,
     ) {
         sizes.increment(part_id::FILE_HEADER, u64::from(elf::FILE_HEADER_SIZE));
         sizes.increment(part_id::PROGRAM_HEADERS, program_headers_size(header_info));
@@ -1766,6 +1783,7 @@ impl platform::Platform for Elf {
         output_kind: OutputKind,
         output_sections: &OutputSections<'data, Self>,
         secondary: &OutputSectionMap<Vec<OutputSectionId>>,
+        _args: &Self::Args,
     ) -> (OutputOrder, ProgramSegments<Self::ProgramSegmentDef>) {
         let mut builder = OutputOrderBuilder::<Self>::new(output_kind, output_sections, secondary);
 
@@ -2473,6 +2491,11 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
     relocations: &R::Sequence<'data>,
     scope: &Scope<'scope>,
 ) -> Result<Vec<ExceptionFrame<'data, R>>> {
+    // NOTE: This function keeps its original inline implementation rather than
+    // delegating to eh_frame::parse_eh_frame_entries because the Rust type
+    // system can't prove that <R::Sequence::Rel == R> without adding a bound
+    // to the Relocation trait. The generic function IS used by Mach-O.
+    // TODO: Add the round-trip bound to Relocation and unify.
     const PREFIX_LEN: usize = size_of::<EhFrameEntryPrefix>();
 
     let mut rel_iter = relocations.rel_iter().enumerate().peekable();
@@ -2480,10 +2503,6 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
     let mut exception_frames = Vec::new();
 
     while offset + PREFIX_LEN <= data.len() {
-        // Although the section data will be aligned within the object file, there's
-        // no guarantee that the object is aligned within the archive to any more
-        // than 2 bytes, so we can't rely on alignment here. Archives are annoying!
-        // See https://www.airs.com/blog/archives/170
         let prefix =
             EhFrameEntryPrefix::read_from_bytes(&data[offset..offset + PREFIX_LEN]).unwrap();
         let size = size_of_val(&prefix.length) + prefix.length as usize;
@@ -2494,21 +2513,14 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
         }
 
         if prefix.cie_id == 0 {
-            // This is a CIE
             let mut referenced_symbols: SmallVec<[SymbolId; 1]> = Default::default();
-            // When deduplicating CIEs, we take into consideration the bytes of the CIE and all the
-            // symbols it references. If however, it references something other than a symbol, then,
-            // because we're not taking that into consideration, we disallow deduplication.
             let mut eligible_for_deduplication = true;
             while let Some((_, rel)) = rel_iter.peek() {
                 let rel_offset = rel.offset();
                 if rel_offset >= next_offset as u64 {
-                    // This relocation belongs to the next entry.
                     break;
                 }
 
-                // We currently always load all CIEs, so any relocations found in CIEs always need
-                // to be processed.
                 process_relocation::<A, <R::Sequence<'data> as RelocationSequence>::Rel>(
                     object,
                     common,
@@ -2539,7 +2551,6 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
                 },
             });
         } else {
-            // This is an FDE
             let mut section_index = None;
             let rel_start_index = rel_iter.peek().map_or(0, |(i, _)| *i);
             let mut rel_end_index = 0;
@@ -2564,9 +2575,6 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
                 && let Some(unloaded) = object.sections[section_index.0].unloaded_mut()
             {
                 let frame_index = FrameIndex::from_usize(exception_frames.len());
-
-                // Update our unloaded section to point to our new frame. Our frame will then in
-                // turn point to whatever the section pointed to before.
                 let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
 
                 exception_frames.push(ExceptionFrame {
@@ -2580,9 +2588,6 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
     }
 
     common.format_specific.exception_frame_count += object.format_specific.exception_frames.len();
-
-    // Allocate space for any remaining bytes in .eh_frame that aren't large enough to constitute an
-    // actual entry. crtend.o has a single u32 equal to 0 as an end marker.
     object.format_specific.eh_frame_size += (data.len() - offset) as u64;
 
     Ok(exception_frames)
@@ -2923,15 +2928,8 @@ pub(crate) struct EhFrameHdrEntry {
     pub(crate) frame_info_ptr: i32,
 }
 
-#[derive(FromBytes, Clone, Copy)]
-#[repr(C)]
-pub(crate) struct EhFrameEntryPrefix {
-    pub(crate) length: u32,
-    pub(crate) cie_id: u32,
-}
-
-/// The offset of the pc_begin field in an FDE.
-pub(crate) const FDE_PC_BEGIN_OFFSET: usize = 8;
+pub(crate) use crate::eh_frame::EhFrameEntryPrefix;
+pub(crate) use crate::eh_frame::FDE_PC_BEGIN_OFFSET;
 
 /// Offset in the file where we store the program headers. We always store these straight after the
 /// file header.
@@ -3997,21 +3995,8 @@ fn finalise_gnu_version_size<'data>(
     }
 }
 
-/// A "common information entry". This is part of the .eh_frame data in ELF.
-#[derive(PartialEq, Eq, Hash)]
-struct Cie<'data> {
-    bytes: &'data [u8],
-    eligible_for_deduplication: bool,
-    referenced_symbols: SmallVec<[SymbolId; 1]>,
-}
-
-struct CieAtOffset<'data> {
-    // TODO: Use or remove. I think we need this when we implement deduplication of CIEs.
-    /// Offset within .eh_frame
-    #[allow(dead_code)]
-    offset: u32,
-    cie: Cie<'data>,
-}
+use crate::eh_frame::Cie;
+use crate::eh_frame::CieAtOffset;
 
 enum ExceptionFrames<'data> {
     Rela(Vec<ExceptionFrame<'data, Rela>>),
@@ -4024,22 +4009,8 @@ impl<'data> Default for ExceptionFrames<'data> {
     }
 }
 
-#[derive(Default)]
-struct ExceptionFrame<'data, R: Relocation> {
-    /// The relocations that need to be processed if we load this frame.
-    relocations: R::Sequence<'data>,
-
-    /// Number of bytes required to store this frame.
-    frame_size: u32,
-
-    /// The index of the previous frame that is for the same section.
-    previous_frame_for_section: Option<FrameIndex>,
-}
-
-struct EhFrameSizes {
-    num_frames: u64,
-    eh_frame_size: u64,
-}
+use crate::eh_frame::EhFrameSizes;
+use crate::eh_frame::ExceptionFrame;
 
 impl<'data> ExceptionFrames<'data> {
     fn len(&self) -> usize {

@@ -60,6 +60,14 @@
 //! ExpectSectionBytes:{section_name}=0x{hex_bytes} Checks that the specified section contains
 //! exactly the given bytes.
 //!
+//! ExpectCompressedSection:{section_name} Checks that the specified section carries
+//! SHF_COMPRESSED and starts with a valid Elf64_Chdr (ch_type = zlib or zstd).
+//!
+//! ExpectDwarfResolves:{N} Asserts that at least N text symbols resolve via the
+//! binary's DWARF to a non-empty (function, file, line) tuple. Gates DWARF
+//! rewriting passes (compression, line v5 upgrade, abbrev dedup, DIE dedup) against
+//! silent corruption — `gdb` prints `<no type>` instead of crashing on broken DWARF.
+//!
 //! Mode:{mode} Set linking mode to static (default), dynamic or unspecified. Cannot be used
 //! together with LinkerDriver.
 //!
@@ -1039,6 +1047,15 @@ struct Assertions {
     expected_dynamic_entries: Vec<String>,
     absent_dynamic_entries: Vec<String>,
     expected_section_bytes: Vec<ExpectedSectionBytes>,
+    expected_compressed_sections: Vec<String>,
+    /// Minimum number of `text` symbols whose addresses must resolve
+    /// via DWARF to a non-empty `(function, file, line)` tuple. Set
+    /// via `//#ExpectDwarfResolves:N`. The harness samples the first
+    /// 64 unique-named text symbols and counts how many resolve via
+    /// the binary's `.debug_*` sections; the assertion is `count >= N`.
+    /// Used to gate any DWARF rewrite (compression, line v5 upgrade,
+    /// abbrev dedup, DIE dedup, …) against silent corruption.
+    expected_dwarf_resolves: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1359,6 +1376,17 @@ fn process_directive(
                     section_name: section_name.to_owned(),
                     expected_bytes,
                 });
+        }
+        "ExpectCompressedSection" => config
+            .assertions
+            .expected_compressed_sections
+            .push(arg.trim().to_owned()),
+        "ExpectDwarfResolves" => {
+            let n: usize = arg
+                .trim()
+                .parse()
+                .with_context(|| format!("ExpectDwarfResolves expects a number, got `{arg}`"))?;
+            config.assertions.expected_dwarf_resolves = Some(n);
         }
         "ExpectDynamic" => config
             .assertions
@@ -3046,6 +3074,129 @@ impl Assertions {
         self.verify_load_alignment(&obj)?;
         self.verify_dynamic_entries(&obj)?;
         self.verify_section_bytes(&obj)?;
+        self.verify_compressed_sections(&obj)?;
+        self.verify_dwarf_resolves_at_path(path)?;
+        Ok(())
+    }
+
+    /// Asserts that at least `expected_dwarf_resolves` text symbols
+    /// resolve via the binary's DWARF to a non-empty `(function,
+    /// file, line)` tuple. Skips silently when the directive isn't
+    /// set on the fixture.
+    ///
+    /// Sampling logic:
+    ///   * Walk the symbol table picking text symbols whose name is unique (skips COMDAT-folded
+    ///     aliases) and whose address is non-zero (skips PLT stubs).
+    ///   * Take the first 64 such symbols.
+    ///   * For each, ask `addr2line::Context` to resolve the address.
+    ///   * Count those that come back with at least a function name AND a file AND a line.
+    ///
+    /// `addr2line::Loader` walks the binary's `.debug_*` sections
+    /// directly via gimli — no external `llvm-symbolizer` /
+    /// `addr2line` binary required. Loader handles SHF_COMPRESSED
+    /// transparently. Takes a path because Loader mmaps the file.
+    fn verify_dwarf_resolves_at_path(&self, path: &Path) -> Result {
+        let Some(min) = self.expected_dwarf_resolves else {
+            return Ok(());
+        };
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read for DWARF check: {}", path.display()))?;
+        let obj2 = ElfFile64::parse(bytes.as_slice())
+            .with_context(|| format!("parse for DWARF check: {}", path.display()))?;
+        let loader = addr2line::Loader::new(path)
+            .map_err(|e| error!("addr2line Loader for {}: {e:?}", path.display()))?;
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut order: Vec<(String, u64)> = Vec::new();
+        for sym in obj2.symbols() {
+            if sym.kind() != object::SymbolKind::Text {
+                continue;
+            }
+            let Ok(name) = sym.name() else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            let addr = sym.address();
+            if addr == 0 {
+                continue;
+            }
+            *counts.entry(name.to_owned()).or_insert(0) += 1;
+            order.push((name.to_owned(), addr));
+        }
+
+        let mut resolved = 0usize;
+        let mut tried = 0usize;
+        for (name, addr) in &order {
+            if counts.get(name).copied().unwrap_or(0) != 1 {
+                continue; // skip COMDAT-folded duplicates
+            }
+            tried += 1;
+            let mut frames = loader
+                .find_frames(*addr)
+                .map_err(|e| error!("find_frames @ 0x{addr:x}: {e:?}"))?;
+            if let Some(frame) = frames.next().map_err(|e| error!("frame iter: {e:?}"))?
+                && frame.function.is_some()
+                && let Some(loc) = frame.location
+                && loc.file.is_some()
+                && loc.line.is_some()
+            {
+                resolved += 1;
+            }
+            if tried >= 64 {
+                break;
+            }
+        }
+
+        ensure!(
+            resolved >= min,
+            "DWARF resolved only {resolved}/{tried} text symbols (expected ≥ {min}). \
+             Possible silent DWARF corruption in a recent rewrite pass."
+        );
+        Ok(())
+    }
+
+    /// For every section named in `ExpectCompressedSection:` in the
+    /// test source, assert it's present in the output, carries the
+    /// `SHF_COMPRESSED` flag, and starts with a valid `Elf64_Chdr`
+    /// whose `ch_type` is either `ELFCOMPRESS_ZLIB` (1) or
+    /// `ELFCOMPRESS_ZSTD` (2). The decompressed-size field is
+    /// sanity-checked to be non-zero.
+    fn verify_compressed_sections(&self, obj: &ElfFile64) -> Result {
+        use object::ObjectSection as _;
+        use object::elf as oe;
+        const CHDR_SIZE: usize = 24;
+        for section_name in &self.expected_compressed_sections {
+            let section = obj
+                .section_by_name(section_name)
+                .with_context(|| format!("expected compressed section `{section_name}` missing"))?;
+            let flags: object::SectionFlags = section.flags();
+            let sh_flags = match flags {
+                object::SectionFlags::Elf { sh_flags } => sh_flags,
+                _ => bail!("section `{section_name}`: not an ELF section"),
+            };
+            ensure!(
+                sh_flags & u64::from(oe::SHF_COMPRESSED) != 0,
+                "section `{section_name}` missing SHF_COMPRESSED (sh_flags = {:#x})",
+                sh_flags
+            );
+            let data = section.data()?;
+            ensure!(
+                data.len() >= CHDR_SIZE,
+                "section `{section_name}` too small for Elf64_Chdr ({} < {})",
+                data.len(),
+                CHDR_SIZE
+            );
+            let ch_type = u32::from_le_bytes(data[0..4].try_into().unwrap());
+            ensure!(
+                ch_type == 1 || ch_type == 2,
+                "section `{section_name}` Chdr ch_type = {ch_type} (want 1=zlib or 2=zstd)"
+            );
+            let ch_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
+            ensure!(
+                ch_size > 0,
+                "section `{section_name}` Chdr ch_size = 0 (decompressed size must be non-zero)"
+            );
+        }
         Ok(())
     }
 
@@ -3912,6 +4063,14 @@ fn run_integration_test(
     mut config: Config,
     test_config: &TestConfig,
 ) -> Result<libtest_mimic::Completion> {
+    // ELF tests require a Linux toolchain (GNU ld, ELF-compatible compiler).
+    // On macOS, the system linker is ld64 which doesn't support ELF flags.
+    if cfg!(target_os = "macos") && config.platform == PlatformKind::Elf {
+        return Ok(libtest_mimic::Completion::ignored_with(
+            "ELF tests require Linux toolchain",
+        ));
+    }
+
     setup_symlink();
 
     let linkers = available_linkers()?;

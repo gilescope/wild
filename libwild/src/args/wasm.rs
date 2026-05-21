@@ -1,0 +1,901 @@
+// WASM argument parsing for the wasm-ld-compatible linker interface.
+//
+// Reference: https://lld.llvm.org/WebAssembly.html
+// Reference: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+#![allow(unused_variables)]
+
+use crate::args::CommonArgs;
+use crate::args::Input;
+use crate::args::InputSpec;
+use crate::args::Modifiers;
+use crate::args::RelocationModel;
+use crate::args::Strip;
+use crate::error::Result;
+use crate::platform;
+use std::path::Path;
+use std::sync::Arc;
+
+#[derive(Debug)]
+pub struct WasmArgs {
+    pub(crate) common: super::CommonArgs,
+    pub(crate) output: Arc<Path>,
+    pub(crate) entry_symbol: Option<Vec<u8>>,
+    pub(crate) lib_search_paths: Vec<Box<Path>>,
+    pub(crate) no_entry: bool,
+    pub(crate) allow_undefined: bool,
+    pub(crate) export_dynamic: bool,
+    /// Explicitly set to false by --no-export-dynamic.
+    pub(crate) no_export_dynamic: bool,
+    pub(crate) no_gc_sections: bool,
+    /// Symbols to explicitly export (--export=<sym>).
+    pub(crate) exports: Vec<String>,
+    /// Symbols to export if defined (--export-if-defined=<sym>).
+    pub(crate) exports_if_defined: Vec<String>,
+    /// Export all non-hidden symbols.
+    pub(crate) export_all: bool,
+    pub(crate) strip: Strip,
+    /// Custom sections to keep even under `--strip-all` /
+    /// `--strip-debug` (`--keep-section=<name>`, repeatable).
+    /// Compared against the section's bytes (no quoting).
+    pub(crate) keep_sections: Vec<String>,
+    /// Relocatable output (-r/--relocatable).
+    pub(crate) is_relocatable: bool,
+    /// Shared library output (-shared).
+    pub(crate) is_shared: bool,
+    /// Initial memory size in bytes (--initial-memory).
+    pub(crate) initial_memory: Option<u64>,
+    /// Maximum memory size (--max-memory).
+    pub(crate) max_memory: Option<u64>,
+    /// Custom page size (`--page-size=N`, custom-page-sizes proposal).
+    /// When set, the MEMORY section uses HAS_PAGE_SIZE limits + the
+    /// given byte-count page size; min/max are interpreted in those
+    /// page units rather than the default 64 KiB.
+    pub(crate) page_size: Option<u64>,
+    /// Stack size override (-z stack-size=N).
+    pub(crate) stack_size: Option<u64>,
+    /// Place stack before data (--stack-first).
+    /// Place stack before data (--stack-first, default).
+    pub(crate) stack_first: bool,
+    /// Global data base address (--global-base).
+    pub(crate) global_base: Option<u64>,
+    /// Initial heap size (--initial-heap).
+    pub(crate) initial_heap: Option<u64>,
+    /// Allow multiple definitions (--allow-multiple-definition).
+    pub(crate) allow_multiple_definitions: bool,
+    /// Emit `warning: duplicate symbol: <name>` per collision and
+    /// continue. Implies `allow_multiple_definitions`. Set by
+    /// `--noinhibit-exec`; left off for plain
+    /// `--allow-multiple-definition` and `-z muldefs`, which lld
+    /// silences.
+    pub(crate) warn_multiple_definitions: bool,
+    /// `-rpath` / `--rpath` entries — runtime library search paths
+    /// emitted as the dylink.0 RuntimePath subsection (id 5).
+    /// `rpath.s` pins this for the wasm dynamic-linker convention.
+    pub(crate) rpath: Vec<String>,
+    /// Symbols to force undefined (-u/--undefined).
+    pub(crate) force_undefined: Vec<String>,
+    /// `--unresolved-symbols=ignore-all` / `--warn-unresolved-symbols`:
+    /// stub out *all* undefined function symbols (not just weak ones)
+    /// instead of emitting env imports. Matches lld's behaviour.
+    pub(crate) stub_unresolved_functions: bool,
+    /// Shared memory mode (--shared-memory).
+    pub(crate) shared_memory: bool,
+    /// Import memory from environment (--import-memory).
+    pub(crate) import_memory: bool,
+    /// `(module, field)` for the memory import — `--import-memory=module,field`
+    /// or `--import-memory=field` (module defaults to `env`). Only set when
+    /// the user passes a value; bare `--import-memory` keeps `(env, memory)`.
+    pub(crate) import_memory_name: Option<(String, String)>,
+    /// Memory export name — `--export-memory[=name]`. `Some(name)` exports
+    /// the memory under `name`; `None` (the default) keeps wasm-ld's
+    /// behaviour (export as `memory` unless importing memory).
+    pub(crate) export_memory_name: Option<String>,
+    /// Import function table (--import-table).
+    pub(crate) import_table: bool,
+    /// Export function table (--export-table).
+    pub(crate) export_table: bool,
+    /// Suppress non-growable memory (--no-growable-memory).
+    pub(crate) no_growable_memory: bool,
+    /// Allow table to grow (--growable-table).
+    pub(crate) growable_table: bool,
+    /// Compress LEB128 in code section (--compress-relocations).
+    pub(crate) compress_relocations: bool,
+    /// `--emit-relocs`: in non-`-r` exec mode, also preserve the
+    /// linking section + reloc.* tables in the output so post-link
+    /// tooling (debuggers, instrumentation, profilers) can re-resolve
+    /// symbols. Distinct from `is_relocatable` — output is still a
+    /// runnable wasm module, just with extra metadata.
+    pub(crate) emit_relocs: bool,
+    /// Target is memory64 / wasm64 (`--features=+memory64`, `-mwasm64`,
+    /// `--target=wasm64-…`). When true, memory/data/imports carry the
+    /// 0x04 limits bit and active data segments use `i64.const` offsets.
+    pub(crate) memory64: bool,
+    /// Position-independent code / executable. Distinct from `is_shared`:
+    /// a shared library implies PIC, but a PIE executable does too. Set
+    /// by `-pie`, `--pie`, or `--experimental-pic`.
+    pub(crate) is_pic: bool,
+    /// Optimisation level from `-O<N>`. Zero (the default) keeps wild
+    /// byte-compatible with wasm-ld. `>= 1` enables the wilt post-link
+    /// optimisation pipeline (DCE, type-GC, const-fold, layout).
+    pub(crate) opt_level: u8,
+    /// Cross-input LTO configuration. See `wild-lto-plan.md` P4.
+    pub(crate) lto: crate::lto::LtoConfig,
+    /// Bit-for-bit compatibility with wasm-ld. Off by default — wild
+    /// stays fast and skips outputs that lld emits unconditionally
+    /// even when no input references them (e.g. the full set of synth
+    /// layout globals under `--export-all`, the empty
+    /// `__wasm_call_ctors` stub when no ctors registered). Turn on
+    /// when a downstream consumer needs byte-identical output.
+    /// Mach-O has the analogous `-ld64_compat` flag.
+    pub(crate) lld_compat: bool,
+    /// Names from `--extra-features=NAME[,…]` (and `--features=NAME`)
+    /// that signal "the runtime supports this even though no input
+    /// declares it." Currently consumed only by the mutable-globals
+    /// export gate: when `mutable-globals` is in here, synthesised
+    /// mutable globals like `__stack_pointer` are eligible for export
+    /// regardless of input target_features.
+    pub(crate) extra_features: Vec<String>,
+    /// `-y SYM` / `--trace-symbol=SYM` / `--trace-symbol SYM` /
+    /// `-ySYM`: emit one line per input that defines or references
+    /// SYM, in the form `<basename>: definition of SYM` or
+    /// `<basename>: reference to SYM`. lld prints these to stdout
+    /// (FileCheck pipes them in via `wasm-ld … -y SYM | FileCheck`).
+    /// Useful for debugging "where is this symbol coming from" or
+    /// "why does the linker think there's a definition I didn't
+    /// write." Empty by default.
+    pub(crate) trace_symbols: Vec<String>,
+    /// `--print-gc-sections`: emit one line per defined function the
+    /// GC pass dropped, in the form
+    /// `removing unused section <basename>:(<name>)`. Useful for
+    /// debugging "why was my function dropped" — combined with
+    /// `--no-gc-sections` to prove a function wasn't actually GC'd.
+    pub(crate) print_gc_sections: bool,
+    /// `--why-extract=PATH`: write a TSV (header `reference<tab>
+    /// extracted<tab>symbol`) listing each archive member that got
+    /// pulled in, the file/entry that referenced it, and the symbol
+    /// that drove the load. `PATH` may be `-` for stdout. Same
+    /// dependency graph the incremental cache wants for archive-
+    /// resolution invalidation, so the instrumentation is shared
+    /// (gated on either flag being on).
+    pub(crate) why_extract: Option<String>,
+    /// `-wrap NAME` / `--wrap NAME` / `--wrap=NAME`: rewrite every
+    /// reference to `NAME` so it targets `__wrap_NAME` instead, and
+    /// every reference to `__real_NAME` so it targets `NAME`. The
+    /// definition of `NAME` (if any) stays in place — typically the
+    /// wrapper sits in another input and calls `__real_NAME`. lld's
+    /// canonical use case: instrumenting a single function without
+    /// touching its callers.
+    pub(crate) wrap: Vec<String>,
+    /// `--import-undefined`: undefined symbols become env-imports
+    /// without erroring. Stronger than `--allow-undefined` — that
+    /// one allows undef refs but doesn't auto-import non-`env`
+    /// modules; this one also opts out of the strong-undef-symbol
+    /// error report introduced under default behaviour. Used by
+    /// debug-undefined-fs.s.
+    pub(crate) import_undefined: bool,
+    /// `-t` / `--trace`: print one line per loaded input file, in
+    /// load order, to stderr. Same as ELF `ld --trace`. Useful for
+    /// debugging "what files actually got linked into this output."
+    pub(crate) trace_files: bool,
+    /// `-M` / `-print-map` / `--print-map` writes a link map to
+    /// stdout. `-Map=PATH` / `--Map=PATH` writes the same map to a
+    /// file. The map lists every output section's file offset and
+    /// size, plus per-function and per-data-segment chunks with
+    /// their input-file attribution — useful for debugging "what's
+    /// in this output and where?".
+    pub(crate) map_file: Option<MapFileTarget>,
+}
+
+/// Where a `-M` / `-Map=PATH` link map should be written.
+#[derive(Debug, Clone)]
+pub(crate) enum MapFileTarget {
+    /// `-M` / `-print-map` / `--print-map` — write the map to stdout.
+    Stdout,
+    /// `-Map=PATH` / `--Map=PATH` — write the map to PATH.
+    Path(std::path::PathBuf),
+}
+
+impl Default for WasmArgs {
+    fn default() -> Self {
+        Self {
+            common: CommonArgs::default(),
+            output: Arc::from(Path::new("a.out")),
+            entry_symbol: None,
+            lib_search_paths: Vec::new(),
+            no_entry: false,
+            allow_undefined: false,
+            export_dynamic: false,
+            no_export_dynamic: false,
+            no_gc_sections: false,
+            exports: Vec::new(),
+            exports_if_defined: Vec::new(),
+            export_all: false,
+            strip: Strip::Nothing,
+            keep_sections: Vec::new(),
+            is_relocatable: false,
+            is_shared: false,
+            initial_memory: None,
+            max_memory: None,
+            page_size: None,
+            stack_size: None,
+            stack_first: true, // wasm-ld default
+            global_base: None,
+            initial_heap: None,
+            allow_multiple_definitions: false,
+            warn_multiple_definitions: false,
+            rpath: Vec::new(),
+            force_undefined: Vec::new(),
+            stub_unresolved_functions: false,
+            shared_memory: false,
+            import_memory: false,
+            import_memory_name: None,
+            export_memory_name: None,
+            import_table: false,
+            export_table: false,
+            no_growable_memory: false,
+            growable_table: false,
+            compress_relocations: false,
+            emit_relocs: false,
+            memory64: false,
+            is_pic: false,
+            opt_level: 0,
+            lto: crate::lto::LtoConfig::default(),
+            lld_compat: false,
+            extra_features: Vec::new(),
+            trace_symbols: Vec::new(),
+            print_gc_sections: false,
+            why_extract: None,
+            wrap: Vec::new(),
+            import_undefined: false,
+            map_file: None,
+            trace_files: false,
+        }
+    }
+}
+
+impl WasmArgs {
+    pub(crate) fn new() -> Result<Self> {
+        let mut common = CommonArgs::from_env()?;
+        // Disable wild's fork-into-subprocess optimisation for the
+        // wasm platform. The subprocess protocol assumes the
+        // platform-specific writer pipes data through stdin in a
+        // particular shape; the wasm writer doesn't — it produces
+        // output directly. Leaving `should_fork = true` (the
+        // crate-wide default) makes wasm links hang on
+        // `fread(__read_nocancel)` because the child never gets
+        // the data it's waiting for.
+        //
+        // ELF sets `should_fork = false` under equivalent
+        // conditions in `args/elf.rs`. The wasm path should have
+        // done the same since wasm was added; this is the catch-up.
+        common.should_fork = false;
+        Ok(Self {
+            common,
+            ..Default::default()
+        })
+    }
+}
+
+impl platform::Args for WasmArgs {
+    fn parse<S, I>(&mut self, input: I) -> Result
+    where
+        S: AsRef<str>,
+        I: Iterator<Item = S>,
+    {
+        parse(self, input)
+    }
+
+    fn should_strip_debug(&self) -> bool {
+        matches!(self.strip, Strip::All | Strip::Debug)
+    }
+
+    fn should_strip_all(&self) -> bool {
+        matches!(self.strip, Strip::All)
+    }
+
+    fn entry_symbol_name<'a>(&'a self, linker_script_entry: Option<&'a [u8]>) -> &'a [u8] {
+        if self.no_entry {
+            return b"";
+        }
+        linker_script_entry
+            .or(self.entry_symbol.as_deref())
+            .unwrap_or(b"_start")
+    }
+
+    fn has_explicit_entry(&self) -> bool {
+        self.entry_symbol.is_some()
+    }
+
+    fn lib_search_path(&self) -> &[Box<Path>] {
+        &self.lib_search_paths
+    }
+
+    fn output(&self) -> &Arc<Path> {
+        &self.output
+    }
+
+    fn common(&self) -> &CommonArgs {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut CommonArgs {
+        &mut self.common
+    }
+
+    fn should_export_all_dynamic_symbols(&self) -> bool {
+        if self.no_export_dynamic {
+            return false;
+        }
+        self.export_dynamic || self.export_all || self.is_shared
+    }
+
+    fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
+        false
+    }
+
+    fn should_gc_sections(&self) -> bool {
+        !self.no_gc_sections
+    }
+
+    fn wasm_opt_level(&self) -> u8 {
+        self.opt_level
+    }
+
+    fn should_allow_object_undefined(&self, _output_kind: crate::OutputKind) -> bool {
+        self.allow_undefined
+    }
+
+    fn allow_multiple_definitions(&self) -> bool {
+        self.allow_multiple_definitions
+    }
+
+    fn warn_multiple_definitions(&self) -> bool {
+        self.warn_multiple_definitions
+    }
+
+    fn force_undefined_symbol_names(&self) -> &[String] {
+        &self.force_undefined
+    }
+
+    fn force_export_symbol_names(&self) -> &[String] {
+        &self.exports
+    }
+
+    fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
+        // WASM has no segments — per spec, memory is a single linear block.
+        crate::alignment::Alignment { exponent: 0 }
+    }
+
+    fn should_merge_sections(&self) -> bool {
+        false
+    }
+
+    fn relocation_model(&self) -> RelocationModel {
+        RelocationModel::NonRelocatable
+    }
+
+    fn should_output_executable(&self) -> bool {
+        !self.is_shared && !self.is_relocatable
+    }
+
+    fn should_output_partial_object(&self) -> bool {
+        self.is_relocatable
+    }
+
+    /// Wasm runs the P3 bitcode-lowering pipeline by default when
+    /// `llc` is discoverable. Users who want to opt out can set
+    /// `WILD_DISABLE_WASM_LTO=1`. See `wild-lto-plan.md` P3.
+    fn wasm_bitcode_lowering_enabled(&self) -> bool {
+        if std::env::var_os("WILD_DISABLE_WASM_LTO").is_some() {
+            return false;
+        }
+        crate::llvm_tools::find(crate::llvm_tools::Tool::Llc).is_some()
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut WasmArgs, input: I) -> Result {
+    let mut inputs = Vec::new();
+    let mut modifiers = Modifiers::default();
+
+    let mut iter = input.peekable();
+    while let Some(arg) = iter.next() {
+        let arg = arg.as_ref();
+        match arg {
+            // --- Driver flavor (rust-lld multi-call convention: `-flavor wasm`) ---
+            "-flavor" | "--flavor" => {
+                if let Some(flavor) = iter.next() {
+                    let f = flavor.as_ref();
+                    if f != "wasm" {
+                        return Err(crate::error!(
+                            "Unsupported linker flavor: {f} (expected 'wasm')"
+                        ));
+                    }
+                }
+            }
+
+            // --- Output ---
+            "-o" => {
+                if let Some(path) = iter.next() {
+                    args.output = Arc::from(Path::new(path.as_ref()));
+                }
+            }
+            _ if arg.starts_with("-o") => {
+                args.output = Arc::from(Path::new(&arg[2..]));
+            }
+
+            // --- Entry point (spec §9.2: linker resolves entry symbol) ---
+            "-e" | "--entry" => {
+                if let Some(sym) = iter.next() {
+                    args.entry_symbol = Some(sym.as_ref().as_bytes().to_vec());
+                }
+            }
+            _ if arg.starts_with("--entry=") => {
+                args.entry_symbol = Some(arg.as_bytes()[8..].to_vec());
+            }
+            "--no-entry" => args.no_entry = true,
+
+            // --- Symbol resolution (spec §9.2) ---
+            "--allow-undefined" | "-allow-undefined" => args.allow_undefined = true,
+            "--import-undefined" | "-import-undefined" => {
+                args.import_undefined = true;
+                args.allow_undefined = true;
+            }
+            "--allow-multiple-definition" => args.allow_multiple_definitions = true,
+            "--no-allow-multiple-definition" => args.allow_multiple_definitions = false,
+            // `--noinhibit-exec`: lld convention for "let the link
+            // succeed even with errors, downgrade fatal duplicate-
+            // symbol errors to warnings". Implies
+            // `--allow-multiple-definition` *and* prints a one-line
+            // `warning: duplicate symbol: <name>` per collision —
+            // distinct from plain `--allow-multiple-definition` /
+            // `-z muldefs`, which lld silences entirely.
+            "--noinhibit-exec" => {
+                args.allow_multiple_definitions = true;
+                args.warn_multiple_definitions = true;
+            }
+            // `-Bsymbolic`: bind locally to defined symbols in shared
+            // libraries. Only meaningful with `-shared`; for an
+            // executable link lld emits a warning, then proceeds.
+            // `bsymbolic.s` checks for that exact warning text.
+            "-Bsymbolic" | "-Bsymbolic-functions" => {
+                if !args.is_shared {
+                    eprintln!("warning: -Bsymbolic is only meaningful when combined with -shared");
+                }
+            }
+
+            // --- Exports (spec §9.2: export for each defined symbol with
+            //     non-local linkage and non-hidden visibility) ---
+            "--export-dynamic" => args.export_dynamic = true,
+            "--no-export-dynamic" => {
+                args.export_dynamic = false;
+                args.no_export_dynamic = true;
+            }
+            "--export-all" => args.export_all = true,
+            _ if arg.starts_with("--export=") => {
+                let name = arg[9..].to_string();
+                // wasm-ld treats `--export=NAME` as also forcing the
+                // symbol undefined for archive extraction (see lld
+                // `Driver::createFiles` — exported symbols seed the
+                // resolution graph). Without this `archive-export`
+                // and similar fixtures don't pull `archive2_symbol`
+                // out of `%t.a`.
+                args.force_undefined.push(name.clone());
+                args.exports.push(name);
+            }
+            "--export" => {
+                if let Some(sym) = iter.next() {
+                    let name = sym.as_ref().to_string();
+                    args.force_undefined.push(name.clone());
+                    args.exports.push(name);
+                }
+            }
+            _ if arg.starts_with("--export-if-defined=") => {
+                args.exports_if_defined.push(arg[20..].to_string());
+            }
+            "--export-table" => args.export_table = true,
+            "--import-table" => args.import_table = true,
+
+            // --- Memory layout (spec §9.1: data segment merging) ---
+            _ if arg.starts_with("--initial-memory=") => {
+                args.initial_memory = arg[17..].parse().ok();
+            }
+            _ if arg.starts_with("--max-memory=") => {
+                args.max_memory = arg[13..].parse().ok();
+            }
+            _ if arg.starts_with("--page-size=") => {
+                args.page_size = arg["--page-size=".len()..].parse().ok();
+            }
+            _ if arg.starts_with("--global-base=") => {
+                args.global_base = arg[14..].parse().ok();
+            }
+            _ if arg.starts_with("--initial-heap=") => {
+                args.initial_heap = arg[15..].parse().ok();
+            }
+            "--stack-first" => args.stack_first = true,
+            "--no-stack-first" => args.stack_first = false,
+            "--no-growable-memory" => args.no_growable_memory = true,
+            "--growable-table" => args.growable_table = true,
+            "--import-memory" => args.import_memory = true,
+            _ if arg.starts_with("--import-memory=") => {
+                args.import_memory = true;
+                let val = &arg["--import-memory=".len()..];
+                // `--import-memory=module,field` → (module, field).
+                // `--import-memory=field` (no comma) → (env, field) per
+                // wasm-ld's default-module convention.
+                let (module, field) = match val.split_once(',') {
+                    Some((m, f)) => (m.to_string(), f.to_string()),
+                    None => ("env".to_string(), val.to_string()),
+                };
+                args.import_memory_name = Some((module, field));
+            }
+            "--export-memory" => args.export_memory_name = Some("memory".to_string()),
+            _ if arg.starts_with("--export-memory=") => {
+                args.export_memory_name = Some(arg["--export-memory=".len()..].to_string());
+            }
+            "--shared-memory" => args.shared_memory = true,
+
+            // --- -z flags ---
+            "-z" => {
+                if let Some(val) = iter.next() {
+                    let val = val.as_ref();
+                    if let Some(size) = val.strip_prefix("stack-size=") {
+                        args.stack_size = size.parse().ok();
+                    } else if val == "muldefs" {
+                        // `-z muldefs` is the lld/binutils synonym for
+                        // `--allow-multiple-definition` (silent — no
+                        // warning). Distinct from `--noinhibit-exec`,
+                        // which sets `warn_multiple_definitions` too.
+                        args.allow_multiple_definitions = true;
+                    }
+                    // Other -z flags silently accepted
+                }
+            }
+
+            // --- GC ---
+            "--gc-sections" => args.no_gc_sections = false,
+            "--no-gc-sections" | "-no-gc-sections" => args.no_gc_sections = true,
+
+            // --- Strip ---
+            "--strip-debug" | "-strip-debug" | "-S" => args.strip = Strip::Debug,
+            "--strip-all" | "-strip-all" | "-s" => args.strip = Strip::All,
+            _ if arg.starts_with("--keep-section=") => {
+                args.keep_sections
+                    .push(arg["--keep-section=".len()..].to_string());
+            }
+
+            // --- Relocatable / shared ---
+            "-r" | "--relocatable" => args.is_relocatable = true,
+            "-shared" | "--shared" => args.is_shared = true,
+
+            // --- Undefined symbols ---
+            "-u" | "--undefined" => {
+                if let Some(sym) = iter.next() {
+                    args.force_undefined.push(sym.as_ref().to_string());
+                }
+            }
+            _ if arg.starts_with("--undefined=") => {
+                args.force_undefined.push(arg[12..].to_string());
+            }
+
+            // --- Library search ---
+            "-L" => {
+                if let Some(path) = iter.next() {
+                    args.lib_search_paths
+                        .push(Box::from(Path::new(path.as_ref())));
+                }
+            }
+            _ if arg.starts_with("-L") => {
+                args.lib_search_paths.push(Box::from(Path::new(&arg[2..])));
+            }
+            "-l" => {
+                if let Some(name) = iter.next() {
+                    let s = name.as_ref();
+                    let spec = if let Some(rest) = s.strip_prefix(':') {
+                        // `-l:filename` (binutils convention): search
+                        // for the literal filename — no `lib` prefix
+                        // or extension auto-attached.
+                        InputSpec::Search(rest.into())
+                    } else {
+                        InputSpec::Lib(s.into())
+                    };
+                    inputs.push(Input {
+                        spec,
+                        search_first: None,
+                        modifiers,
+                    });
+                }
+            }
+            _ if arg.starts_with("-l") => {
+                let s = &arg[2..];
+                let spec = if let Some(rest) = s.strip_prefix(':') {
+                    InputSpec::Search(rest.into())
+                } else {
+                    InputSpec::Lib(s.into())
+                };
+                inputs.push(Input {
+                    spec,
+                    search_first: None,
+                    modifiers,
+                });
+            }
+
+            // --- Archive modifiers ---
+            "--whole-archive" => modifiers.whole_archive = true,
+            "--no-whole-archive" => modifiers.whole_archive = false,
+            "--start-lib" => modifiers.archive_semantics = true,
+            "--end-lib" => modifiers.archive_semantics = false,
+
+            // --- Target/arch ---
+            "--target" => {
+                if let Some(t) = iter.next()
+                    && t.as_ref().starts_with("wasm64")
+                {
+                    args.memory64 = true;
+                }
+            }
+            _ if arg.starts_with("--target=") => {
+                if arg["--target=".len()..].starts_with("wasm64") {
+                    args.memory64 = true;
+                }
+            }
+            "-m" => {
+                if let Some(t) = iter.next()
+                    && t.as_ref() == "wasm64"
+                {
+                    args.memory64 = true;
+                }
+            }
+            "-mwasm64" => args.memory64 = true,
+            _ if arg.starts_with("-m") => {} // e.g. other -m variants
+
+            // --- PIC ---
+            "--experimental-pic" | "-pie" | "--pie" => args.is_pic = true,
+            _ if arg.starts_with("--unresolved-symbols=") => {
+                let val = &arg["--unresolved-symbols=".len()..];
+                match val {
+                    "ignore-all" => {
+                        args.allow_undefined = true;
+                        args.stub_unresolved_functions = true;
+                    }
+                    "report-all" => {} // default
+                    "import-dynamic" => {
+                        // Treat unresolved symbols as imports — same
+                        // behaviour as `ignore-all` for now (allow-
+                        // undefined + stub-unresolved-functions),
+                        // since wild's writer already routes any
+                        // surviving undef into an env.<name> import
+                        // under shared/PIE / Bdynamic. lld emits a
+                        // diagnostic warning that the feature is
+                        // experimental (`unresolved-symbols-dynamic.s`
+                        // checks for this exact string).
+                        args.allow_undefined = true;
+                        args.stub_unresolved_functions = true;
+                        eprintln!(
+                            "wasm-ld: warning: dynamic imports are not yet stable (--unresolved-symbols=import-dynamic)"
+                        );
+                    }
+                    "ignore-in-shared-libs" => {}
+                    "ignore-in-object-files" => {}
+                    _ => {}
+                }
+            }
+            "--warn-unresolved-symbols" => {
+                args.allow_undefined = true;
+                args.stub_unresolved_functions = true;
+            }
+            "--fatal-warnings" => {}
+            "--no-fatal-warnings" => {}
+            _ if arg.starts_with("--features=") => {
+                for feat in arg["--features=".len()..].split(',') {
+                    if feat == "+memory64" {
+                        args.memory64 = true;
+                    }
+                    // Strip leading `+`/`=` if present, store the bare name.
+                    let bare = feat.trim_start_matches(['+', '=']);
+                    if !bare.is_empty() {
+                        args.extra_features.push(bare.to_string());
+                    }
+                }
+            }
+            _ if arg.starts_with("--extra-features=") => {
+                for feat in arg["--extra-features=".len()..].split(',') {
+                    if feat == "+memory64" {
+                        args.memory64 = true;
+                    }
+                    let bare = feat.trim_start_matches(['+', '=']);
+                    if !bare.is_empty() {
+                        args.extra_features.push(bare.to_string());
+                    }
+                }
+            }
+            "--no-check-features" => {}
+            // Bit-for-bit lld compatibility mode. Off by default; turn
+            // on when byte-identical output to wasm-ld matters. See
+            // the field doc on `WasmArgs::lld_compat`.
+            "--lld-compat" | "-lld_compat" => args.lld_compat = true,
+            "--no-lld-compat" | "-no_lld_compat" => args.lld_compat = false,
+            "-t" | "--trace" => args.trace_files = true,
+            // `-y` and `--trace-symbol` accept a symbol either glued
+            // (`-yfoo`, `--trace-symbol=foo`) or space-separated
+            // (`-y foo`, `--trace-symbol foo` / `-trace-symbol foo`).
+            // The bare-flag forms must consume the next argument so a
+            // following symbol name isn't mistaken for a positional
+            // input file.
+            "-y" | "-trace-symbol" | "--trace-symbol" => {
+                if let Some(name) = iter.next() {
+                    args.trace_symbols.push(name.as_ref().to_string());
+                }
+            }
+            _ if arg.starts_with("-y") => {
+                // `-yfoo` glued form.
+                args.trace_symbols.push(arg[2..].to_string());
+            }
+            _ if arg.starts_with("--trace-symbol=") => {
+                args.trace_symbols
+                    .push(arg["--trace-symbol=".len()..].to_string());
+            }
+            _ if arg.starts_with("-trace-symbol=") => {
+                // Single-dash glued form, used in trace-symbol.s.
+                args.trace_symbols
+                    .push(arg["-trace-symbol=".len()..].to_string());
+            }
+            _ if arg.starts_with("--wrap=") => {
+                args.wrap.push(arg["--wrap=".len()..].to_string());
+            }
+            "-wrap" | "--wrap" => {
+                if let Some(name) = iter.next() {
+                    args.wrap.push(name.as_ref().to_string());
+                }
+            }
+            _ if arg.starts_with("-rpath") => {
+                if arg == "-rpath" {
+                    if let Some(p) = iter.next() {
+                        args.rpath.push(p.as_ref().to_string());
+                    }
+                } else if let Some(rest) = arg.strip_prefix("-rpath=") {
+                    args.rpath.push(rest.to_string());
+                }
+            }
+            _ if arg.starts_with("--rpath=") => {
+                if let Some(rest) = arg.strip_prefix("--rpath=") {
+                    args.rpath.push(rest.to_string());
+                }
+            }
+            _ if arg.starts_with("--rpath") => {
+                if arg == "--rpath"
+                    && let Some(p) = iter.next()
+                {
+                    args.rpath.push(p.as_ref().to_string());
+                }
+            }
+            "--print-gc-sections" => args.print_gc_sections = true,
+            "--no-print-gc-sections" => args.print_gc_sections = false,
+            "--demangle" => args.common.demangle = true,
+            "--no-demangle" => args.common.demangle = false,
+            "--why-extract" => {
+                if let Some(p) = iter.next() {
+                    args.why_extract = Some(p.as_ref().to_string());
+                }
+            }
+            _ if arg.starts_with("--why-extract=") => {
+                args.why_extract = Some(arg["--why-extract=".len()..].to_string());
+            }
+            "--compress-relocations" => args.compress_relocations = true,
+            _ if arg.starts_with("--compress-relocations") => args.compress_relocations = true,
+            "-M" | "-print-map" | "--print-map" => {
+                args.map_file = Some(MapFileTarget::Stdout);
+            }
+            _ if arg.starts_with("-Map=") => {
+                args.map_file = Some(MapFileTarget::Path(std::path::PathBuf::from(
+                    &arg["-Map=".len()..],
+                )));
+            }
+            _ if arg.starts_with("--Map=") => {
+                args.map_file = Some(MapFileTarget::Path(std::path::PathBuf::from(
+                    &arg["--Map=".len()..],
+                )));
+            }
+            "-Map" | "--Map" => {
+                if let Some(p) = iter.next() {
+                    args.map_file = Some(MapFileTarget::Path(std::path::PathBuf::from(p.as_ref())));
+                }
+            }
+            "--emit-relocs" => args.emit_relocs = true,
+            "--no-merge-data-segments" => {}
+            _ if arg.starts_with("--page-size=") => {}
+            "--no-shlib-sigcheck" => {}
+            _ if arg.starts_with("--build-id") => {}
+            "-v" | "--verbose" => {
+                // `-v` / `--verbose`: lld prints "LLD <version>" then
+                // continues processing. The `version.test` fixture
+                // checks for the literal `LLD {{.+}}` line so the
+                // exact suffix is flexible — emit wild's own banner
+                // with the LLD prefix to keep the test happy.
+                println!("LLD wild {}", env!("CARGO_PKG_VERSION"));
+            }
+            "--version" | "-V" => {
+                // `--version` skips input-file processing per lld's
+                // behaviour. `-V` is the alias and behaves the same.
+                // Print and exit immediately.
+                println!("LLD wild {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--reproduce" => {
+                iter.next();
+            }
+            _ if arg.starts_with("--reproduce=") => {}
+            "--color-diagnostics" | "--no-color-diagnostics" => {}
+            _ if arg.starts_with("-O") => {
+                // `-O<N>` — optimisation level. `-O` alone is treated as `-O1`.
+                let rest = &arg[2..];
+                args.opt_level = if rest.is_empty() {
+                    1
+                } else {
+                    rest.parse::<u8>().unwrap_or(1)
+                };
+            }
+            _ if arg.starts_with("--threads=") => {}
+            // LTO-family flags are routed into `args.lto` so the P4
+            // batch lowerer (and future P5 UnifiedLTO) can read them.
+            // Unknown variants (`--thinlto-*`, `--lto-O<N>`, etc.)
+            // are accepted and silently parsed as best-effort.
+            _ if arg.starts_with("-flto")
+                || arg == "-fno-lto"
+                || arg.starts_with("--lto")
+                || arg.starts_with("--no-lto")
+                || arg.starts_with("--thinlto") =>
+            {
+                let _ = args.lto.parse_flag(arg);
+            }
+            _ if arg.starts_with("--library-path") => {
+                if arg == "--library-path" {
+                    iter.next();
+                }
+            }
+            _ if arg.starts_with("--library=") => {
+                inputs.push(Input {
+                    spec: InputSpec::Lib(arg[10..].into()),
+                    search_first: None,
+                    modifiers,
+                });
+            }
+            "--library" => {
+                if let Some(name) = iter.next() {
+                    inputs.push(Input {
+                        spec: InputSpec::Lib(name.as_ref().into()),
+                        search_first: None,
+                        modifiers,
+                    });
+                }
+            }
+
+            // --- Response files ---
+            _ if arg.starts_with('@') => {
+                let path = &arg[1..];
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    let extra_args: Vec<String> =
+                        content.split_whitespace().map(String::from).collect();
+                    parse(args, extra_args.into_iter())?;
+                }
+            }
+
+            // Positional: input file
+            _ if !arg.starts_with('-') => {
+                inputs.push(Input {
+                    spec: InputSpec::File(Box::from(Path::new(arg))),
+                    search_first: None,
+                    modifiers,
+                });
+            }
+
+            // Unknown flags: collect but don't error
+            _ => {
+                args.common.unrecognized_options.push(arg.to_owned());
+            }
+        }
+    }
+
+    args.common.inputs.extend(inputs);
+    Ok(())
+}

@@ -230,10 +230,12 @@ fn test_merge_parts() {
 
     let output_sections =
         crate::output_section_id::OutputSections::<crate::elf::Elf>::for_testing();
-    let (output_order, _program_segments) =
-        output_sections.output_order(crate::output_kind::OutputKind::StaticExecutable(
+    let (output_order, _program_segments) = output_sections.output_order(
+        crate::output_kind::OutputKind::StaticExecutable(
             crate::args::RelocationModel::NonRelocatable,
-        ));
+        ),
+        &crate::args::elf::ElfArgs::default(),
+    );
     let mut expected_sum_of_sums = 0;
     let all_1 = output_sections.new_part_map::<u32>().output_order_map(
         &output_order,
@@ -256,6 +258,8 @@ fn test_merge_parts() {
         output_section_id::CSTRING,
         output_section_id::ENTRY_POINT,
         output_section_id::LINK_EDIT_SEGMENT,
+        output_section_id::OBJC_SELREFS,
+        output_section_id::OBJC_IMAGEINFO,
     ];
     let mut sum_of_sums = 0;
     sum_of_1s.for_each(|section_id, sum| {
@@ -323,10 +327,12 @@ fn test_output_order_map_consistent() {
 
     let output_sections =
         crate::output_section_id::OutputSections::<crate::elf::Elf>::for_testing();
-    let (output_order, _program_segments) =
-        output_sections.output_order(crate::output_kind::OutputKind::StaticExecutable(
+    let (output_order, _program_segments) = output_sections.output_order(
+        crate::output_kind::OutputKind::StaticExecutable(
             crate::args::RelocationModel::NonRelocatable,
-        ));
+        ),
+        &crate::args::elf::ElfArgs::default(),
+    );
     let part_map = output_sections.new_part_map::<u32>();
 
     // First, make sure that all our built-in part-ids are here. If they're not, we'd fail anyway,
@@ -376,10 +382,12 @@ fn test_output_order_map() {
 
     let output_sections =
         crate::output_section_id::OutputSections::<crate::elf::Elf>::for_testing();
-    let (output_order, _program_segments) =
-        output_sections.output_order(crate::output_kind::OutputKind::StaticExecutable(
+    let (output_order, _program_segments) = output_sections.output_order(
+        crate::output_kind::OutputKind::StaticExecutable(
             crate::args::RelocationModel::NonRelocatable,
-        ));
+        ),
+        &crate::args::elf::ElfArgs::default(),
+    );
     let mut part_map = output_sections.new_part_map::<u32>();
 
     const PART_ID1: PartId = output_section_id::DATA.part_id_with_alignment(alignment::USIZE);

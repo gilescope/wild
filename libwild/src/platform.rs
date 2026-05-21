@@ -113,7 +113,7 @@ pub(crate) trait Arch: Send + Sync + 'static {
         _relocations: <Self::Platform as Platform>::RelocationList<'data>,
         _existing_deltas: Option<&SectionRelaxDeltas>,
         _resolve_symbol: impl FnMut(object::SymbolIndex) -> Option<RelaxSymbolInfo>,
-    ) -> (Vec<(u64, u32)>, Option<u64>) {
+    ) -> (Vec<(u64, i32)>, Option<u64>) {
         // This function should not be called unless `supports_size_reduction_relaxations` returns
         // true in which case this function should be implemented.
         unreachable!();
@@ -221,6 +221,27 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     /// For platforms that don't support symbol versioning, this can just be the unit type.
     type VerneedTable<'data>: VerneedTable<'data>;
 
+    /// When every alternative definition of a symbol is weak, merge their visibilities
+    /// using `min()` (least-restrictive wins) instead of `max()` (most-restrictive).
+    /// Mach-O's `.weak_def_can_be_hidden` directive (`N_WEAK_DEF | N_WEAK_REF`) hides the
+    /// symbol only if every defining translation unit agrees; a single peer without the
+    /// flag promotes the merged symbol back to default visibility. ELF has no equivalent
+    /// — its `STV_HIDDEN` is unconditional, so the default is `false`.
+    const ALL_WEAK_MIN_VISIBILITY: bool = false;
+
+    /// When `ALL_WEAK_MIN_VISIBILITY` produces a default-visibility merge from at least
+    /// one originally-hidden alternative, force `EXPORT_DYNAMIC` on the selected symbol
+    /// so the layout creates a resolution and the output's exports table can carry the
+    /// promoted symbol. Mach-O needs this; ELF doesn't.
+    const PROMOTE_WEAK_TO_EXPORT_DYNAMIC: bool = false;
+
+    /// Apply `DOWNGRADE_TO_LOCAL | NON_INTERPOSABLE` to defined externals whose input
+    /// visibility is `Hidden`. Mach-O uses this so that `weak_def_can_be_hidden`
+    /// (`N_WEAK_DEF | N_WEAK_REF`) and `private_extern` (`N_PEXT`) symbols stay out of
+    /// the exports trie. ELF keeps the existing flow where hidden defs only get
+    /// `NON_INTERPOSABLE` and dynsym inclusion is gated separately.
+    const APPLY_HIDDEN_VIS_DOWNGRADE_TO_DEFS: bool = false;
+
     /// Invoke the linker for requested architecture.
     fn link_for_arch<'data>(
         linker: &'data crate::Linker,
@@ -228,9 +249,49 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     ) -> Result<crate::LinkerOutput<'data>>;
 
     fn write_output_file<'data, A: Arch<Platform = Self>>(
-        output: &crate::file_writer::Output,
+        output: &mut crate::file_writer::Output,
         layout: &Layout<'data, Self>,
     ) -> Result;
+
+    /// Compute the output file size from the section-layout snapshot,
+    /// or `None` if the size depends on data not yet available at that
+    /// layout phase and the platform will set the size itself inside
+    /// `write_output_file`. Mach-O returns `None` — its final size
+    /// depends on `segment_layouts`, symbol counts, and stab counts
+    /// that aren't built until later; the Mach-O writer computes the
+    /// size and calls `output.set_size` itself.
+    fn output_file_size_at_layout(
+        _section_layouts: &OutputSectionMap<OutputRecordLayout>,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Platform-specific symtab-precount result: per-input slot
+    /// offsets + any totals the writer needs. ELF keeps the existing
+    /// `GroupLayout::strtab_start_offset` machinery for now (default
+    /// returns `()`); Mach-O returns a real struct with per-object
+    /// nlist / strtab / DYSYMTAB offsets that the writer uses for
+    /// parallel per-object writes (replaces the shared-state
+    /// `entries: Vec` + `seen_names: HashSet` approach).
+    ///
+    /// A migration of ELF's offset-assignment into this hook would
+    /// unify both platforms on one codepath. Zero perf cost — the
+    /// computation is the same prefix-sum ELF already does — but
+    /// best done in a separate commit so the ELF blast radius is
+    /// isolated.
+    type SymtabPrecount: Default + Send + Sync + 'static;
+
+    /// Walk the post-layout state and assign per-input symtab +
+    /// strtab byte offsets. Called from the platform's
+    /// `write_output_file` path before the mmap buffer is sized, so
+    /// exact totals feed into `output.set_size` (killing the
+    /// "pessimistic 512 bytes/symbol" estimate Mach-O has carried).
+    ///
+    /// Default returns the type's `Default::default()` — ELF and
+    /// Wasm use existing machinery.
+    fn precount_symtab<'data>(_layout: &Layout<'data, Self>) -> Self::SymtabPrecount {
+        Self::SymtabPrecount::default()
+    }
 
     /// Possibly initialise a linker plugin if the platform supports it and the arguments specifies
     /// that one should be used.
@@ -283,6 +344,62 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     /// should be considered content and thus prevent the output section from being discarded.
     fn is_zero_sized_section_content(section_id: OutputSectionId) -> bool;
 
+    /// Returns alignment-padding insertion deltas for the named input
+    /// section under Mach-O's `.subsections_via_symbols`. Each entry
+    /// `(input_offset, bytes_delta)` records `-N` bytes inserted just
+    /// before the symbol at `input_offset`. Default: no padding —
+    /// non-Mach-O platforms have no subsection concept here. Sum of
+    /// `-bytes_delta` is the total size growth for the section.
+    fn compute_subsection_padding_deltas<'data>(
+        _file: &<Self as Platform>::File<'data>,
+        _section_index: object::SectionIndex,
+    ) -> Vec<(u64, i32)> {
+        Vec::new()
+    }
+
+    /// Builds the atom (subsection) map for an
+    /// `MH_SUBSECTIONS_VIA_SYMBOLS` pure-text section. Default: empty
+    /// — only Mach-O divides sections at symbol boundaries.
+    fn compute_atoms<'data>(
+        _file: &<Self as Platform>::File<'data>,
+        _section_index: object::SectionIndex,
+    ) -> Vec<layout::Atom> {
+        Vec::new()
+    }
+
+    /// For an `MH_SUBSECTIONS_VIA_SYMBOLS` section whose atoms have
+    /// at least one anchor symbol named in `-order_file` (`symbol_order`),
+    /// returns `(per-atom output offset, total section size)` after
+    /// reordering atoms by priority. Returns `None` when no reorder is
+    /// needed (every atom unranked, or sorted order matches input
+    /// order). Default: `None` — only Mach-O reorders subsections.
+    fn compute_atom_output_offsets<'data>(
+        _file: &<Self as Platform>::File<'data>,
+        _section_index: object::SectionIndex,
+        _atoms: &[layout::Atom],
+        _symbol_order: &std::collections::HashMap<String, u32>,
+    ) -> Option<(Vec<u64>, u64)> {
+        None
+    }
+
+    /// Scans the subset of an input section's relocations whose
+    /// `r_address` falls within `atom_input_range`, driving symbol
+    /// requests for each extern reference. Used by Mach-O's per-atom
+    /// GC — one call per atom activation. Default: no-op, because no
+    /// other platform has a per-atom story; calling this without a
+    /// Mach-O override indicates a bug.
+    fn scan_atom_relocations<'data, 'scope, A: Arch<Platform = Self>>(
+        _state: &layout::ObjectLayoutState<'data, Self>,
+        _common: &mut layout::CommonGroupState<'data, Self>,
+        _queue: &mut layout::LocalWorkQueue,
+        _resources: &'scope layout::GraphResources<'data, '_, Self>,
+        _section: layout::Section,
+        _atom_input_range: std::ops::Range<u64>,
+        _scope: &rayon::Scope<'scope>,
+    ) -> Result {
+        Ok(())
+    }
+
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails];
 
     fn finalise_group_layout(memory_offsets: &OutputSectionPartMap<u64>) -> Self::GroupLayoutExt;
@@ -314,7 +431,8 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     fn finalise_object_sizes<'data>(
         object: &mut layout::ObjectLayoutState<'data, Self>,
         common: &mut layout::CommonGroupState<'data, Self>,
-    );
+        output_sections: &OutputSections<'data, Self>,
+    ) -> Result;
 
     fn finalise_object_layout<'data>(
         object: &layout::ObjectLayoutState<'data, Self>,
@@ -469,6 +587,7 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
         extra_sizes: &mut OutputSectionPartMap<u64>,
         dynamic_symbol_defs: &[DynamicSymbolDefinition<Self>],
         args: &Self::Args,
+        symbol_db: &SymbolDb<'_, Self>,
     ) -> Result;
 
     fn finalise_layout_epilogue<'data>(
@@ -502,12 +621,41 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
         Ok(())
     }
 
+    /// Tweak per-section minimum alignments once args are known but before
+    /// the main layout pass runs. Used by Mach-O under `-ld64_compat` to
+    /// force `__data` onto a 16 KB page boundary so the writer can split
+    /// the merged DATA region into `__DATA_CONST` + `__DATA` segments.
+    /// Default: no-op.
+    fn adjust_output_section_alignments(
+        _output_sections: &mut OutputSections<Self>,
+        _args: &Self::Args,
+    ) {
+    }
+
+    /// Adjust per-section alignments once input contributions are known (i.e.
+    /// after `compute_total_section_part_sizes`) but before addresses are
+    /// assigned. Mach-O uses this to promote `__thread_data` and
+    /// `__thread_bss` to a shared max alignment — matching ld64's
+    /// <rdar://24221680> rule so the per-thread TLV buffer dyld `memcpy`s
+    /// into respects every variable's alignment. Default: no-op.
+    fn adjust_alignments_after_sizing(
+        _output_sections: &mut OutputSections<Self>,
+        _section_part_sizes: &OutputSectionPartMap<u64>,
+        _args: &Self::Args,
+    ) {
+    }
+
     /// Allocate space for headers based on segment and section counts.
+    /// `total_sizes` holds the byte counts that other passes have already
+    /// accumulated per part, letting us reserve only for sections that
+    /// actually carry content — important for Mach-O's tight-packed layout.
     fn allocate_header_sizes(
         prelude: &mut PreludeLayoutState<Self>,
         sizes: &mut OutputSectionPartMap<u64>,
         header_info: &layout::HeaderInfo,
         output_sections: &OutputSections<Self>,
+        args: &Self::Args,
+        total_sizes: &OutputSectionPartMap<u64>,
     );
 
     /// Gives the platform an opportunity to error out if an input stack section is requesting an
@@ -610,6 +758,7 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
         output_kind: OutputKind,
         output_sections: &OutputSections<'data, Self>,
         secondary: &OutputSectionMap<Vec<OutputSectionId>>,
+        args: &Self::Args,
     ) -> (OutputOrder, ProgramSegments<Self::ProgramSegmentDef>);
 
     fn will_emit_section_symbol_for_partial_objects(
@@ -715,6 +864,16 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
         index: object::SymbolIndex,
     ) -> Result<Option<object::SectionIndex>>;
 
+    /// Returns the symbol's offset within its section. For ELF, st_value is already
+    /// section-relative. For Mach-O, n_value is absolute so we subtract the section base.
+    fn symbol_value_in_section(
+        &self,
+        symbol: &<Self::Platform as Platform>::SymtabEntry,
+        _section_index: object::SectionIndex,
+    ) -> Result<u64> {
+        Ok(symbol.value())
+    }
+
     fn symbol_versions(&self) -> &[<Self::Platform as Platform>::SymbolVersionIndex];
 
     fn dynamic_symbol_used(
@@ -788,6 +947,15 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn section_display_name(&self, index: object::SectionIndex) -> Cow<'data, str>;
 
+    /// Returns true if the given symbol is in a common/tentative section (e.g.
+    /// Mach-O `__common`). Default returns false; Mach-O overrides this.
+    fn is_symbol_in_common_section(
+        &self,
+        _symbol: &<Self::Platform as Platform>::SymtabEntry,
+    ) -> bool {
+        false
+    }
+
     fn dynamic_tag_values(&self) -> Option<<Self::Platform as Platform>::DynamicTagValues<'data>>;
 
     fn get_version_names(&self) -> Result<<Self::Platform as Platform>::VersionNames<'data>>;
@@ -829,6 +997,17 @@ pub(crate) trait SectionHeader: std::fmt::Debug + Send + Sync + 'static {
     fn is_merge_section(&self) -> bool;
 
     fn is_strings(&self) -> bool;
+
+    /// Fixed stride for non-string merge sections (e.g. Mach-O's
+    /// `__literal4`/`__literal8`/`__literal16`). `None` means either
+    /// the section is not merge-fixed-stride (strings use
+    /// `is_strings`) or the platform has no such concept. When
+    /// `Some(n)`, the merger splits the input at every `n` bytes and
+    /// deduplicates each chunk independently — mirroring ld64's
+    /// `FixedSizeSection::useElementAt`.
+    fn merge_stride(&self) -> Option<u32> {
+        None
+    }
 
     fn should_retain(&self) -> bool;
 
@@ -1089,11 +1268,21 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         &[]
     }
 
+    /// Symbols to forcibly hide from exports (Mach-O -unexported_symbol).
+    fn force_unexport_symbol_names(&self) -> &[String] {
+        &[]
+    }
+
     fn symbol_names_to_wrap(&self) -> &[String] {
         &[]
     }
 
     fn entry_symbol_name<'a>(&'a self, linker_script_entry: Option<&'a [u8]>) -> &'a [u8];
+
+    /// Whether the user explicitly specified an entry point (e.g. via `-e`).
+    fn has_explicit_entry(&self) -> bool {
+        false
+    }
 
     fn version_script_path(&self) -> Option<&Path> {
         None
@@ -1115,8 +1304,55 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         None
     }
 
+    /// Path to a list of symbols that should NOT be exported (Mach-O -unexported_symbols_list).
+    fn unexport_list_path(&self) -> Option<&Path> {
+        None
+    }
+
+    /// Symbol-order map from `-order_file` (Mach-O). Maps each symbol name
+    /// listed in the order file to its priority (0-based index in the file).
+    /// Empty when no order file was provided. Used by Mach-O subsection
+    /// reordering; ELF returns the empty default.
+    fn symbol_order(&self) -> &std::collections::HashMap<String, u32> {
+        static EMPTY: std::sync::OnceLock<std::collections::HashMap<String, u32>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(std::collections::HashMap::new)
+    }
+
+    /// Path to libLTO.dylib for native LTO compilation (Mach-O -lto_library).
+    // dead_code suppressed because on macOS-only builds without the LTO
+    // pipeline enabled, the trait method's default impl reads as unused.
+    // ELF/wasm builds reach it through `input_data`.
+    #[allow(dead_code)]
+    fn lto_library_path(&self) -> Option<&Path> {
+        None
+    }
+
+    /// True if this platform wants wild to lower LTO bitcode inputs
+    /// to platform objects on the fly via subprocess `llc`. Today
+    /// only the wasm args override to `true`; Mach-O uses
+    /// `lto_library_path` (in-process libLTO) instead, ELF uses the
+    /// Gold plugin path. See `wild-lto-plan.md` phase P3.
+    fn wasm_bitcode_lowering_enabled(&self) -> bool {
+        false
+    }
+
+    /// Path to write LTO-compiled intermediate object (Mach-O -object_path_lto).
+    // dead_code: same rationale as `lto_library_path` above.
+    #[allow(dead_code)]
+    fn object_path_lto(&self) -> Option<&Path> {
+        None
+    }
+
     fn should_gc_sections(&self) -> bool {
         true
+    }
+
+    /// Wasm post-link optimisation level (`-O<N>`). Non-wasm platforms
+    /// return 0; the wasm writer consults this to decide whether wilt
+    /// should run. Default 0 keeps wild byte-compatible with wasm-ld.
+    fn wasm_opt_level(&self) -> u8 {
+        0
     }
 
     fn should_relax(&self) -> bool {
@@ -1137,8 +1373,25 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    /// Returns the set of symbols known to be provided by linked dylibs (Mach-O .tbd parsing).
+    fn dylib_symbols(&self) -> &crate::args::macho::DylibSymbols {
+        static EMPTY: std::sync::LazyLock<crate::args::macho::DylibSymbols> =
+            std::sync::LazyLock::new(crate::args::macho::DylibSymbols::default);
+        &EMPTY
+    }
+
     /// Returns whether multiple symbols with the same name should be permitted.
     fn allow_multiple_definitions(&self) -> bool {
+        false
+    }
+
+    /// Returns whether multiple-definition collisions should emit a
+    /// warning instead of being silently dropped. Implies
+    /// `allow_multiple_definitions`. Lld's `--noinhibit-exec` sets this:
+    /// the link succeeds, the first definition wins, and a one-line
+    /// `warning: duplicate symbol: <name>` goes to stderr per
+    /// collision.
+    fn warn_multiple_definitions(&self) -> bool {
         false
     }
 

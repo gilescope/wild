@@ -1,0 +1,141 @@
+name = "wasm"
+
+# Wasm benchmark matrix. Every entry has `platform = "wasm"` so the
+# host filter accepts them on either Linux or macOS — wasm32 is
+# target-only, no host-format dependency.
+#
+# Generating save-dirs:
+#   Wild doesn't currently emit `WILD_SAVE_BASE`-style replay dirs
+#   for wasm, so each save-dir's `run-with` script is hand-authored.
+#   Convention follows the ELF / Mach-O harness:
+#
+#     <saves>/<bench-name>/run-with    # executable script
+#
+#   The runner invokes:
+#
+#     OUT=<tmpfile> ./run-with <linker> [extra flags…]
+#
+#   so `run-with` should:
+#     - assemble its inputs into wasm32 `.o` files (cached alongside
+#       the script if expensive),
+#     - exec `$1` (the linker binary path) with those inputs and
+#       `--no-entry --export-all -o "$OUT"` (or whatever flags suit
+#       the workload),
+#     - shift "$@" so trailing args land on the linker invocation.
+#
+# A reference template lives at `benchmarks/runner/bin/wasm-run-with.tmpl`.
+#
+# Linkers to compare:
+#   wild                                              (default)
+#   ~/.rustup/toolchains/<…>/bin/gcc-ld/wasm-ld       (rust-lld baseline)
+#
+# Run with:
+#   cargo run --release -p benchmark-runner -- \
+#     bench --config benchmarks/wasm.toml \
+#           --saves /tmp/wild-saves-wasm \
+#           --tmp /tmp/wasm-bench-out \
+#           --allow-non-tmpfs \
+#           $WILD_BIN $WASM_LD_BIN
+
+# --- Tiny / sanity ---
+
+[bench.wasm-hello-c]
+# Minimal C program → wasm32 .o → linked. Output ~1-2 KB. Sanity
+# check that wild + wasm-ld both produce a valid module; numbers
+# here are dominated by process startup, not link work.
+platform = "wasm"
+
+[bench.wasm-hello-rust]
+# Tiny rust no_std executable for wasm32-unknown-unknown. Exercises
+# wild's Rust-shim path (panic_abort, alloc nostd).
+platform = "wasm"
+
+# --- Small (curated micro-suite from the rust-wasm WG) ---
+#
+# Sourced from https://github.com/fitzgen/code-size-benchmarks. The
+# whole set is a few hundred KB combined; each individual case is
+# 1-50 KB after link. Useful as a *spread* — they exercise different
+# rust-shim paths (panics, allocator choice, regex) rather than a
+# single hot path.
+
+[bench.wasm-codesize-allocator]
+# `allocator-system` from the code-size suite. Smallest meaningful
+# Rust→wasm output: bare alloc + dealloc through the system
+# allocator. Exercises wild's handling of synthesized stack/memory
+# globals.
+platform = "wasm"
+
+[bench.wasm-codesize-panic]
+# `panic-with-static-message` from the code-size suite. Exercises
+# the rust panic shim — string literal data section + the unwind
+# / abort selector.
+platform = "wasm"
+
+# --- Medium ---
+
+[bench.wasm-many-functions]
+# Synthetic ~5-20k tiny functions, ~500 KB-1 MB output. Stresses
+# the symbol table and code-section assembly. Useful for spotting
+# super-linear regressions in the writer.
+platform = "wasm"
+
+[bench.wasm-libsodium]
+# libsodium's bench suite compiled to wasm32 (the
+# `jedisct1/webassembly-benchmarks` 2021-Q1 set). Each .wasm is a
+# single primitive (chacha, sha2, ed25519, …); whole set ~250-400 KB
+# combined. The de-facto "real-world" wasm benchmark — pure C →
+# wasm, exercises crypto / SIMD / register allocation.
+platform = "wasm"
+
+[bench.wasm-rust-medium]
+# A small custom Rust binary checked in at
+# `benchmarks/wasm-savedirs/wasm-rust-medium/` — pulls in `regex`
+# + `serde_json` + a few compute loops to produce a representative
+# medium-rust output (~1-2 MB) without depending on any
+# system-config crate (etcetera, home, dirs) that would block
+# wasm32-wasip2. Picked over tokei because tokei → etcetera →
+# `home` doesn't compile on wasm32-wasip2. Picked over ripgrep
+# because ripgrep's WASI support is still an unmerged PR (#2994).
+#
+# SKIPPED today: wild produces structurally-invalid wasm output on
+# rustc-driven Rust → wasm32-wasip2 builds (every type-mismatch
+# check in `wasm-validate` fires). Reproduces on a hello-world
+# (`fn main() { println!("hi"); }`); not specific to this workload.
+# wild's own `WILD_VALIDATE_OUTPUT` doesn't catch it either —
+# meaning we'd be benchmarking the time to produce a broken
+# binary. Drop the `skip` once wild's wasm writer can link a
+# rustc-produced .o + sysroot .rlib set to a valid module.
+#
+# Save-dir builder: `benchmarks/wasm-savedirs/build-wasm-rust-medium.sh`
+# (works correctly — produces a valid output under wasm-ld; wild
+# is the side that fails).
+platform = "wasm"
+skip = true
+
+# --- Large ---
+
+[bench.wasm-bevy-experiments]
+# `topheman/bevy-rust-wasm-experiments` — a small playable Bevy
+# game compiled with wasm-bindgen. ~15-30 MB raw .wasm. Exercises
+# every part of the writer at scale: SIMD, large code section,
+# wasm-bindgen glue, lots of cross-crate deps. Best stress test
+# we'll find without proprietary blobs.
+#
+# Save-dir builder must run wasm-bindgen first; the bench measures
+# ONLY the link step on the post-bindgen .o set (cached in the
+# save-dir). Same pattern as the substrate harness.
+platform = "wasm"
+
+# --- Large (opt-in: needs an external workload checkout) ---
+
+[bench.wasm-substrate-runtime]
+# A Substrate-style runtime built via `substrate-wasm-builder`
+# (e.g. partner-chains-demo-runtime). ~5-15 MB raw, ~1 MB
+# zstd-compressed. The current `benches/wasm-lto-bench.sh`
+# operates on this same workload and can be migrated to feed
+# this save-dir.
+#
+# Skipped by default — uncomment `skip = false` and provide the
+# save-dir to enable.
+platform = "wasm"
+skip = true

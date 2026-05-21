@@ -177,6 +177,29 @@ pub(crate) fn write<'data, A: Arch<Platform = Elf>>(
     write_sframe_section(section_buffers.get_mut(output_section_id::SFRAME), layout)?;
 
     write_gnu_build_id_note(sized_output, &layout.args().build_id, layout)?;
+
+    // `.debug_abbrev` cross-CU dedup. No-op unless enabled. Runs
+    // before the other debug passes so they see the already-deduped
+    // section (their work is independent, but staying early keeps
+    // the order deterministic and simplifies reasoning).
+    crate::elf_abbrev_dedup::dedup_debug_abbrev(sized_output, layout.args().dedup_debug_abbrev)?;
+
+    // `--upgrade-debug-line=v5` post-pass. No-op when the flag isn't
+    // set. Runs BEFORE compress so the new `.debug_line_str` section
+    // also gets compressed if compression is on. Rewrites
+    // `.debug_line` v4 → v5 with cross-CU path pooling, adds
+    // `.debug_line_str`, patches DW_AT_stmt_list values, shifts
+    // sections, updates SHDR + ehdr.
+    crate::elf_line_v5::upgrade_debug_line(sized_output, layout.args().upgrade_debug_line)?;
+
+    // `--compress-debug-sections=zstd` post-pass. No-op when the
+    // flag wasn't set. Runs after build-id so the ELF is otherwise
+    // final; rewrites SHDR offsets + e_shoff and shortens the file.
+    crate::elf_compress::compress_debug_sections(
+        sized_output,
+        layout.args().compress_debug_sections,
+    )?;
+
     Ok(())
 }
 
@@ -1903,8 +1926,10 @@ fn write_section_raw<'out, 'data>(
                             .copy_from_slice(&input_data[input_pos..skip_start]);
                         output_pos += copy_len;
                     }
-                    // Skip over the deleted bytes in the input.
-                    input_pos = skip_start + delta.bytes_deleted as usize;
+                    // Skip over the deleted bytes in the input. On the ELF
+                    // relaxation path `bytes_delta` is always positive; the
+                    // signed refactor widens the type but not the values.
+                    input_pos = skip_start + delta.bytes_delta as usize;
                 }
 
                 // Copy the remainder after the last deletion.
@@ -1955,9 +1980,13 @@ fn write_symbols<'data>(
             let section_id =
                 if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
                     match &object.sections[section_index.0] {
-                        SectionSlot::Loaded(section) => section.output_section_id(),
+                        SectionSlot::Loaded(section) | SectionSlot::LoadedDebugInfo(section) => {
+                            section.output_section_id()
+                        }
                         SectionSlot::MergeStrings(section) => section.part_id.output_section_id(),
                         SectionSlot::FrameData(..) => output_section_id::EH_FRAME,
+                        SectionSlot::NoteGnuProperty(..) => output_section_id::NOTE_GNU_PROPERTY,
+                        SectionSlot::RiscvVAttributes(..) => output_section_id::RISCV_ATTRIBUTES,
                         _ => bail!(
                             "Tried to copy a symbol in a section we didn't load. {}",
                             layout.symbol_debug(symbol_id)
@@ -2647,8 +2676,7 @@ fn apply_relocation<
         RelocationKind::None => return Ok(RelocationModifier::Normal),
         RelocationKind::Alignment => {
             let addend = addend as u64;
-            let removed_bytes =
-                relax_deltas.map_or(0u64, |d| u64::from(d.delta_bytes_at(rel.offset())));
+            let removed_bytes = relax_deltas.map_or(0u64, |d| d.delta_at(rel.offset()) as u64);
             let padding_bytes = addend.saturating_sub(removed_bytes) as usize;
             A::fill_nop_padding(out, offset_in_section as usize, padding_bytes);
 
@@ -4023,7 +4051,10 @@ fn get_symbol_attributes(layout: &ElfLayout, symbol_id: SymbolId) -> Result<(u32
                         .sections
                         .get(section_index.0)
                         .and_then(|slot| match slot {
-                            SectionSlot::Loaded(section) => Some(section.output_section_id()),
+                            SectionSlot::Loaded(section)
+                            | SectionSlot::LoadedDebugInfo(section) => {
+                                Some(section.output_section_id())
+                            }
                             SectionSlot::MergeStrings(section) => {
                                 Some(section.part_id.output_section_id())
                             }
@@ -4239,7 +4270,9 @@ fn write_regular_object_dynamic_symbol_definition<'data>(
     let name = sym_def.name;
     if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
         let output_section_id = match &object.sections[section_index.0] {
-            SectionSlot::Loaded(section) => section.output_section_id(),
+            SectionSlot::Loaded(section) | SectionSlot::LoadedDebugInfo(section) => {
+                section.output_section_id()
+            }
             SectionSlot::MergeStrings(merge_section) => merge_section.part_id.output_section_id(),
             _ => bail!(
                 "Internal error: Defined symbols should always be for a loaded or merge-strings section"

@@ -1,27 +1,243 @@
-// TODO
+// Mach-O argument parsing for the macOS linker driver interface.
 #![allow(unused_variables)]
-#![allow(unused)]
 
-use crate::args::ArgumentParser;
 use crate::args::CommonArgs;
-use crate::args::FILES_PER_GROUP_ENV;
+use crate::args::Input;
+use crate::args::InputSpec;
 use crate::args::Modifiers;
-use crate::args::REFERENCE_LINKER_ENV;
 use crate::args::RelocationModel;
-use crate::ensure;
+use crate::args::Strip;
+use crate::error::Context as _;
 use crate::error::Result;
 use crate::platform;
-use crate::save_dir::SaveDir;
-use jobserver::Client;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Hashbrown-backed symbol set using foldhash. Dylib symbol keys
+/// come from trusted on-disk TBD content; the std HashSet's SipHash
+/// only buys DoS resistance we don't need and was ~12 % of wild's
+/// bevy-dylib wall-clock (profiled via samply).
+///
+/// Entries are `Arc<[u8]>` (not `Vec<u8>`) so the in-process daemon's
+/// SDK/TBD memory cache can hand out refcount-bumped shares of
+/// already-parsed symbol bytes without per-entry allocation. The
+/// Borrow impl on `Arc<[u8]>` keeps `set.contains(&[u8])` working the
+/// same as before. On a bevy-class link this halves `pending
+/// frameworks` (the 17×TBD copy-merge loop) by removing the
+/// per-symbol Vec clone — that loop emerged as the dominant
+/// remaining cost after the v4 mem-cache hoist.
+pub(crate) type DylibSymbols = hashbrown::HashSet<std::sync::Arc<[u8]>, foldhash::fast::FixedState>;
+
+/// What kind of LC_LOAD_* command to emit for a dylib dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DylibLoadKind {
+    Normal,   // LC_LOAD_DYLIB
+    Weak,     // LC_LOAD_WEAK_DYLIB
+    Reexport, // LC_REEXPORT_DYLIB
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UndefinedTreatment {
+    #[default]
+    Error,
+    Warning,
+    Suppress,
+    DynamicLookup,
+}
+
+/// `-multiply_defined <treatment>` policy. ld64 historically supported this
+/// only for two-level-namespaced builds; modern ld64 ignores it but accepts
+/// the spelling. wild keeps it so existing build scripts don't break and
+/// adds a real effect: `Warning`/`Suppress` downgrade duplicate strong
+/// definitions from a hard error to a permissive accept (first definition
+/// wins, like `--allow-multiple-definition` on ELF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MultiplyDefinedTreatment {
+    #[default]
+    Error,
+    Warning,
+    Suppress,
+}
 
 #[derive(Debug)]
 pub struct MachOArgs {
     pub(crate) common: super::CommonArgs,
-
     pub(crate) output: Arc<Path>,
     pub(crate) relocation_model: RelocationModel,
+    pub(crate) lib_search_paths: Vec<Box<Path>>,
+    pub(crate) syslibroot: Option<Box<Path>>,
+    pub(crate) entry_symbol: Option<Vec<u8>>,
+    pub(crate) explicit_entry: bool,
+    pub(crate) strip: Strip,
+    pub(crate) strip_locals: bool,
+    pub(crate) is_dylib: bool,
+    pub(crate) is_relocatable: bool,
+    #[allow(dead_code)]
+    pub(crate) install_name: Option<Vec<u8>>,
+    /// Additional dylibs to emit load commands for (from -l flags resolving to .tbd/.dylib).
+    pub(crate) extra_dylibs: Vec<(Vec<u8>, DylibLoadKind)>,
+    /// Symbols to force as undefined (-u flag), triggering archive member loading.
+    pub(crate) force_undefined: Vec<String>,
+    /// Symbols exported by linked dylibs (from .tbd parsing). Used to distinguish
+    /// undefined symbols that are dylib imports from truly missing symbols.
+    ///
+    /// Backed by hashbrown + foldhash — the keys come from trusted
+    /// on-disk TBD content, so the std HashSet's SipHash is wasted
+    /// DoS-resistance and used to be ~12% of wild's bevy-dylib wall-clock.
+    pub(crate) dylib_symbols: DylibSymbols,
+    /// Subset of `dylib_symbols` whose defining dylib placed the
+    /// symbol in a Mach-O thread-local section (`S_THREAD_LOCAL_*`,
+    /// section types `0x11..=0x15`). Populated by scanning each
+    /// dylib's nlist symbol table during `handle_dylib_input` —
+    /// the export trie alone doesn't say whether an export is TLS,
+    /// so we read the `n_sect` of every external defined symbol
+    /// and consult its section header.
+    ///
+    /// Used by `apply_relocations` to diagnose TLS-vs-regular
+    /// mismatches across dylib boundaries: a TLVP reloc onto a
+    /// non-TLS dylib symbol, or a regular GOT/UNSIGNED reloc onto
+    /// a TLS dylib symbol. Both cases would silently link with the
+    /// wrong runtime semantics otherwise.
+    pub(crate) dylib_tls_symbols: hashbrown::HashSet<Vec<u8>, foldhash::fast::FixedState>,
+    /// Path of the `system/` TBD re-exports directory we've already
+    /// walked during `-lSystem` / `-lc` / `-lm` / `-lpthread`
+    /// handling. rustc typically passes all four in sequence and each
+    /// used to re-scan the directory + re-parse every `.tbd` (~20-30
+    /// ms wasted per duplicate pass). `None` until the first scan;
+    /// any subsequent `-l<lib>` that resolves to the same directory
+    /// short-circuits via path comparison.
+    pub(crate) system_tbd_dir_walked: Option<Box<Path>>,
+    /// `true` when the SDK symbol set for this link was hydrated from
+    /// the global SDK cache (`$XDG_CACHE_HOME/wild/sdk-<hex>.bin`)
+    /// rather than parsed from disk. Diagnostic-only — logged when
+    /// `WILD_PARSE_DEBUG=1`.
+    pub(crate) sdk_cache_used: bool,
+    /// Whether to skip ad-hoc code signing (-no_adhoc_codesign).
+    pub(crate) no_adhoc_codesign: bool,
+    /// LC_RPATH entries from -rpath flags.
+    pub(crate) rpaths: Vec<Vec<u8>>,
+    /// Whether to omit LC_FUNCTION_STARTS (-no_function_starts).
+    pub(crate) no_function_starts: bool,
+    /// Custom stack size from -stack_size.
+    pub(crate) stack_size: Option<u64>,
+    /// Whether to omit LC_DATA_IN_CODE (-no_data_in_code_info).
+    pub(crate) no_data_in_code: bool,
+    /// Minimum OS version for LC_BUILD_VERSION (encoded as Mach-O packed version).
+    pub(crate) minos: Option<u32>,
+    /// SDK version for LC_BUILD_VERSION (encoded as Mach-O packed version).
+    pub(crate) sdk_version: Option<u32>,
+    /// The name used for UUID hashing (from -final_output). Falls back to output path.
+    pub(crate) final_output: Option<String>,
+    /// Whether to omit LC_UUID.
+    pub(crate) no_uuid: bool,
+    /// Whether to emit a random UUID instead of deterministic.
+    pub(crate) random_uuid: bool,
+    /// Additional empty sections from -add_empty_section (segname, sectname).
+    pub(crate) empty_sections: Vec<([u8; 16], [u8; 16])>,
+    /// Whether -export_dynamic was passed.
+    pub(crate) export_dynamic: bool,
+    /// Whether -dead_strip was passed (GC unreachable sections).
+    pub(crate) gc_sections: bool,
+    /// Path to exported symbols list file (-exported_symbols_list).
+    pub(crate) exported_symbols_list: Option<PathBuf>,
+    /// Path to unexported symbols list file (-unexported_symbols_list).
+    pub(crate) unexported_symbols_list: Option<PathBuf>,
+    /// Inline exported symbols from -exported_symbol flags.
+    pub(crate) exported_symbols: Vec<String>,
+    /// Inline unexported symbols from -unexported_symbol flags.
+    pub(crate) unexported_symbols: Vec<String>,
+    /// Dylib compatibility version (packed u32 from -compatibility_version).
+    pub(crate) compatibility_version: u32,
+    /// Dylib current version (packed u32 from -current_version).
+    pub(crate) current_version: u32,
+    /// Whether this is a bundle (MH_BUNDLE) output.
+    pub(crate) is_bundle: bool,
+    /// Sections with embedded file content from -sectcreate (segname, sectname, data).
+    pub(crate) sectcreate: Vec<([u8; 16], [u8; 16], Vec<u8>)>,
+    /// Framework search paths from -F flags.
+    pub(crate) framework_search_paths: Vec<Box<Path>>,
+    /// Use extension-first search order (dylibs before static libs across all paths).
+    pub(crate) search_dylibs_first: bool,
+    /// Whether -pagezero_size was specified (only valid for executables).
+    has_pagezero_size: bool,
+    /// -Z: don't search default library paths.
+    no_default_search_paths: bool,
+    /// Whether to emit __init_offsets instead of __mod_init_func (-init_offsets or -fixup_chains).
+    pub(crate) use_init_offsets: bool,
+    /// Whether -dead_strip_dylibs was passed.
+    pub(crate) dead_strip_dylibs: bool,
+    /// Whether -mark_dead_strippable_dylib was passed (sets MH_DEAD_STRIPPABLE_DYLIB).
+    pub(crate) mark_dead_strippable: bool,
+    /// Maps symbol name → index in extra_dylibs (for dead-strip-dylibs tracking).
+    pub(crate) dylib_symbol_provenance: std::collections::HashMap<Vec<u8>, usize>,
+    /// Indices of extra_dylibs that should not be dead-stripped (from
+    /// -needed_framework/-needed-l).
+    pub(crate) needed_dylib_indices: std::collections::HashSet<usize>,
+    /// Indices of extra_dylibs marked MH_DEAD_STRIPPABLE_DYLIB (auto-strip if unused).
+    pub(crate) auto_strip_dylib_indices: std::collections::HashSet<usize>,
+    /// -oso_prefix: strip this prefix from OSO debug paths.
+    pub(crate) oso_prefix: Option<String>,
+    /// AST file paths from -add_ast_path (emitted as N_AST stab entries).
+    pub(crate) ast_paths: Vec<String>,
+    /// Map file path from -map.
+    pub(crate) map_file: Option<PathBuf>,
+    /// Whether -application_extension was passed.
+    pub(crate) application_extension: bool,
+    /// Dylib names that aren't marked extension-safe (for deferred warning).
+    non_extension_safe_dylibs: Vec<String>,
+    /// Whether -flat_namespace was passed (disables two-level namespace).
+    pub(crate) flat_namespace: bool,
+    /// Treatment for undefined symbols (-undefined flag).
+    pub(crate) undefined_treatment: UndefinedTreatment,
+    /// -w: suppress warnings.
+    suppress_warnings: bool,
+    /// Symbols from -U to emit as undefined in output symtab.
+    pub(crate) dynamic_undefined_symbols: Vec<Vec<u8>>,
+    /// Symbol ordering from -order_file (symbol name → priority).
+    pub(crate) symbol_order: std::collections::HashMap<String, u32>,
+    /// Whether --print-dependencies was passed.
+    pub(crate) print_dependencies: bool,
+    /// Umbrella framework name from -umbrella.
+    pub(crate) umbrella: Option<String>,
+    /// Path for -dependency_info output.
+    pub(crate) dependency_info_path: Option<PathBuf>,
+    /// Frameworks to resolve after all -F paths are collected. (name, is_needed)
+    pending_frameworks: Vec<(String, bool)>,
+    /// .tbd positional inputs to process after -platform_version is known.
+    pending_tbd_inputs: Vec<PathBuf>,
+    /// Path to libLTO.dylib from -lto_library.
+    pub(crate) lto_library: Option<PathBuf>,
+    /// Path to write LTO-compiled intermediate object (-object_path_lto).
+    pub(crate) object_path_lto: Option<PathBuf>,
+    /// Extra LLVM options from -mllvm.
+    pub(crate) mllvm_options: Vec<String>,
+    /// `-no_pie`: clear `MH_PIE` so the loader places `__TEXT` at a
+    /// fixed address. Almost always wrong on modern macOS (dyld will
+    /// log `code signature in (...) not valid for use in process: PIE
+    /// not enabled`), but ld64 accepts it for legacy linker scripts
+    /// and we mirror that.
+    pub(crate) no_pie: bool,
+    /// `-bind_at_load`: set `MH_BINDATLOAD` in the mach header so dyld
+    /// resolves all imports eagerly at process start instead of lazily.
+    /// Used by tooling that profiles startup or wants to fail fast on
+    /// missing symbols.
+    pub(crate) bind_at_load: bool,
+    /// `-no_compact_unwind`: skip emitting `__unwind_info`. Forces the
+    /// runtime to fall back to scanning `__eh_frame` for unwind data,
+    /// which is slower but smaller. Useful for size-constrained builds
+    /// or when debugging unwinder behaviour.
+    pub(crate) no_compact_unwind: bool,
+    /// `-headerpad <hex>` / `-headerpad_max_install_names`: override the
+    /// trailing slack we leave after the load commands so
+    /// `install_name_tool` can rewrite paths post-link without shifting
+    /// `__text`. `None` means the wild default (32 B).
+    pub(crate) headerpad: Option<u64>,
+    /// `-multiply_defined error|warning|suppress`: how to react when
+    /// two strong definitions for the same symbol turn up. ld64 accepts
+    /// the flag but ignores it on two-level-namespaced builds; wild
+    /// honours all three.
+    pub(crate) multiply_defined: MultiplyDefinedTreatment,
 }
 
 impl MachOArgs {
@@ -31,16 +247,90 @@ impl MachOArgs {
             ..Default::default()
         })
     }
+
+    /// Add a dylib dependency if not already present (by install name).
+    fn add_dylib(&mut self, name: Vec<u8>, kind: DylibLoadKind) {
+        if !self.extra_dylibs.iter().any(|(n, _)| n == &name) {
+            self.extra_dylibs.push((name, kind));
+        }
+    }
 }
 
 impl Default for MachOArgs {
     fn default() -> Self {
         Self {
             common: CommonArgs::default(),
-
-            // TODO: move to CommonArgs
             relocation_model: RelocationModel::NonRelocatable,
             output: Arc::from(Path::new("a.out")),
+            lib_search_paths: Vec::new(),
+            syslibroot: None,
+            entry_symbol: Some(b"_main".to_vec()),
+            explicit_entry: false,
+            strip: Strip::Nothing,
+            strip_locals: false,
+            is_dylib: false,
+            is_relocatable: false,
+            install_name: None,
+            extra_dylibs: Vec::new(),
+            force_undefined: Vec::new(),
+            dylib_symbols: Default::default(),
+            dylib_tls_symbols: Default::default(),
+            system_tbd_dir_walked: None,
+            sdk_cache_used: false,
+            no_adhoc_codesign: false,
+            rpaths: Vec::new(),
+            no_function_starts: false,
+            stack_size: None,
+            no_data_in_code: false,
+            minos: None,
+            sdk_version: None,
+            final_output: None,
+            no_uuid: false,
+            random_uuid: false,
+            empty_sections: Vec::new(),
+            export_dynamic: false,
+            gc_sections: false,
+            exported_symbols_list: None,
+            unexported_symbols_list: None,
+            exported_symbols: Vec::new(),
+            unexported_symbols: Vec::new(),
+            compatibility_version: 0x01_0000, // 1.0.0
+            current_version: 0x01_0000,       // 1.0.0
+            is_bundle: false,
+            sectcreate: Vec::new(),
+            framework_search_paths: Vec::new(),
+            search_dylibs_first: false,
+            has_pagezero_size: false,
+            no_default_search_paths: false,
+            use_init_offsets: false,
+            dead_strip_dylibs: false,
+            mark_dead_strippable: false,
+            dylib_symbol_provenance: Default::default(),
+            needed_dylib_indices: Default::default(),
+            auto_strip_dylib_indices: Default::default(),
+            oso_prefix: None,
+            ast_paths: Vec::new(),
+            map_file: None,
+            application_extension: false,
+            non_extension_safe_dylibs: Vec::new(),
+            flat_namespace: false,
+            undefined_treatment: UndefinedTreatment::Error,
+            suppress_warnings: false,
+            dynamic_undefined_symbols: Vec::new(),
+            symbol_order: Default::default(),
+            print_dependencies: false,
+            umbrella: None,
+            dependency_info_path: None,
+            pending_frameworks: Vec::new(),
+            pending_tbd_inputs: Vec::new(),
+            lto_library: None,
+            object_path_lto: None,
+            mllvm_options: Vec::new(),
+            no_pie: false,
+            bind_at_load: false,
+            no_compact_unwind: false,
+            headerpad: None,
+            multiply_defined: MultiplyDefinedTreatment::Error,
         }
     }
 }
@@ -55,48 +345,99 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_strip_debug(&self) -> bool {
-        todo!()
+        !self.is_relocatable && matches!(self.strip, Strip::All | Strip::Debug)
     }
-
     fn should_strip_all(&self) -> bool {
-        false
+        !self.is_relocatable && matches!(self.strip, Strip::All)
     }
 
     fn entry_symbol_name<'a>(&'a self, linker_script_entry: Option<&'a [u8]>) -> &'a [u8] {
-        // TODO: probably add option
-        b"_main"
+        linker_script_entry
+            .or(self.entry_symbol.as_deref())
+            .unwrap_or(b"_main")
+    }
+
+    fn has_explicit_entry(&self) -> bool {
+        self.explicit_entry
     }
 
     fn lib_search_path(&self) -> &[Box<std::path::Path>] {
-        todo!()
+        &self.lib_search_paths
     }
 
     fn output(&self) -> &std::sync::Arc<std::path::Path> {
         &self.output
     }
-
     fn common(&self) -> &crate::args::CommonArgs {
         &self.common
     }
-
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs {
         &mut self.common
     }
-
     fn should_export_all_dynamic_symbols(&self) -> bool {
-        todo!()
+        self.export_dynamic
+    }
+    fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
+        false
     }
 
-    fn should_export_dynamic(&self, lib_name: &[u8]) -> bool {
-        todo!()
+    fn should_gc_sections(&self) -> bool {
+        self.gc_sections
+    }
+
+    fn export_list_path(&self) -> Option<&Path> {
+        self.exported_symbols_list.as_deref()
+    }
+
+    fn unexport_list_path(&self) -> Option<&Path> {
+        self.unexported_symbols_list.as_deref()
+    }
+
+    fn should_allow_object_undefined(&self, _output_kind: crate::OutputKind) -> bool {
+        self.undefined_treatment != UndefinedTreatment::Error || self.flat_namespace
+    }
+
+    fn lto_library_path(&self) -> Option<&Path> {
+        self.lto_library.as_deref()
+    }
+
+    fn object_path_lto(&self) -> Option<&Path> {
+        self.object_path_lto.as_deref()
+    }
+
+    fn dylib_symbols(&self) -> &DylibSymbols {
+        &self.dylib_symbols
+    }
+
+    fn allow_multiple_definitions(&self) -> bool {
+        // `Warning` and `Suppress` both mean "don't bail on the second
+        // strong def". The user-visible difference (a stderr warning
+        // for `Warning`) would need a separate hook in `symbol_db`;
+        // for now both downgrade to silent first-wins.
+        !matches!(self.multiply_defined, MultiplyDefinedTreatment::Error)
+    }
+
+    fn force_undefined_symbol_names(&self) -> &[String] {
+        &self.force_undefined
+    }
+
+    fn force_export_symbol_names(&self) -> &[String] {
+        &self.exported_symbols
+    }
+
+    fn force_unexport_symbol_names(&self) -> &[String] {
+        &self.unexported_symbols
+    }
+
+    fn symbol_order(&self) -> &std::collections::HashMap<String, u32> {
+        &self.symbol_order
     }
 
     fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
-        todo!()
+        crate::alignment::Alignment { exponent: 14 } // 16KB pages
     }
 
     fn should_merge_sections(&self) -> bool {
-        // TODO
         true
     }
 
@@ -105,51 +446,2331 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_output_executable(&self) -> bool {
-        // TODO
-        true
+        !self.is_dylib && !self.is_bundle && !self.is_relocatable
+    }
+
+    fn should_output_partial_object(&self) -> bool {
+        self.is_relocatable
     }
 }
 
-// Parse the supplied input arguments, which should not include the program name.
+/// Parse macOS linker arguments. Handles the ld64-compatible flags that clang passes.
 pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     args: &mut MachOArgs,
-    mut input: I,
+    input: I,
 ) -> Result {
+    let debug = std::env::var_os("WILD_PARSE_DEBUG").is_some();
+    let t0 = std::time::Instant::now();
+    let stage = |label: &str, t: std::time::Instant| -> std::time::Instant {
+        if debug {
+            eprintln!(
+                "wild args.parse: {:>5.1} ms {}",
+                t.elapsed().as_secs_f64() * 1000.0,
+                label
+            );
+        }
+        std::time::Instant::now()
+    };
+    // Collect args so we can pre-scan for global flags that affect input processing.
+    let all_args: Vec<String> = input.map(|a| a.as_ref().to_string()).collect();
+    let t = stage("collect argv", t0);
+
+    // Pre-scan for flags that must be effective before any input is processed.
+    let mut has_syslibroot = false;
+    let mut has_no_default_search = false;
+    for a in &all_args {
+        match a.as_str() {
+            "-search_dylibs_first" => args.search_dylibs_first = true,
+            "-init_offsets" => args.use_init_offsets = true,
+            "-fixup_chains" => args.use_init_offsets = true,
+            "-no_fixup_chains" => {} /* keep use_init_offsets as-is unless -init_offsets was */
+            "-syslibroot" => has_syslibroot = true,
+            "-Z" => has_no_default_search = true,
+            _ => {}
+        }
+    }
+
+    // If no -syslibroot was passed, discover the SDK via `xcrun` so the
+    // in-place `-l<lib>` handling below finds `lib*.tbd` stubs in
+    // `<SDK>/usr/lib`. Without this, `-lc++` (passed by rustc for build
+    // scripts that link C++ via `wasm-opt`, `cxx`, `link-cplusplus`)
+    // resolves to nothing, wild silently defaults the C++ imports to
+    // libSystem, and dyld SIGABRT's at load with
+    // `__ZTVN10__cxxabiv117__class_type_infoE not found`.
+    //
+    // `cc -fuse-ld=<wild>` doesn't hit this because `cc` already
+    // cooks in a `-syslibroot` argument; the gap is the rustc path
+    // which passes `-lc++` with no syslibroot.
+    let t = stage("pre-scan args", t);
+    if !has_syslibroot
+        && !has_no_default_search
+        && let Some(sdk) = discover_sdk_path()
+    {
+        args.syslibroot = Some(sdk);
+    }
+    let t = stage("discover_sdk_path", t);
+
+    // Expand `-Wl,foo,bar,baz` into `foo`, `bar`, `baz` before the
+    // main parse loop. When rustc invokes wild via
+    // `clang -fuse-ld=<wild>`, clang passes `-Wl,-dead_strip`
+    // through to the linker verbatim — the `-Wl,` prefix is only
+    // stripped when clang drives its own bundled `ld`. Wild sees
+    // the literal `-Wl,-dead_strip` and (without this expansion)
+    // silently ignores it, which leaves `gc_sections=false` and
+    // forces every section into MustLoad via the `no_gc` branch.
+    // That was the source of wild's 3× live-code bloat on
+    // rust-linked binaries before this expansion landed.
+    let mut expanded: Vec<String> = Vec::with_capacity(all_args.len());
+    for a in &all_args {
+        if let Some(rest) = a.strip_prefix("-Wl,") {
+            for piece in rest.split(',') {
+                if !piece.is_empty() {
+                    expanded.push(piece.to_string());
+                }
+            }
+        } else {
+            expanded.push(a.clone());
+        }
+    }
+
+    let mut arg_iter = expanded.iter().map(|s| s.as_str());
     let mut modifier_stack = vec![Modifiers::default()];
 
-    let arg_parser = setup_argument_parser();
-    while let Some(arg) = input.next() {
-        let arg = arg.as_ref();
+    // Per-arg timing summary: (prefix, cumulative-ms, count)
+    let mut bucket: std::collections::BTreeMap<&'static str, (f64, u32)> = Default::default();
+    while let Some(arg) = arg_iter.next() {
+        // Handle @response files
+        if let Some(path) = arg.strip_prefix('@') {
+            let file_args = crate::args::read_args_from_file(Path::new(path))?;
+            // Re-parse the file contents (simplified - no recursion limit)
+            let mut file_iter = file_args.iter().map(|s| s.as_str());
+            while let Some(file_arg) = file_iter.next() {
+                parse_one_arg(args, file_arg, &mut file_iter, &mut modifier_stack)?;
+            }
+            continue;
+        }
 
-        arg_parser.handle_argument(args, &mut modifier_stack, arg, &mut input)?;
+        // Instant::now() has real cost (clock_gettime syscall on some
+        // platforms) so skip it entirely on the default path — the
+        // per-arg loop runs hundreds of times.
+        let a_t = debug.then(std::time::Instant::now);
+        parse_one_arg(args, arg, &mut arg_iter, &mut modifier_stack)?;
+        if let Some(a_t) = a_t {
+            let elapsed = a_t.elapsed().as_secs_f64() * 1000.0;
+            let bucket_key: &'static str = if arg.starts_with("-l") {
+                "-l<lib>"
+            } else if arg.starts_with("-L") {
+                "-L<path>"
+            } else if arg.starts_with("-F") {
+                "-F<path>"
+            } else if arg.starts_with("-framework") {
+                "-framework"
+            } else if arg.to_ascii_lowercase().ends_with(".rlib") {
+                "*.rlib"
+            } else if arg.to_ascii_lowercase().ends_with(".o") {
+                "*.o"
+            } else if arg.to_ascii_lowercase().ends_with(".tbd") {
+                "*.tbd"
+            } else if arg.to_ascii_lowercase().ends_with(".dylib") {
+                "*.dylib"
+            } else if arg.starts_with("-") {
+                "<flag>"
+            } else {
+                "<other>"
+            };
+            let e = bucket.entry(bucket_key).or_insert((0.0, 0));
+            e.0 += elapsed;
+            e.1 += 1;
+        }
+    }
+    if debug {
+        for (k, (ms, n)) in &bucket {
+            eprintln!("wild args.parse:   {ms:>5.1} ms  {n:>4} × {k}");
+        }
+    }
+    let t = stage("main parse loop", t);
+
+    // Resolve deferred .tbd inputs now that -platform_version is known.
+    let pending_tbds = std::mem::take(&mut args.pending_tbd_inputs);
+    for path in &pending_tbds {
+        handle_tbd_input(args, path);
+    }
+    let t = stage("pending tbd inputs", t);
+
+    // Add default framework search paths unless -Z suppresses them.
+    // ld64 searches /Library/Frameworks and /System/Library/Frameworks
+    // by default. On modern macOS, the actual framework binaries are in
+    // the dyld shared cache and the on-disk paths are broken symlinks;
+    // only the SDK .tbd stubs work. We try syslibroot first, then
+    // discover the SDK via `xcrun --show-sdk-path`, then fall back to
+    // the bare system paths.
+    // SDK was pre-discovered at the top of this function (before
+    // any `-l<lib>` was processed). Re-use that value for framework
+    // path fallbacks below; no second `xcrun` invocation needed.
+    let discovered_sdk: Option<Box<Path>> = args.syslibroot.clone();
+
+    if !args.no_default_search_paths && !args.pending_frameworks.is_empty() {
+        let sdk_root = args.syslibroot.clone().or(discovered_sdk.clone());
+        let mut add_fw_path = |p: &Path| {
+            if p.is_dir() && !args.framework_search_paths.iter().any(|e| **e == *p) {
+                args.framework_search_paths.push(Box::from(p));
+            }
+        };
+        if let Some(ref root) = sdk_root {
+            add_fw_path(&root.join("System/Library/Frameworks"));
+            add_fw_path(&root.join("Library/Frameworks"));
+        }
+        add_fw_path(Path::new("/System/Library/Frameworks"));
+        add_fw_path(Path::new("/Library/Frameworks"));
+
+        // When we discovered the SDK to resolve frameworks, also collect
+        // system library symbols so the undefined-symbol check has a
+        // complete picture. Without this, framework symbols populate
+        // dylib_symbols but system lib symbols don't, causing false
+        // "undefined symbol" errors.
+        if let Some(ref sdk) = sdk_root
+            && (args.dylib_symbols.is_empty() || args.syslibroot.is_none())
+        {
+            let usr_lib = sdk.join("usr/lib");
+            if usr_lib.is_dir() {
+                let system_tbd = usr_lib.join("libSystem.tbd");
+                if system_tbd.exists() {
+                    // SDK-cache fast path: profile showed this walk
+                    // (libSystem.tbd + ~100 usr/lib/system/*.tbd YAML
+                    // parses) was 40% of total link time on bevy
+                    // because it bypassed the cache that the
+                    // `-lSystem` path already uses. Reuse the same
+                    // cache here — keyed on sysroot, validated against
+                    // libSystem.tbd's (size, mtime), populated on cache
+                    // miss after the full walk. Saves ~400 ms on a
+                    // bevy-class link.
+                    if let Some(cached) = crate::sdk_cache::load_sdk_symbols(sdk) {
+                        args.dylib_symbols.extend(cached);
+                        args.system_tbd_dir_walked =
+                            Some(Box::from(usr_lib.join("system").as_path()));
+                        args.sdk_cache_used = true;
+                    } else {
+                        collect_tbd_symbols(&system_tbd, &mut args.dylib_symbols);
+                        let system_dir = usr_lib.join("system");
+                        if system_dir.is_dir()
+                            && let Ok(entries) = std::fs::read_dir(&system_dir)
+                        {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e == "tbd") {
+                                    collect_tbd_symbols(&p, &mut args.dylib_symbols);
+                                }
+                            }
+                        }
+                        args.system_tbd_dir_walked = Some(Box::from(system_dir.as_path()));
+                        crate::sdk_cache::save_sdk_symbols(sdk, &args.dylib_symbols);
+                    }
+                }
+            }
+        }
+    }
+
+    let t = stage("framework tbd collection", t);
+
+    // Resolve deferred framework links now that all -F paths are collected.
+    let pending = std::mem::take(&mut args.pending_frameworks);
+    for (name, needed) in &pending {
+        let dylib_count_before = args.extra_dylibs.len();
+        link_framework(args, name)?;
+        // Mark as needed (immune to -dead_strip_dylibs).
+        if *needed && args.extra_dylibs.len() > dylib_count_before {
+            args.needed_dylib_indices
+                .insert(args.extra_dylibs.len() - 1);
+        }
+    }
+
+    let t = stage("pending frameworks", t);
+    let _ = t; // final marker
+
+    // Warn about non-extension-safe dylibs.
+    if args.application_extension && !args.suppress_warnings {
+        for name in &args.non_extension_safe_dylibs {
+            eprintln!(
+                "wild: warning: linking against dylib not safe for use in application extensions: {name}"
+            );
+        }
+    }
+
+    // Validate flag combinations.
+    if args.has_pagezero_size && (args.is_dylib || args.is_bundle) {
+        crate::bail!(" -pagezero_size option can only be used when linking a main executable");
     }
 
     Ok(())
 }
 
-fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
-    let mut parser = ArgumentParser::<MachOArgs>::new();
+fn parse_one_arg<S: AsRef<str>, I: Iterator<Item = S>>(
+    args: &mut MachOArgs,
+    arg: &str,
+    input: &mut I,
+    modifier_stack: &mut [Modifiers],
+) -> Result {
+    // Flags that take a following argument (must be checked before prefix matching)
+    match arg {
+        "-help" | "--help" => {
+            println!("Usage: wild [options] file...");
+            println!("  Wild — a fast linker");
+            std::process::exit(0);
+        }
+        "-o" | "--output" => {
+            if let Some(val) = input.next() {
+                args.output = Arc::from(Path::new(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "--print-dependencies" | "--print_dependencies" => {
+            args.print_dependencies = true;
+            return Ok(());
+        }
+        "--time" => {
+            args.common.time_phase_options = Some(Vec::new());
+            return Ok(());
+        }
+        "-arch" => {
+            input.next();
+            return Ok(());
+        } // consume and ignore
+        "-syslibroot" => {
+            if let Some(val) = input.next() {
+                args.syslibroot = Some(Box::from(Path::new(val.as_ref())));
+            }
+            return Ok(());
+        }
+        "-e" => {
+            if let Some(val) = input.next() {
+                args.entry_symbol = Some(val.as_ref().as_bytes().to_vec());
+                args.explicit_entry = true;
+            }
+            return Ok(());
+        }
+        "-u" => {
+            if let Some(val) = input.next() {
+                args.force_undefined.push(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        // Flags that take 1 argument, ignored
+        "-install_name" => {
+            if let Some(val) = input.next() {
+                args.install_name = Some(val.as_ref().as_bytes().to_vec());
+            }
+            return Ok(());
+        }
+        "-rpath" => {
+            if let Some(val) = input.next() {
+                args.rpaths.push(val.as_ref().as_bytes().to_vec());
+            }
+            return Ok(());
+        }
+        "--incremental-cache" => {
+            // Mach-O ld-style: separate value. `--incremental-cache=…`
+            // (joined form) is handled by the generic `--key=value`
+            // splitter higher up.
+            if let Some(val) = input.next() {
+                args.common.incremental_cache = super::IncrementalCacheMode::parse(val.as_ref())?;
+            }
+            return Ok(());
+        }
+        "-exported_symbols_list" => {
+            if let Some(val) = input.next() {
+                // Copy the list into the save-dir so WILD_SAVE_BASE
+                // replays don't bail on a stale rustc temp-file path
+                // like `/var/folders/.../rustcXXXX/list`.
+                args.common.save_dir.handle_file(val.as_ref());
+                args.exported_symbols_list = Some(PathBuf::from(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "-exported_symbol" => {
+            if let Some(val) = input.next() {
+                args.exported_symbols.push(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-unexported_symbol" => {
+            if let Some(val) = input.next() {
+                args.unexported_symbols.push(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-unexported_symbols_list" => {
+            if let Some(val) = input.next() {
+                args.common.save_dir.handle_file(val.as_ref());
+                args.unexported_symbols_list = Some(PathBuf::from(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "-compatibility_version" => {
+            if let Some(val) = input.next() {
+                args.compatibility_version = parse_macho_version(val.as_ref());
+            }
+            return Ok(());
+        }
+        "-current_version" => {
+            if let Some(val) = input.next() {
+                args.current_version = parse_macho_version(val.as_ref());
+            }
+            return Ok(());
+        }
+        "-pagezero_size" => {
+            if let Some(_val) = input.next() {
+                args.has_pagezero_size = true;
+            }
+            return Ok(());
+        }
+        "-reexport_library" => {
+            if let Some(val) = input.next() {
+                let path = Path::new(val.as_ref());
+                if path.extension().is_some_and(|e| e == "tbd") {
+                    handle_tbd_input(args, path);
+                    // Override kind to Reexport
+                    if let Some(last) = args.extra_dylibs.last_mut() {
+                        last.1 = DylibLoadKind::Reexport;
+                    }
+                } else {
+                    handle_dylib_input(args, path)?;
+                    if let Some(last) = args.extra_dylibs.last_mut() {
+                        last.1 = DylibLoadKind::Reexport;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        "-weak_library" => {
+            if let Some(val) = input.next() {
+                let path = Path::new(val.as_ref());
+                if path.extension().is_some_and(|e| e == "tbd") {
+                    handle_tbd_input(args, path);
+                } else {
+                    handle_dylib_input(args, path)?;
+                }
+                if let Some(last) = args.extra_dylibs.last_mut() {
+                    last.1 = DylibLoadKind::Weak;
+                }
+            }
+            return Ok(());
+        }
+        "-framework" | "-weak_framework" | "-needed_framework" => {
+            if let Some(name) = input.next() {
+                let needed = arg == "-needed_framework";
+                args.pending_frameworks
+                    .push((name.as_ref().to_string(), needed));
+            }
+            return Ok(());
+        }
+        "-oso_prefix" => {
+            if let Some(val) = input.next() {
+                args.oso_prefix = Some(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-add_ast_path" => {
+            if let Some(val) = input.next() {
+                args.ast_paths.push(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-map" => {
+            if let Some(val) = input.next() {
+                args.map_file = Some(PathBuf::from(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "-dependency_info" => {
+            if let Some(val) = input.next() {
+                args.dependency_info_path = Some(PathBuf::from(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "-lto_library" => {
+            if let Some(val) = input.next() {
+                args.lto_library = Some(PathBuf::from(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "-object_path_lto" => {
+            if let Some(val) = input.next() {
+                args.object_path_lto = Some(PathBuf::from(val.as_ref()));
+            }
+            return Ok(());
+        }
+        "-mllvm" => {
+            if let Some(val) = input.next() {
+                args.mllvm_options.push(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-umbrella" => {
+            if let Some(val) = input.next() {
+                args.umbrella = Some(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-order_file" => {
+            if let Some(val) = input.next() {
+                args.common.save_dir.handle_file(val.as_ref());
+                let path = PathBuf::from(val.as_ref());
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    for (i, line) in content.lines().enumerate() {
+                        let sym = line.trim();
+                        if !sym.is_empty() && !sym.starts_with('#') {
+                            args.symbol_order.insert(sym.to_string(), i as u32);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        "-headerpad" => {
+            // ld64 takes a hex byte count, e.g. `-headerpad 0x100`. We
+            // accept bare-hex too — strip the optional `0x` prefix and
+            // parse base-16. Parse failure is silent (matches ld64) and
+            // leaves the default in place; no point bailing the whole
+            // link over a typo'd headerpad.
+            if let Some(val) = input.next() {
+                let s = val.as_ref();
+                let s = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .unwrap_or(s);
+                if let Ok(n) = u64::from_str_radix(s, 16) {
+                    args.headerpad = Some(n);
+                }
+            }
+            return Ok(());
+        }
+        "-allowable_client" | "-client_name" | "-sub_library" | "-sub_umbrella"
+        | "-objc_abi_version" | "-image_base" => {
+            input.next(); // consume the argument
+            return Ok(());
+        }
+        // -sectcreate takes 3 arguments: segname sectname file
+        "-sectcreate" => {
+            if let (Some(seg), Some(sect), Some(file)) = (input.next(), input.next(), input.next())
+            {
+                let mut segname = [0u8; 16];
+                let mut sectname = [0u8; 16];
+                let seg_bytes = seg.as_ref().as_bytes();
+                let sect_bytes = sect.as_ref().as_bytes();
+                segname[..seg_bytes.len().min(16)]
+                    .copy_from_slice(&seg_bytes[..seg_bytes.len().min(16)]);
+                sectname[..sect_bytes.len().min(16)]
+                    .copy_from_slice(&sect_bytes[..sect_bytes.len().min(16)]);
+                let data = std::fs::read(file.as_ref()).with_context(|| {
+                    format!("Failed to read -sectcreate file `{}`", file.as_ref())
+                })?;
+                args.sectcreate.push((segname, sectname, data));
+            }
+            return Ok(());
+        }
+        // -add_empty_section takes 2 arguments: segname sectname
+        "-add_empty_section" => {
+            if let (Some(seg), Some(sect)) = (input.next(), input.next()) {
+                let mut segname = [0u8; 16];
+                let mut sectname = [0u8; 16];
+                let seg_bytes = seg.as_ref().as_bytes();
+                let sect_bytes = sect.as_ref().as_bytes();
+                segname[..seg_bytes.len().min(16)]
+                    .copy_from_slice(&seg_bytes[..seg_bytes.len().min(16)]);
+                sectname[..sect_bytes.len().min(16)]
+                    .copy_from_slice(&sect_bytes[..sect_bytes.len().min(16)]);
+                args.empty_sections.push((segname, sectname));
+            }
+            return Ok(());
+        }
+        // -platform_version takes 3 arguments: platform min_version sdk_version
+        "-platform_version" => {
+            input.next(); // platform (ignored, always macos)
+            if let Some(v) = input.next() {
+                args.minos = Some(parse_macho_version(v.as_ref()));
+            }
+            if let Some(v) = input.next() {
+                args.sdk_version = Some(parse_macho_version(v.as_ref()));
+            }
+            return Ok(());
+        }
+        "-macos_version_min" => {
+            if let Some(v) = input.next() {
+                args.minos = Some(parse_macho_version(v.as_ref()));
+            }
+            return Ok(());
+        }
+        "-force_load" => {
+            if let Some(val) = input.next() {
+                let path = Path::new(val.as_ref());
+                let mut mods = *modifier_stack.last().unwrap();
+                mods.whole_archive = true;
+                args.common.inputs.push(Input {
+                    spec: InputSpec::File(Box::from(path)),
+                    search_first: None,
+                    modifiers: mods,
+                });
+            }
+            return Ok(());
+        }
+        // Flags that take 1 argument, ignored (group 2)
+        "-undefined" => {
+            if let Some(val) = input.next() {
+                args.undefined_treatment = match val.as_ref() {
+                    "error" => UndefinedTreatment::Error,
+                    "warning" => UndefinedTreatment::Warning,
+                    "suppress" => UndefinedTreatment::Suppress,
+                    "dynamic_lookup" => UndefinedTreatment::DynamicLookup,
+                    _ => UndefinedTreatment::Error,
+                };
+            }
+            return Ok(());
+        }
+        "-multiply_defined" => {
+            if let Some(val) = input.next() {
+                args.multiply_defined = match val.as_ref() {
+                    "warning" => MultiplyDefinedTreatment::Warning,
+                    "suppress" => MultiplyDefinedTreatment::Suppress,
+                    // "error" and unknown spellings → keep the default.
+                    _ => MultiplyDefinedTreatment::Error,
+                };
+            }
+            return Ok(());
+        }
+        "-upward-l" | "-alignment" => {
+            input.next();
+            return Ok(());
+        }
+        "-S" => {
+            args.strip = Strip::Debug;
+            return Ok(());
+        }
+        "-demangle" => {
+            args.common.demangle = true;
+            return Ok(());
+        }
+        "--no-fork" => {
+            args.common.should_fork = false;
+            return Ok(());
+        }
+        "-export_dynamic" => {
+            args.export_dynamic = true;
+            return Ok(());
+        }
+        "-flat_namespace" => {
+            args.flat_namespace = true;
+            return Ok(());
+        }
+        "-dead_strip" => {
+            args.gc_sections = true;
+            return Ok(());
+        }
+        "-dead_strip_dylibs" => {
+            args.dead_strip_dylibs = true;
+            return Ok(());
+        }
+        "-mark_dead_strippable_dylib" => {
+            args.mark_dead_strippable = true;
+            return Ok(());
+        }
+        "-application_extension" => {
+            args.application_extension = true;
+            return Ok(());
+        }
+        "-w" => {
+            args.suppress_warnings = true;
+            return Ok(());
+        }
+        "-search_dylibs_first" => {
+            args.search_dylibs_first = true;
+            return Ok(());
+        }
+        "-Z" => {
+            args.no_default_search_paths = true;
+            return Ok(());
+        }
+        // Historically a toggle for bit-for-bit compat with ld64. Now
+        // accepted as a no-op — wild's Mach-O output is always in the
+        // ld64-matching shape. Left accepted so existing scripts and
+        // build systems don't break on the flag.
+        "-ld64_compat" | "--ld64-compat" => {
+            return Ok(());
+        }
+        "-v" => {
+            args.common.version_mode = crate::args::VersionMode::Verbose;
+            return Ok(());
+        }
+        "-no_pie" => {
+            args.no_pie = true;
+            return Ok(());
+        }
+        "-pie" => {
+            // ld64 also accepts the affirmative form. We always emit
+            // PIE by default; this just unwinds a prior `-no_pie`.
+            args.no_pie = false;
+            return Ok(());
+        }
+        "-bind_at_load" => {
+            args.bind_at_load = true;
+            return Ok(());
+        }
+        "-no_compact_unwind" => {
+            args.no_compact_unwind = true;
+            return Ok(());
+        }
+        "-headerpad_max_install_names" => {
+            // ld64 reserves enough room for every dylib path entry to
+            // be expanded to MAXPATHLEN (1024). 0x1000 is the value
+            // ld64 actually picks and matches what `install_name_tool`
+            // assumes is available.
+            args.headerpad = Some(0x1000);
+            return Ok(());
+        }
+        // No-argument flags, ignored
+        "-dynamic"
+        | "-no_deduplicate"
+        | "-no_objc_category_merging"
+        | "-ObjC"
+        | "-no_implicit_dylibs"
+        | "-search_paths_first"
+        | "-two_levelnamespace"
+        | "-execute"
+        | "-no_fixup_chains"
+        | "-fixup_chains"
+        | "-init_offsets"
+        | "-adhoc_codesign"
+        | "-data_in_code_info"
+        | "-function_starts"
+        | "-subsections_via_symbols"
+        | "-reproducible" => {
+            return Ok(());
+        }
+        "-all_load" => {
+            modifier_stack.last_mut().unwrap().whole_archive = true;
+            return Ok(());
+        }
+        "-noall_load" => {
+            modifier_stack.last_mut().unwrap().whole_archive = false;
+            return Ok(());
+        }
+        "-dylib" | "-dynamiclib" => {
+            args.is_dylib = true;
+            args.entry_symbol = None; // dylibs have no entry point
+            return Ok(());
+        }
+        "-bundle" => {
+            args.is_bundle = true;
+            args.entry_symbol = None; // bundles have no entry point
+            return Ok(());
+        }
+        "-x" => {
+            args.strip_locals = true;
+            return Ok(());
+        }
+        "-no_adhoc_codesign" => {
+            args.no_adhoc_codesign = true;
+            return Ok(());
+        }
+        "-no_function_starts" => {
+            args.no_function_starts = true;
+            return Ok(());
+        }
+        "-final_output" => {
+            if let Some(val) = input.next() {
+                args.final_output = Some(val.as_ref().to_string());
+            }
+            return Ok(());
+        }
+        "-no_uuid" => {
+            args.no_uuid = true;
+            return Ok(());
+        }
+        "-random_uuid" => {
+            args.random_uuid = true;
+            return Ok(());
+        }
+        "-no_data_in_code_info" => {
+            args.no_data_in_code = true;
+            return Ok(());
+        }
+        "-stack_size" => {
+            if let Some(val) = input.next() {
+                let val = val.as_ref();
+                args.stack_size = Some(
+                    u64::from_str_radix(val.strip_prefix("0x").unwrap_or(val), 16).unwrap_or(0),
+                );
+            }
+            return Ok(());
+        }
+        "-r" => {
+            args.is_relocatable = true;
+            args.entry_symbol = None;
+            return Ok(());
+        }
+        "--validate-output" => {
+            args.common.validate_output = true;
+            return Ok(());
+        }
+        "-filelist" => {
+            if let Some(val) = input.next() {
+                let val = val.as_ref();
+                // -filelist <path>[,<directory>]
+                let (file_path, prefix) = if let Some(comma) = val.find(',') {
+                    (&val[..comma], Some(&val[comma + 1..]))
+                } else {
+                    (val, None)
+                };
+                args.common.save_dir.handle_file(file_path);
+                let content = std::fs::read_to_string(file_path)
+                    .with_context(|| format!("Failed to read filelist `{file_path}`"))?;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let path = if let Some(dir) = prefix {
+                        Path::new(dir).join(line)
+                    } else {
+                        PathBuf::from(line)
+                    };
+                    args.common.inputs.push(Input {
+                        spec: InputSpec::File(Box::from(path.as_path())),
+                        search_first: None,
+                        modifiers: *modifier_stack.last().unwrap(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
 
-    parser
-        .declare_with_param()
-        .long("output")
-        .short("o")
-        .help("Set the output filename")
-        .execute(|args, _modifier_stack, value| {
-            args.output = Arc::from(Path::new(value));
-            Ok(())
-        });
-    parser
-        .declare_with_optional_param()
-        .long("time")
-        .help("Show timing information")
-        .execute(|args, _modifier_stack, value| {
-            args.common.time_phase_options = match value {
-                Some(v) => Some(super::parse_time_phase_options(v)?),
-                None => Some(Vec::new()),
-            };
-            Ok(())
-        });
+    // Handle --time=<value> form
+    if let Some(val) = arg.strip_prefix("--time=") {
+        args.common.time_phase_options = Some(super::parse_time_phase_options(val)?);
+        return Ok(());
+    }
 
-    parser
+    // Handle --incremental-cache=<mode> joined form. The separate
+    // `--incremental-cache MODE` form is handled in `parse_one_arg`'s
+    // string-match table above.
+    if let Some(val) = arg.strip_prefix("--incremental-cache=") {
+        args.common.incremental_cache = super::IncrementalCacheMode::parse(val)?;
+        return Ok(());
+    }
+
+    // --emit-patch=<path>: write byte-diff between prev and new outputs
+    // for AOT edit-and-continue patchers to consume.
+    if let Some(val) = arg.strip_prefix("--emit-patch=") {
+        args.common.emit_patch = Some(std::path::PathBuf::from(val));
+        return Ok(());
+    }
+
+    // -L<path> (library search path)
+    if let Some(path) = arg.strip_prefix("-L") {
+        if path.is_empty() {
+            if let Some(val) = input.next() {
+                args.lib_search_paths
+                    .push(Box::from(Path::new(val.as_ref())));
+            }
+        } else {
+            args.lib_search_paths.push(Box::from(Path::new(path)));
+        }
+        return Ok(());
+    }
+
+    // -F<path> (framework search path)
+    if let Some(path) = arg.strip_prefix("-F") {
+        if !path.is_empty() {
+            args.framework_search_paths.push(Box::from(Path::new(path)));
+        } else if let Some(val) = input.next() {
+            args.framework_search_paths
+                .push(Box::from(Path::new(val.as_ref())));
+        }
+        return Ok(());
+    }
+
+    // -U <symbol> (allow undefined, dynamic lookup)
+    if arg == "-U" {
+        if let Some(sym) = input.next() {
+            let name = sym.as_ref().as_bytes().to_vec();
+            args.dylib_symbols
+                .insert(std::sync::Arc::<[u8]>::from(name.as_slice()));
+            args.dynamic_undefined_symbols.push(name);
+        }
+        return Ok(());
+    }
+
+    // Prefix link flags: -needed-l<name>, -weak-l<name>, -reexport-l<name>, -hidden-l<name>
+    let mut dylib_kind = DylibLoadKind::Normal;
+    let mut is_needed = false;
+    let mut is_hidden = false;
+    let lib_from_prefix = if let Some(name) = arg.strip_prefix("-needed-l") {
+        is_needed = true;
+        Some(name)
+    } else if let Some(name) = arg.strip_prefix("-weak-l") {
+        dylib_kind = DylibLoadKind::Weak;
+        Some(name)
+    } else if let Some(name) = arg.strip_prefix("-reexport-l") {
+        dylib_kind = DylibLoadKind::Reexport;
+        Some(name)
+    } else if let Some(name) = arg.strip_prefix("-hidden-l") {
+        is_hidden = true;
+        Some(name)
+    } else {
+        None
+    };
+
+    // -l<name> (link library) -- must come after -lto_library check above
+    let lib_name = lib_from_prefix.or_else(|| arg.strip_prefix("-l"));
+    if let Some(lib) = lib_name {
+        if !lib.is_empty() {
+            // On macOS, libSystem is implicitly linked (we emit LC_LOAD_DYLIB for it).
+            // Skip it and other system dylibs that we handle implicitly, but still
+            // parse their .tbd to know which symbols they export.
+            if lib == "System" || lib == "c" || lib == "m" || lib == "pthread" {
+                if args.no_default_search_paths {
+                    crate::bail!("library not found: -l{lib}");
+                }
+                let mut search_paths: Vec<Box<Path>> = args.lib_search_paths.clone();
+                if let Some(ref root) = args.syslibroot {
+                    search_paths.push(Box::from(root.join("usr/lib")));
+                }
+                // Global SDK cache fast-path. On the first
+                // `-lSystem`/`-lc`/`-lm`/`-lpthread` call, if we have
+                // a syslibroot and its cached symbol set is still
+                // valid (libSystem.tbd's size+mtime unchanged),
+                // hydrate `args.dylib_symbols` from disk without
+                // walking + parsing ~100 `.tbd` files. Saves ~60 ms
+                // on the cold link path for every wild invocation
+                // after the first against a given SDK.
+                //
+                // The cache is process-wide, stored under
+                // `$XDG_CACHE_HOME/wild/sdk-<hex>.bin`, so every
+                // output binary linked against the same SDK
+                // benefits from the same cache entry.
+                if args.system_tbd_dir_walked.is_none()
+                    && let Some(ref root) = args.syslibroot
+                    && let Some(cached) = crate::sdk_cache::load_sdk_symbols(root)
+                {
+                    args.dylib_symbols.extend(cached);
+                    // Record both walk-done and sdk-cache-hit so the
+                    // subsequent -l<lib> calls (c/m/pthread) also
+                    // short-circuit cleanly.
+                    args.system_tbd_dir_walked =
+                        Some(Box::from(root.join("usr/lib/system").as_path()));
+                    args.sdk_cache_used = true;
+                    return Ok(());
+                }
+                // SDK cache already populated symbols — short-circuit
+                // before re-parsing libSystem.tbd. Hits when the
+                // SDK-root discovery (line 549) already loaded the
+                // cached symbols, OR when this is the second
+                // `-lSystem`/`-lc`/`-lm` after a successful first
+                // parse populated `sdk_cache_used`. Without this,
+                // the loop below re-parses libSystem.tbd via
+                // `collect_tbd_symbols` (~400 ms on bevy — was the
+                // dominant remaining hot spot in the cargo dev-loop
+                // profile after the line-549 fix).
+                if args.sdk_cache_used {
+                    return Ok(());
+                }
+                for dir in &search_paths {
+                    let tbd_path = dir.join(format!("lib{lib}.tbd"));
+                    if tbd_path.exists() {
+                        collect_tbd_symbols(&tbd_path, &mut args.dylib_symbols);
+                        // Also collect from re-exported libraries (libSystem
+                        // re-exports libdyld, libsystem_c, etc. from the
+                        // `system/` subdir). Walk + parse the ~100 stub
+                        // files **exactly once per syslibroot**: rustc
+                        // typically passes `-lSystem`, `-lc`, `-lm`,
+                        // `-lpthread` in a row, each of which used to
+                        // re-scan the same directory and re-parse every
+                        // .tbd — ~20-30 ms per duplicate pass, the
+                        // dominant chunk of `args.parse` time on
+                        // rust-analyzer. Tracked via a tri-state
+                        // `system_dir_walked` flag: `Some(dir)` records
+                        // which directory we walked, so a different
+                        // syslibroot on a second parse invocation
+                        // (unusual but possible) still re-walks cleanly.
+                        let system_dir = dir.join("system");
+                        if system_dir.is_dir() {
+                            let already_walked = args
+                                .system_tbd_dir_walked
+                                .as_deref()
+                                .is_some_and(|p| p == system_dir.as_path());
+                            if !already_walked {
+                                if let Ok(entries) = std::fs::read_dir(&system_dir) {
+                                    for entry in entries.flatten() {
+                                        let p = entry.path();
+                                        if p.extension().is_some_and(|e| e == "tbd") {
+                                            collect_tbd_symbols(&p, &mut args.dylib_symbols);
+                                        }
+                                    }
+                                }
+                                args.system_tbd_dir_walked = Some(Box::from(system_dir.as_path()));
+                                // Now that we've done the expensive
+                                // walk, persist the collected
+                                // symbols globally so the next link
+                                // against this SDK can skip it.
+                                if let Some(ref root) = args.syslibroot {
+                                    crate::sdk_cache::save_sdk_symbols(root, &args.dylib_symbols);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+            // Try to find the library on the search path, including syslibroot.
+            let mut found = false;
+            let extensions = [".tbd", ".dylib", ".a"];
+            let mut search_paths: Vec<Box<Path>> = args.lib_search_paths.clone();
+            if !args.no_default_search_paths
+                && let Some(ref root) = args.syslibroot
+            {
+                search_paths.push(Box::from(root.join("usr/lib")));
+                search_paths.push(Box::from(root.join("usr/lib/swift")));
+            }
+            // search_paths_first (default): try all extensions per dir.
+            // search_dylibs_first: try each extension across all dirs.
+            let search_dylibs_first = args.search_dylibs_first;
+            'search: for i in 0..extensions.len() * search_paths.len() {
+                let (dir_idx, ext_idx) = if search_dylibs_first {
+                    (i % search_paths.len(), i / search_paths.len())
+                } else {
+                    (i / extensions.len(), i % extensions.len())
+                };
+                let ext = extensions[ext_idx];
+                let dir = &search_paths[dir_idx];
+                let path = dir.join(format!("lib{lib}{ext}"));
+                if path.exists() {
+                    if ext == ".tbd" {
+                        if let Some(dylib_path) = parse_tbd_install_name(&path) {
+                            args.add_dylib(dylib_path, dylib_kind);
+                        }
+                        collect_tbd_symbols(&path, &mut args.dylib_symbols);
+                    } else if ext == ".dylib" {
+                        // Parse exports trie + install name from the dylib.
+                        handle_dylib_input(args, &path)?;
+                        // Override the load kind if a prefix modifier was used.
+                        if dylib_kind != DylibLoadKind::Normal
+                            && let Some(last) = args.extra_dylibs.last_mut()
+                        {
+                            last.1 = dylib_kind;
+                        }
+                    } else {
+                        args.common.inputs.push(Input {
+                            spec: InputSpec::File(Box::from(path.as_path())),
+                            search_first: None,
+                            modifiers: *modifier_stack.last().unwrap(),
+                        });
+                    }
+                    // -hidden-l: add archive global symbols to unexport list.
+                    if is_hidden && ext == ".a" {
+                        // Scan archive for global symbols to hide from dylib exports.
+                        if let Ok(data) = std::fs::read(&path)
+                            && let Ok(archive) = object::read::archive::ArchiveFile::parse(&*data)
+                        {
+                            for member in archive.members() {
+                                let Ok(member) = member else { continue };
+                                let Ok(member_data) = member.data(&*data) else {
+                                    continue;
+                                };
+                                let Ok(obj) = object::File::parse(member_data) else {
+                                    continue;
+                                };
+                                use object::Object;
+                                use object::ObjectSymbol;
+                                for sym in obj.symbols() {
+                                    if sym.is_global()
+                                        && sym.is_definition()
+                                        && let Ok(name) = sym.name()
+                                    {
+                                        args.unexported_symbols.push(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if is_needed && !args.extra_dylibs.is_empty() {
+                        args.needed_dylib_indices
+                            .insert(args.extra_dylibs.len() - 1);
+                    }
+                    found = true;
+                    break 'search;
+                }
+            }
+            // If not found, warn but don't error (might be a system dylib we handle implicitly)
+            if !found {
+                tracing::warn!("library not found: -l{lib}");
+            }
+        }
+        return Ok(());
+    }
+
+    // Unknown flags starting with - go to unrecognized
+    if arg.starts_with('-') {
+        args.common.unrecognized_options.push(arg.to_owned());
+        return Ok(());
+    }
+
+    // Positional argument = input file.
+    // Check if it's a dylib/bundle -- if so, treat like a .tbd (extract install name
+    // and symbols, emit LC_LOAD_DYLIB) rather than passing through object pipeline.
+    let path = Path::new(arg);
+    if path.extension().is_some_and(|e| e == "tbd") {
+        // Defer: $ld$ directives depend on -platform_version which may come later.
+        args.pending_tbd_inputs.push(path.to_path_buf());
+    } else if path.extension().is_some_and(|e| e == "dylib") || is_macho_dylib(path) {
+        handle_dylib_input(args, path)?;
+    } else {
+        args.common.save_dir.handle_file(arg);
+        args.common.inputs.push(Input {
+            spec: InputSpec::File(Box::from(path)),
+            search_first: None,
+            modifiers: *modifier_stack.last().unwrap(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Extract `install-name` from a .tbd (text-based dylib stub) file.
+fn parse_tbd_install_name(path: &Path) -> Option<Vec<u8>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("install-name:") {
+            let name = rest.trim().trim_matches('\'').trim_matches('"');
+            if !name.is_empty() {
+                return Some(name.as_bytes().to_vec());
+            }
+        }
+    }
+    None
+}
+
+/// Parse a Mach-O version string like "10.9" or "13.5.1" into packed u32 format:
+/// major<<16 | minor<<8 | patch.
+fn parse_macho_version(s: &str) -> u32 {
+    let mut parts = s.split('.');
+    let major = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    (major << 16) | (minor << 8) | patch
+}
+
+/// Collect exported symbols from a .tbd file, processing $ld$ linker directives.
+fn collect_tbd_symbols_with_directives(
+    path: &Path,
+    symbols: &mut DylibSymbols,
+    minos: Option<u32>,
+    install_name: &mut Option<Vec<u8>>,
+) {
+    let target_version = minos.unwrap_or(0);
+    let mut hide_list = Vec::new();
+    let mut visited = std::collections::HashSet::<std::path::PathBuf>::new();
+    collect_tbd_with_directives_impl(
+        path,
+        symbols,
+        target_version,
+        install_name,
+        &mut hide_list,
+        &mut visited,
+    );
+    // Apply hide directives after all symbols are collected.
+    for sym in &hide_list {
+        // `sym` is a `Vec<u8>`; the set entries are `Arc<[u8]>` so we
+        // borrow as `&[u8]` to match the set's `Borrow` impl.
+        symbols.remove(sym.as_slice());
+    }
+}
+
+fn collect_tbd_with_directives_impl(
+    path: &Path,
+    symbols: &mut DylibSymbols,
+    target_version: u32,
+    install_name: &mut Option<Vec<u8>>,
+    hide_list: &mut Vec<Vec<u8>>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon) {
+        return;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let records = match text_stub_library::parse_str(&content) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for record in &records {
+        match record {
+            text_stub_library::TbdVersionedRecord::V4(v4) => {
+                let is_arm64 = |targets: &[String]| -> bool {
+                    targets.is_empty()
+                        || targets
+                            .iter()
+                            .any(|t| t.starts_with("arm64-") || t.starts_with("arm64e-"))
+                };
+                for exp in &v4.exports {
+                    if !is_arm64(&exp.targets) {
+                        continue;
+                    }
+                    for sym in exp.symbols.iter().chain(exp.weak_symbols.iter()) {
+                        process_tbd_symbol(sym, symbols, target_version, install_name, hide_list);
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                }
+                for exp in &v4.re_exports {
+                    if !is_arm64(&exp.targets) {
+                        continue;
+                    }
+                    for sym in &exp.symbols {
+                        process_tbd_symbol(sym, symbols, target_version, install_name, hide_list);
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                }
+            }
+            text_stub_library::TbdVersionedRecord::V3(v3) => {
+                for exp in &v3.exports {
+                    for sym in &exp.symbols {
+                        process_tbd_symbol(sym, symbols, target_version, install_name, hide_list);
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.weak_def_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Recurse into `reexported-libraries:` (see collect_tbd_symbols_impl
+    // for why this is necessary). Child install-names shouldn't be
+    // allowed to mutate the parent's install_name — pass a scratch
+    // Option so $ld$install_name directives there don't leak up.
+    for child_install in parse_reexported_libraries(&content) {
+        if let Some(child_path) = resolve_tbd_for_install_name(path, &child_install) {
+            let mut scratch: Option<Vec<u8>> = None;
+            collect_tbd_with_directives_impl(
+                &child_path,
+                symbols,
+                target_version,
+                &mut scratch,
+                hide_list,
+                visited,
+            );
+        }
+    }
+}
+
+/// Expand a TBD `objc-classes:` entry into the two ABI symbols ld64
+/// emits for it: `_OBJC_CLASS_$_<name>` (the class object) and
+/// `_OBJC_METACLASS_$_<name>` (the metaclass object). Without this,
+/// any `[NSException raise:…]`-style ObjC reference that resolves to
+/// a class symbol exported only via `objc-classes:` (e.g. NSException
+/// from CoreFoundation.tbd) shows up as `undefined symbol` even though
+/// the framework actually provides it. Mirrors ld64's
+/// `MachOFileAbstraction::handleSymbolicSymbols` expansion.
+fn expand_objc_class_symbols(classes: &[String], symbols: &mut DylibSymbols) {
+    for name in classes {
+        let class_sym = format!("_OBJC_CLASS_$_{name}");
+        let meta_sym = format!("_OBJC_METACLASS_$_{name}");
+        symbols.insert(std::sync::Arc::<[u8]>::from(class_sym.as_bytes()));
+        symbols.insert(std::sync::Arc::<[u8]>::from(meta_sym.as_bytes()));
+    }
+}
+
+/// Expand a TBD `objc-eh-types:` entry into `_OBJC_EHTYPE_$_<name>`
+/// — the per-class exception-handling type info object the ObjC ABI
+/// looks up at `@catch` time. ld64 only emits these for classes the
+/// framework explicitly marks; the regular `objc-classes:` list does
+/// NOT imply the EH-type symbol.
+fn expand_objc_eh_symbols(eh_types: &[String], symbols: &mut DylibSymbols) {
+    for name in eh_types {
+        let sym = format!("_OBJC_EHTYPE_$_{name}");
+        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+    }
+}
+
+/// Expand a TBD `objc-ivars:` entry into `_OBJC_IVAR_$_<class>.<ivar>`.
+/// The TBD lists these as already-formed `<class>.<ivar>` pairs, so the
+/// expansion is a single prefix concat. Ld64 emits these for every
+/// public ivar the framework exposes.
+fn expand_objc_ivar_symbols(ivars: &[String], symbols: &mut DylibSymbols) {
+    for entry in ivars {
+        let sym = format!("_OBJC_IVAR_$_{entry}");
+        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+    }
+}
+
+/// Process a single symbol from a .tbd, handling $ld$ linker directives.
+/// Returns Some(sym_name) for $ld$hide$ directives to remove in a second pass.
+fn process_tbd_symbol(
+    sym: &str,
+    symbols: &mut DylibSymbols,
+    target_version: u32,
+    install_name: &mut Option<Vec<u8>>,
+    hide_list: &mut Vec<Vec<u8>>,
+) {
+    if let Some(rest) = sym.strip_prefix("$ld$add$os") {
+        // $ld$add$os<ver>$_<sym> — add symbol if target >= ver
+        if let Some((ver_str, _real_sym)) = rest.split_once('$') {
+            let ver = parse_macho_version(ver_str);
+            if target_version >= ver
+                && let Some(real) = rest.rsplit_once('$')
+            {
+                symbols.insert(std::sync::Arc::<[u8]>::from(real.1.as_bytes()));
+            }
+        }
+    } else if let Some(rest) = sym.strip_prefix("$ld$hide$os") {
+        // $ld$hide$os<ver>$_<sym> — hide symbol if target >= ver (deferred)
+        if let Some((ver_str, real_sym)) = rest.split_once('$') {
+            let ver = parse_macho_version(ver_str);
+            if target_version >= ver {
+                hide_list.push(real_sym.as_bytes().to_vec());
+            }
+        }
+    } else if let Some(rest) = sym.strip_prefix("$ld$install_name$os") {
+        // $ld$install_name$os<ver>$<new_name> — change install name if target >= ver
+        if let Some((ver_str, new_name)) = rest.split_once('$') {
+            let ver = parse_macho_version(ver_str);
+            if target_version >= ver {
+                *install_name = Some(new_name.as_bytes().to_vec());
+            }
+        }
+    } else if let Some(rest) = sym.strip_prefix("$ld$previous$") {
+        // $ld$previous$<install_name>$$<compat_ver>$<min_os>$<max_os>$$
+        // Use <install_name> when target is in [min_os, max_os)
+        let parts: Vec<&str> = rest.split('$').collect();
+        // Format: <name> "" <compat> <min> <max> ""
+        if parts.len() >= 5 {
+            let new_name = parts[0];
+            let min_os = parse_macho_version(parts[3]);
+            let max_os = parse_macho_version(parts[4]);
+            if target_version >= min_os && (max_os == 0 || target_version < max_os) {
+                *install_name = Some(new_name.as_bytes().to_vec());
+            }
+        }
+    } else {
+        // Regular symbol
+        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+    }
+}
+
+/// Collect exported symbols from a .tbd file into the given set (no directive processing).
+fn collect_tbd_symbols(path: &Path, symbols: &mut DylibSymbols) {
+    let mut visited = std::collections::HashSet::<std::path::PathBuf>::new();
+    collect_tbd_symbols_impl(path, symbols, &mut visited);
+}
+
+fn collect_tbd_symbols_impl(
+    path: &Path,
+    symbols: &mut DylibSymbols,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon) {
+        return;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let records = match text_stub_library::parse_str(&content) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for record in &records {
+        match record {
+            text_stub_library::TbdVersionedRecord::V4(v4) => {
+                let is_arm64 = |targets: &[String]| -> bool {
+                    targets.is_empty()
+                        || targets
+                            .iter()
+                            .any(|t| t.starts_with("arm64-") || t.starts_with("arm64e-"))
+                };
+                for exp in &v4.exports {
+                    if !is_arm64(&exp.targets) {
+                        continue;
+                    }
+                    for sym in &exp.symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    for sym in &exp.weak_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                }
+                for exp in &v4.re_exports {
+                    if !is_arm64(&exp.targets) {
+                        continue;
+                    }
+                    for sym in &exp.symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    for sym in &exp.weak_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_eh_symbols(&exp.objc_eh_types, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                }
+            }
+            text_stub_library::TbdVersionedRecord::V3(v3) => {
+                for exp in &v3.exports {
+                    for sym in &exp.symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    expand_objc_class_symbols(&exp.objc_classes, symbols);
+                    expand_objc_ivar_symbols(&exp.objc_ivars, symbols);
+                    for sym in &exp.weak_def_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                    for sym in &exp.thread_local_symbols {
+                        symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_bytes()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Follow `reexported-libraries:` chains. text-stub-library 0.9
+    // doesn't model this key; umbrella frameworks (ApplicationServices,
+    // Carbon, CoreServices) use it to point at nested frameworks
+    // they re-export. Without following it, the linker misses symbols
+    // like `_CGDisplayCreateUUIDFromDisplayID` (ColorSync, re-exported
+    // via ApplicationServices) that modern `winit`/bevy_dylib needs.
+    for install_name in parse_reexported_libraries(&content) {
+        if let Some(child) = resolve_tbd_for_install_name(path, &install_name) {
+            collect_tbd_symbols_impl(&child, symbols, visited);
+        }
+    }
+}
+
+/// Scan raw TBD YAML for the `reexported-libraries:` section and
+/// return the install-name paths it points at.
+///
+/// text-stub-library 0.9 doesn't model this key (it only models the
+/// symbol-listing `re-exports:` section). On Apple SDKs, umbrella
+/// frameworks such as `ApplicationServices` declare their nested
+/// re-exports here — linkers that miss this lose access to every
+/// nested framework's symbols (e.g. `_CGDisplayCreateUUIDFromDisplayID`
+/// lives in `ColorSync`, re-exported by `ApplicationServices`).
+///
+/// Format:
+///   reexported-libraries:
+///     - targets:   [ arm64e-macos, ... ] libraries: [ '/System/Library/Frameworks/.../X', '...' ]
+///
+/// We don't filter by target: out-of-target re-exports resolve to
+/// .tbd files whose own target filter excludes their symbols, so the
+/// cost of being permissive here is bounded by one extra stat.
+fn parse_reexported_libraries(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    let mut pending = String::new();
+    let mut collecting = false;
+
+    for line in content.lines() {
+        if !in_section {
+            // Top-level key (no leading whitespace) that starts
+            // `reexported-libraries` — allow optional YAML dash.
+            let stripped = line.trim_start();
+            if stripped == line && stripped.starts_with("reexported-libraries:") {
+                in_section = true;
+            }
+            continue;
+        }
+        // End of section = first non-empty top-level line.
+        if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            break;
+        }
+        let trimmed = line.trim_start();
+        // Begin a new `libraries:` array.
+        if let Some(after) = trimmed.strip_prefix("libraries:") {
+            collecting = true;
+            pending.clear();
+            pending.push_str(after);
+        } else if collecting {
+            pending.push(' ');
+            pending.push_str(trimmed);
+        }
+        if collecting {
+            // Extract all single-quoted substrings seen so far.
+            let mut iter = pending.split('\'');
+            // Skip the first piece (before the first quote).
+            let _ = iter.next();
+            let mut inside = true;
+            for piece in iter {
+                if inside {
+                    let s = piece.trim();
+                    if !s.is_empty() && !out.iter().any(|x: &String| x == s) {
+                        out.push(s.to_owned());
+                    }
+                }
+                inside = !inside;
+            }
+            if pending.contains(']') {
+                collecting = false;
+                pending.clear();
+            }
+        }
+    }
+    out
+}
+
+/// Given a `.tbd` file at `origin` and an absolute install-name
+/// path like `/System/Library/Frameworks/ColorSync.framework/.../ColorSync`,
+/// return the `.tbd` file the install-name points at (i.e.
+/// `<sdk>/System/Library/Frameworks/.../ColorSync.tbd`), or `None`
+/// if we can't locate it.
+///
+/// SDK root is derived from the origin path by splitting at
+/// `/System/Library/` or `/usr/lib/`. That matches the layout Apple
+/// ships (the SDK root always contains both subtrees).
+fn resolve_tbd_for_install_name(origin: &Path, install_name: &str) -> Option<std::path::PathBuf> {
+    let origin_str = origin.to_str()?;
+    const MARKERS: &[&str] = &["/System/Library/", "/usr/lib/"];
+    let sdk_root = MARKERS
+        .iter()
+        .find_map(|m| origin_str.find(m).map(|i| &origin_str[..i]))?;
+    let install_trim = install_name.strip_prefix('/')?;
+    let mut candidate = std::path::PathBuf::from(sdk_root);
+    candidate.push(install_trim);
+    candidate.set_extension("tbd");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Discover the macOS SDK path via `xcrun --show-sdk-path`.
+/// Returns `None` if xcrun is unavailable or fails.
+fn discover_sdk_path() -> Option<Box<Path>> {
+    std::process::Command::new("xcrun")
+        .args(["--show-sdk-path"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| Box::from(Path::new(s.trim())))
+            } else {
+                None
+            }
+        })
+}
+
+/// Resolved framework lookup, cached across daemon-mode link
+/// invocations. Holds the same effects `link_framework` would apply:
+/// the install name (if a `.tbd` provided one) and the parsed symbol
+/// set as an `Arc` so refcount-bumping replaces re-parsing.
+#[derive(Clone)]
+struct CachedFrameworkResolution {
+    install_name: Option<Vec<u8>>,
+    symbols: std::sync::Arc<DylibSymbols>,
+}
+
+/// Process-resident cache of framework name → resolved TBD effects.
+/// Skips ALL filesystem stats inside `link_framework` after the first
+/// daemon-served link, including the per-search-path `is_dir` walk
+/// that contributed several ms even when the underlying TBD mem
+/// cache hit.
+///
+/// Keyed on `(framework_search_paths-digest, name)` — if `-F` flags
+/// change between cargo invocations, the digest mismatches and we
+/// fall through to a fresh resolution. The TBD layer's
+/// `(size, mtime_ns)` validation is the safety net for the very
+/// rare case of an SDK update during a single daemon's lifetime.
+static FRAMEWORK_SESSION: std::sync::Mutex<
+    Option<std::collections::HashMap<String, CachedFrameworkResolution>>,
+> = std::sync::Mutex::new(None);
+
+fn framework_session_key(search_paths: &[Box<std::path::Path>], name: &str) -> String {
+    // Deterministic + cheap. Path count is small (≤ 5 typically) and
+    // a leading null byte separates digest from name so two distinct
+    // (paths, name) pairs can't collide via concatenation games.
+    let mut s = String::with_capacity(64);
+    for p in search_paths {
+        s.push_str(&p.to_string_lossy());
+        s.push('\0');
+    }
+    s.push('|');
+    s.push_str(name);
+    s
+}
+
+/// Search framework search paths for a framework and register it as a dylib dependency.
+fn link_framework(args: &mut MachOArgs, name: &str) -> Result {
+    // Daemon-friendly fast path: skip the entire path-walk + stat
+    // dance when this daemon already resolved `name` against the
+    // current search-path set. A bevy-class link has 17 framework
+    // flags; on each link this path saves ~3 stats per framework
+    // even when the TBD mem-cache below was already hot.
+    let session_key = framework_session_key(&args.framework_search_paths, name);
+    {
+        let guard = FRAMEWORK_SESSION
+            .lock()
+            .expect("framework session cache poisoned");
+        if let Some(map) = guard.as_ref()
+            && let Some(cached) = map.get(&session_key)
+        {
+            if let Some(install_name) = cached.install_name.clone() {
+                args.add_dylib(install_name, DylibLoadKind::Normal);
+            }
+            args.dylib_symbols.extend(cached.symbols.iter().cloned());
+            return Ok(());
+        }
+    }
+
+    // Search: <F-path>/<name>.framework/<name>[.tbd]
+    let framework_dir = format!("{name}.framework");
+    for dir in &args.framework_search_paths {
+        let fw_dir = dir.join(&framework_dir);
+        if !fw_dir.is_dir() {
+            continue;
+        }
+        // Try .tbd first, then bare name (dylib without extension)
+        let tbd_path = fw_dir.join(format!("{name}.tbd"));
+        if tbd_path.exists() {
+            // Global TBD cache fast-path: on profile, CoreFoundation
+            // + CoreServices framework parsing via yaml_rust
+            // dominates cold-link time (85% of wild-leaf samples).
+            // Cache `(install_name, symbols)` keyed on
+            // (path, size, mtime).
+            if let Some((install_name, symbols)) = crate::sdk_cache::load_tbd_symbols(&tbd_path) {
+                if let Some(dylib_path) = install_name.clone() {
+                    args.add_dylib(dylib_path, DylibLoadKind::Normal);
+                }
+                // Iterate the Arc'd HashSet by reference so the
+                // mem-cache fast path doesn't pay a full HashSet
+                // clone on top of the per-symbol Vec clones that
+                // `extend` already does.
+                let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+                for sym in symbols.iter() {
+                    args.dylib_symbol_provenance
+                        .entry(sym.as_ref().to_vec())
+                        .or_insert(dylib_idx);
+                }
+                args.dylib_symbols.extend(symbols.iter().cloned());
+                framework_session_insert(
+                    session_key,
+                    CachedFrameworkResolution {
+                        install_name,
+                        symbols,
+                    },
+                );
+                return Ok(());
+            }
+            // Miss: parse the .tbd, then persist the result for
+            // the next link.
+            let install_name = parse_tbd_install_name(&tbd_path);
+            let mut fresh_symbols: DylibSymbols = Default::default();
+            collect_tbd_symbols(&tbd_path, &mut fresh_symbols);
+            if let Some(ref dylib_path) = install_name {
+                args.add_dylib(dylib_path.clone(), DylibLoadKind::Normal);
+            }
+            // Populate `dylib_symbol_provenance` so two-level-namespace
+            // binds attribute these imports to this framework's
+            // ordinal rather than collapsing onto the libSystem
+            // catch-all (`lib_ordinal_for_named_symbol`).
+            let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+            for sym in &fresh_symbols {
+                args.dylib_symbol_provenance
+                    .entry(sym.as_ref().to_vec())
+                    .or_insert(dylib_idx);
+            }
+            args.dylib_symbols.extend(fresh_symbols.iter().cloned());
+            crate::sdk_cache::save_tbd_symbols(&tbd_path, install_name.as_deref(), &fresh_symbols);
+            framework_session_insert(
+                session_key,
+                CachedFrameworkResolution {
+                    install_name,
+                    symbols: std::sync::Arc::new(fresh_symbols),
+                },
+            );
+            return Ok(());
+        }
+        let dylib_path = fw_dir.join(name);
+        if dylib_path.exists() {
+            handle_dylib_input(args, &dylib_path)?;
+            // Don't cache the `.dylib` (vs `.tbd`) branch — the
+            // `handle_dylib_input` path mutates `args` more
+            // broadly (rpaths, install-name handling) and would
+            // be misleading to replay verbatim. In practice this
+            // branch fires for non-SDK frameworks that link from
+            // a real Mach-O dylib; far rarer than the .tbd path.
+            return Ok(());
+        }
+    }
+    tracing::warn!("framework not found: {name}");
+    Ok(())
+}
+
+fn framework_session_insert(key: String, value: CachedFrameworkResolution) {
+    let mut guard = FRAMEWORK_SESSION
+        .lock()
+        .expect("framework session cache poisoned");
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.insert(key, value);
+}
+
+/// Check if a file is a Mach-O dylib/bundle by reading its header.
+fn is_macho_dylib(path: &Path) -> bool {
+    // Short-circuit on known non-Mach-O extensions: `.rlib` and `.a`
+    // are ar archives; `.o` is a relocatable object; `.tbd` is
+    // handled upstream. Without this, rustc-driven links of crates
+    // like rust-analyzer (~211 rlibs totalling ~350 MiB) used to
+    // read every single input into RAM just to inspect four magic
+    // bytes — the 123 ms bulk of `args.parse`. Extension check is
+    // a pure-string op; on a match we never touch the filesystem.
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rlib" | "a" | "o" | "tbd") => return false,
+        _ => {}
+    }
+    // For paths without a conventional extension (or with ".dylib"
+    // / ".bundle" / none-at-all), open + read exactly 16 bytes —
+    // enough to inspect magic + filetype. Avoids slurping GB-scale
+    // files into memory for the magic-check.
+    use std::io::Read as _;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
+    if magic != 0xfeed_facf {
+        return false;
+    }
+    let filetype = u32::from_le_bytes(head[12..16].try_into().unwrap());
+    matches!(filetype, 6 | 8) // MH_DYLIB | MH_BUNDLE
+}
+
+/// Handle a .tbd file as a positional input: extract install-name and symbols, register as dylib
+/// dep.
+fn handle_tbd_input(args: &mut MachOArgs, path: &Path) {
+    let mut install_name = parse_tbd_install_name(path);
+    let symbols_before: usize = args.dylib_symbols.len();
+    let mut fresh: DylibSymbols = Default::default();
+    collect_tbd_symbols_with_directives(path, &mut fresh, args.minos, &mut install_name);
+    // Check app-extension safety from .tbd flags.
+    if let Ok(content) = std::fs::read_to_string(path)
+        && let Ok(records) = text_stub_library::parse_str(&content)
+    {
+        for record in &records {
+            if let text_stub_library::TbdVersionedRecord::V4(v4) = record {
+                if v4.flags.iter().any(|f| f == "not_app_extension_safe") {
+                    let display = path.file_name().unwrap_or(path.as_os_str());
+                    args.non_extension_safe_dylibs
+                        .push(display.to_string_lossy().into_owned());
+                }
+                break;
+            }
+        }
+    }
+    if let Some(name) = install_name {
+        args.add_dylib(name, DylibLoadKind::Normal);
+    }
+    // Track which dylib provided each symbol so two-level-namespace
+    // binds get the right LC_LOAD_DYLIB ordinal at write time.
+    let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+    for sym in &fresh {
+        args.dylib_symbol_provenance
+            .entry(sym.as_ref().to_vec())
+            .or_insert(dylib_idx);
+    }
+    args.dylib_symbols.extend(fresh);
+    let _ = symbols_before;
+}
+
+/// Handle a .dylib input: extract install name and exported symbols, register as dylib dep.
+fn handle_dylib_input(args: &mut MachOArgs, path: &Path) -> Result {
+    let data = std::fs::read(path)
+        .with_context(|| format!("Failed to read dylib `{}`", path.display()))?;
+    let le = object::Endianness::Little;
+
+    // Parse install name from LC_ID_DYLIB
+    let mut install_name: Option<Vec<u8>> = None;
+    let mut exported_symbols: Vec<Vec<u8>> = Vec::new();
+    let mut reexported_dylib_paths: Vec<String> = Vec::new();
+    let mut dylib_rpaths: Vec<PathBuf> = Vec::new();
+    // 1-indexed: section_types[i] = flags of n_sect == i+1.
+    // Section ordinals in nlist_64.n_sect are 1-based across the
+    // concatenation of every LC_SEGMENT_64's section list in load
+    // order, so we collect them as we walk commands.
+    let mut section_types: Vec<u32> = Vec::new();
+    // (symoff, nsyms, stroff, strsize) from LC_SYMTAB. We can't
+    // process the symbol table until we've seen every LC_SEGMENT_64
+    // (so `section_types` is complete), but LC_SYMTAB usually
+    // appears before the LINKEDIT segment that holds it; record
+    // and process at end.
+    let mut symtab_info: Option<(usize, usize, usize, usize)> = None;
+    let mh_flags = if data.len() >= 28 {
+        u32::from_le_bytes(data[24..28].try_into().unwrap())
+    } else {
+        0
+    };
+    let is_dead_strippable = (mh_flags & 0x0040_0000) != 0;
+
+    if data.len() >= 32 {
+        let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let mut offset = 32; // skip mach_header_64 (32 bytes)
+        for _ in 0..ncmds {
+            if offset + 8 > data.len() {
+                break;
+            }
+            let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let cmdsize =
+                u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            if cmdsize < 8 || offset + cmdsize > data.len() {
+                break;
+            }
+            // LC_ID_DYLIB = 0x0D
+            if cmd == 0x0D && cmdsize >= 24 {
+                let name_offset =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                if name_offset < cmdsize {
+                    let name_start = offset + name_offset;
+                    let name_end = data[name_start..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map_or(offset + cmdsize, |p| name_start + p);
+                    install_name = Some(data[name_start..name_end].to_vec());
+                }
+            }
+            // LC_REEXPORT_DYLIB = 0x8000001F
+            if cmd == 0x8000_001F && cmdsize >= 24 {
+                let name_offset =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                if name_offset < cmdsize {
+                    let name_start = offset + name_offset;
+                    let name_end = data[name_start..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map_or(offset + cmdsize, |p| name_start + p);
+                    if let Ok(s) = std::str::from_utf8(&data[name_start..name_end]) {
+                        reexported_dylib_paths.push(s.to_string());
+                    }
+                }
+            }
+            // LC_DYLD_EXPORTS_TRIE = 0x80000033 or LC_DYLD_INFO[_ONLY] = 0x22 / 0x80000022
+            if (cmd == 0x8000_0033) && cmdsize >= 16 {
+                let trie_off =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                let trie_size =
+                    u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+                if trie_off > 0 && trie_size > 0 && trie_off + trie_size <= data.len() {
+                    parse_export_trie(&data[trie_off..trie_off + trie_size], &mut exported_symbols);
+                }
+            }
+            // LC_RPATH = 0x8000001C
+            if cmd == 0x8000_001C && cmdsize >= 12 {
+                let path_off =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                if path_off < cmdsize {
+                    let s = offset + path_off;
+                    let e = data[s..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map_or(offset + cmdsize, |p| s + p);
+                    if let Ok(rp) = std::str::from_utf8(&data[s..e]) {
+                        dylib_rpaths.push(PathBuf::from(rp));
+                    }
+                }
+            }
+            // LC_DYLD_INFO / LC_DYLD_INFO_ONLY: export info is at fields [40..48]
+            if (cmd == 0x22 || cmd == 0x8000_0022) && cmdsize >= 48 {
+                let export_off =
+                    u32::from_le_bytes(data[offset + 40..offset + 44].try_into().unwrap()) as usize;
+                let export_size =
+                    u32::from_le_bytes(data[offset + 44..offset + 48].try_into().unwrap()) as usize;
+                if export_off > 0 && export_size > 0 && export_off + export_size <= data.len() {
+                    parse_export_trie(
+                        &data[export_off..export_off + export_size],
+                        &mut exported_symbols,
+                    );
+                }
+            }
+            // LC_SEGMENT_64 = 0x19. Walk the inline section_64
+            // headers and collect each section's `flags` (the low
+            // byte is the section type, e.g. S_THREAD_LOCAL_*).
+            if cmd == 0x19 && cmdsize >= 72 {
+                let nsects =
+                    u32::from_le_bytes(data[offset + 64..offset + 68].try_into().unwrap()) as usize;
+                let mut sec_off = offset + 72;
+                for _ in 0..nsects {
+                    if sec_off + 80 > data.len() || sec_off + 80 > offset + cmdsize {
+                        break;
+                    }
+                    // section_64.flags is at offset 64 within the 80-byte struct.
+                    let flags =
+                        u32::from_le_bytes(data[sec_off + 64..sec_off + 68].try_into().unwrap());
+                    section_types.push(flags);
+                    sec_off += 80;
+                }
+            }
+            // LC_SYMTAB = 0x02
+            if cmd == 0x02 && cmdsize >= 24 {
+                let symoff =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                let nsyms =
+                    u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+                let stroff =
+                    u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
+                let strsize =
+                    u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap()) as usize;
+                symtab_info = Some((symoff, nsyms, stroff, strsize));
+            }
+            offset += cmdsize;
+        }
+    }
+
+    // Now scan the symbol table for TLS exports. A TLS export is an
+    // external defined symbol whose section's low-byte flags is one
+    // of S_THREAD_LOCAL_REGULAR (0x11), S_THREAD_LOCAL_ZEROFILL
+    // (0x12), S_THREAD_LOCAL_VARIABLES (0x13),
+    // S_THREAD_LOCAL_VARIABLE_POINTERS (0x14), or
+    // S_THREAD_LOCAL_INIT_FUNCTION_POINTERS (0x15).
+    if let Some((symoff, nsyms, stroff, strsize)) = symtab_info {
+        const NLIST_64_SIZE: usize = 16;
+        let nlist_end = symoff.saturating_add(nsyms.saturating_mul(NLIST_64_SIZE));
+        let str_end = stroff.saturating_add(strsize);
+        if nlist_end <= data.len() && str_end <= data.len() {
+            let strtab = &data[stroff..str_end];
+            for i in 0..nsyms {
+                let off = symoff + i * NLIST_64_SIZE;
+                let n_strx = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+                let n_type = data[off + 4];
+                let n_sect = data[off + 5] as usize;
+                // External, defined-in-section: N_EXT (0x01) set,
+                // N_TYPE (0x0e) == N_SECT (0xe).
+                let n_ext = (n_type & 0x01) != 0;
+                let is_n_sect = (n_type & 0x0e) == 0x0e;
+                if !n_ext || !is_n_sect || n_sect == 0 {
+                    continue;
+                }
+                let Some(&sec_flags) = section_types.get(n_sect - 1) else {
+                    continue;
+                };
+                let sec_type = sec_flags & 0xff;
+                if !(0x11..=0x15).contains(&sec_type) {
+                    continue;
+                }
+                if n_strx >= strtab.len() {
+                    continue;
+                }
+                let name_end = strtab[n_strx..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map_or(strtab.len(), |p| n_strx + p);
+                if name_end > n_strx {
+                    args.dylib_tls_symbols
+                        .insert(strtab[n_strx..name_end].to_vec());
+                }
+            }
+        }
+    }
+
+    let name = install_name.unwrap_or_else(|| path.to_string_lossy().as_bytes().to_vec());
+    args.add_dylib(name, DylibLoadKind::Normal);
+    let dylib_idx = args.extra_dylibs.len().saturating_sub(1);
+    for sym in &exported_symbols {
+        args.dylib_symbols
+            .insert(std::sync::Arc::<[u8]>::from(sym.as_slice()));
+        args.dylib_symbol_provenance.insert(sym.clone(), dylib_idx);
+    }
+
+    // Track dylibs not safe for app extensions.
+    if (mh_flags & 0x0200_0000) == 0 {
+        args.non_extension_safe_dylibs.push(
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    // Mark auto-strippable if MH_DEAD_STRIPPABLE_DYLIB is set.
+    if is_dead_strippable {
+        args.auto_strip_dylib_indices.insert(dylib_idx);
+    }
+
+    // Follow LC_REEXPORT_DYLIB chains recursively.
+    let search_dirs: Vec<PathBuf> = path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .into_iter()
+        .chain(args.lib_search_paths.iter().map(|d| d.to_path_buf()))
+        .collect();
+    let loader_dir = path.parent().map(|d| d.to_path_buf());
+    let output_dir = args.output.parent().map(|d| d.to_path_buf());
+    for reexport_install_name in reexported_dylib_paths {
+        collect_dylib_reexport_symbols(
+            &reexport_install_name,
+            &search_dirs,
+            &dylib_rpaths,
+            loader_dir.as_deref(),
+            output_dir.as_deref(),
+            &mut args.dylib_symbols,
+            0,
+        );
+    }
+
+    Ok(())
+}
+
+/// Expand a Mach-O install name with @rpath/, @loader_path/, or @executable_path/ prefix
+/// into candidate filesystem paths for link-time resolution.
+fn expand_install_name(
+    install_name: &str,
+    rpaths: &[PathBuf],
+    loader_dir: Option<&Path>,
+    output_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    if let Some(rel) = install_name.strip_prefix("@rpath/") {
+        rpaths.iter().map(|rp| rp.join(rel)).collect()
+    } else if let Some(rel) = install_name.strip_prefix("@loader_path/") {
+        loader_dir.map(|d| vec![d.join(rel)]).unwrap_or_default()
+    } else if let Some(rel) = install_name.strip_prefix("@executable_path/") {
+        output_dir.map(|d| vec![d.join(rel)]).unwrap_or_default()
+    } else {
+        vec![PathBuf::from(install_name)]
+    }
+}
+
+/// Recursively collect symbols from a re-exported dylib and its re-exports.
+fn collect_dylib_reexport_symbols(
+    install_name: &str,
+    search_dirs: &[PathBuf],
+    rpaths: &[PathBuf],
+    loader_dir: Option<&Path>,
+    output_dir: Option<&Path>,
+    symbols: &mut DylibSymbols,
+    depth: usize,
+) {
+    if depth > 8 {
+        return; // prevent infinite recursion
+    }
+    // Build candidate paths: expand @rpath/@loader_path/@executable_path, then search dirs.
+    let mut candidates = expand_install_name(install_name, rpaths, loader_dir, output_dir);
+    let file_name = Path::new(install_name).file_name().unwrap_or_default();
+    for dir in search_dirs {
+        candidates.push(dir.join(file_name));
+    }
+
+    for candidate in &candidates {
+        let Ok(data) = std::fs::read(candidate) else {
+            continue;
+        };
+        if data.len() < 32 {
+            continue;
+        }
+        let mut exported = Vec::new();
+        let mut nested_reexports = Vec::new();
+        let mut nested_rpaths = Vec::new();
+        let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let mut off = 32;
+        for _ in 0..ncmds {
+            if off + 8 > data.len() {
+                break;
+            }
+            let cmd = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            let sz = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
+            if sz < 8 || off + sz > data.len() {
+                break;
+            }
+            // LC_REEXPORT_DYLIB
+            if cmd == 0x8000_001F && sz >= 24 {
+                let n_off =
+                    u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+                if n_off < sz {
+                    let s = off + n_off;
+                    let e = data[s..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map_or(off + sz, |p| s + p);
+                    if let Ok(name) = std::str::from_utf8(&data[s..e]) {
+                        nested_reexports.push(name.to_string());
+                    }
+                }
+            }
+            // LC_RPATH
+            if cmd == 0x8000_001C && sz >= 12 {
+                let p_off =
+                    u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+                if p_off < sz {
+                    let s = off + p_off;
+                    let e = data[s..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map_or(off + sz, |p| s + p);
+                    if let Ok(rp) = std::str::from_utf8(&data[s..e]) {
+                        nested_rpaths.push(PathBuf::from(rp));
+                    }
+                }
+            }
+            // LC_DYLD_EXPORTS_TRIE
+            if cmd == 0x8000_0033 && sz >= 16 {
+                let t_off =
+                    u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+                let t_sz =
+                    u32::from_le_bytes(data[off + 12..off + 16].try_into().unwrap()) as usize;
+                if t_off > 0 && t_sz > 0 && t_off + t_sz <= data.len() {
+                    parse_export_trie(&data[t_off..t_off + t_sz], &mut exported);
+                }
+            }
+            // LC_DYLD_INFO / LC_DYLD_INFO_ONLY
+            if (cmd == 0x22 || cmd == 0x8000_0022) && sz >= 48 {
+                let e_off =
+                    u32::from_le_bytes(data[off + 40..off + 44].try_into().unwrap()) as usize;
+                let e_sz =
+                    u32::from_le_bytes(data[off + 44..off + 48].try_into().unwrap()) as usize;
+                if e_off > 0 && e_sz > 0 && e_off + e_sz <= data.len() {
+                    parse_export_trie(&data[e_off..e_off + e_sz], &mut exported);
+                }
+            }
+            off += sz;
+        }
+        for sym in exported {
+            symbols.insert(std::sync::Arc::<[u8]>::from(sym.as_slice()));
+        }
+        // For nested re-exports, combine rpaths and use this dylib's dir as loader_path.
+        let mut combined_rpaths = rpaths.to_vec();
+        combined_rpaths.extend(nested_rpaths);
+        let mut dirs = search_dirs.to_vec();
+        if let Some(parent) = candidate.parent()
+            && !dirs.contains(&parent.to_path_buf())
+        {
+            dirs.push(parent.to_path_buf());
+        }
+        let nested_loader = candidate.parent();
+        for nested in nested_reexports {
+            collect_dylib_reexport_symbols(
+                &nested,
+                &dirs,
+                &combined_rpaths,
+                nested_loader,
+                output_dir,
+                symbols,
+                depth + 1,
+            );
+        }
+        return; // found the file, stop searching candidates
+    }
+}
+
+/// Walk a Mach-O exports trie and collect all symbol names.
+fn parse_export_trie(trie: &[u8], symbols: &mut Vec<Vec<u8>>) {
+    fn walk(trie: &[u8], offset: usize, prefix: &[u8], symbols: &mut Vec<Vec<u8>>) {
+        if offset >= trie.len() {
+            return;
+        }
+        let mut pos = offset;
+        // Terminal info size (ULEB128)
+        let (terminal_size, n) = read_uleb128(&trie[pos..]);
+        pos += n;
+        if terminal_size > 0 {
+            // This node is a terminal — the prefix is an exported symbol
+            symbols.push(prefix.to_vec());
+        }
+        let terminal_end = pos + terminal_size as usize;
+        if terminal_end > trie.len() {
+            return;
+        }
+        pos = terminal_end;
+        // Child count
+        if pos >= trie.len() {
+            return;
+        }
+        let child_count = trie[pos] as usize;
+        pos += 1;
+        for _ in 0..child_count {
+            // Edge label (NUL-terminated string)
+            let label_start = pos;
+            while pos < trie.len() && trie[pos] != 0 {
+                pos += 1;
+            }
+            let label = &trie[label_start..pos];
+            if pos < trie.len() {
+                pos += 1; // skip NUL
+            }
+            // Child node offset (ULEB128)
+            let (child_offset, n) = read_uleb128(&trie[pos..]);
+            pos += n;
+            let mut child_prefix = prefix.to_vec();
+            child_prefix.extend_from_slice(label);
+            walk(trie, child_offset as usize, &child_prefix, symbols);
+        }
+    }
+
+    walk(trie, 0, &[], symbols);
+}
+
+fn read_uleb128(data: &[u8]) -> (u64, usize) {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return (result, i + 1);
+        }
+        shift += 7;
+    }
+    (result, data.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const APPSERV_SNIPPET: &str = r#"--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64e-macos ]
+install-name:    '/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices'
+reexported-libraries:
+  - targets:         [ arm64e-macos ]
+    libraries:       [ '/System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync',
+                       '/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics' ]
+  - targets:         [ x86_64-macos ]
+    libraries:       [ '/System/Library/Frameworks/CoreText.framework/Versions/A/CoreText' ]
+exports:
+  - targets:         [ arm64e-macos ]
+    symbols:         [ _AppServices_Symbol ]
+"#;
+
+    #[test]
+    fn parse_reexported_libraries_extracts_all_install_names() {
+        let libs = parse_reexported_libraries(APPSERV_SNIPPET);
+        assert!(
+            libs.contains(
+                &"/System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync".to_owned()
+            ),
+            "missing ColorSync in {libs:?}"
+        );
+        assert!(libs.contains(
+            &"/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics".to_owned()
+        ));
+        // Permissive target filter: we accept x86_64-only entries so
+        // out-of-target re-exports still get checked via filesystem
+        // (the child .tbd's own target filter will then reject their
+        // symbols). Cheap and keeps this parser dumb.
+        assert!(libs.contains(
+            &"/System/Library/Frameworks/CoreText.framework/Versions/A/CoreText".to_owned()
+        ));
+    }
+
+    #[test]
+    fn parse_reexported_libraries_ignores_unrelated_yaml() {
+        // A tbd with no reexported-libraries section returns empty.
+        let cg_snippet = r#"--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64e-macos ]
+install-name:    '/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics'
+exports:
+  - targets:         [ arm64e-macos ]
+    symbols:         [ _CGAffineTransformInvert ]
+"#;
+        assert!(parse_reexported_libraries(cg_snippet).is_empty());
+    }
+
+    #[test]
+    fn parse_reexported_libraries_stops_at_next_top_level_key() {
+        let snippet = r#"reexported-libraries:
+  - targets:         [ arm64e-macos ]
+    libraries:       [ '/A', '/B' ]
+exports:
+  - targets:         [ arm64e-macos ]
+    symbols:         [ '/not-a-library' ]
+"#;
+        let libs = parse_reexported_libraries(snippet);
+        assert_eq!(libs, vec!["/A".to_owned(), "/B".to_owned()]);
+    }
+
+    // wasi's `std::env::temp_dir()` is a hard panic — skip filesystem-using tests there.
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn resolve_tbd_for_install_name_derives_sdk_root() {
+        // Synthesise an SDK-like tree under tempdir.
+        let tmp = std::env::temp_dir().join(format!("wild-tbd-resolve-{}", std::process::id()));
+        let sdk_rel = "System/Library/Frameworks";
+        let cs = tmp.join(sdk_rel).join("ColorSync.framework/Versions/A");
+        std::fs::create_dir_all(&cs).unwrap();
+        std::fs::write(cs.join("ColorSync.tbd"), "stub").unwrap();
+
+        let origin = tmp.join(format!(
+            "{sdk_rel}/ApplicationServices.framework/Versions/A/ApplicationServices.tbd"
+        ));
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        std::fs::write(&origin, "stub").unwrap();
+
+        let got = resolve_tbd_for_install_name(
+            &origin,
+            "/System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync",
+        );
+        assert_eq!(got.as_ref(), Some(&cs.join("ColorSync.tbd")));
+
+        // Non-existent install-name returns None.
+        let missing = resolve_tbd_for_install_name(
+            &origin,
+            "/System/Library/Frameworks/DoesNotExist.framework/Versions/A/Nope",
+        );
+        assert!(missing.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn resolve_tbd_for_install_name_bails_when_no_marker() {
+        // Origin path with no /System/Library/ or /usr/lib/ marker
+        // — we can't derive an SDK root, so must return None rather
+        // than guess.
+        let tmp =
+            std::env::temp_dir().join(format!("wild-tbd-resolve-nomark-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let origin = tmp.join("random.tbd");
+        std::fs::write(&origin, "stub").unwrap();
+        assert!(resolve_tbd_for_install_name(&origin, "/System/Library/Frameworks/X/X").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

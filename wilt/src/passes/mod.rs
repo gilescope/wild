@@ -1,0 +1,39 @@
+/// Optimization passes.
+///
+/// Each pass takes a `WasmModule` and returns modifications to apply.
+/// Passes don't modify the module directly — they produce patches
+/// that the emitter applies.
+pub mod branch_threading;
+pub mod cfg_dce;
+pub mod compress;
+pub mod const_fold;
+pub mod const_global;
+pub mod const_prop;
+pub mod copy_prop;
+pub mod dae;
+pub mod dce;
+pub mod dead_globals;
+pub mod dedup;
+pub mod dedup_imports;
+pub mod devirt;
+pub mod dwarf_full;
+pub mod dwarf_line;
+pub mod fn_merge;
+pub mod if_fold;
+pub mod inline_trivial;
+pub mod layout_for_compression;
+pub mod memory_packing;
+pub mod merge_blocks;
+pub mod name_section;
+pub mod pure_call_elim;
+pub mod remove_unused_brs;
+pub mod reorder;
+pub mod reorder_locals;
+pub mod simplify_locals;
+pub mod source_map;
+pub mod strip;
+pub mod type_gc;
+pub mod unused_data;
+pub mod unused_elem;
+
+pub mod vacuum;
