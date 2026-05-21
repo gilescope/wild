@@ -4637,7 +4637,13 @@ fn can_export_symbol<'data, P: Platform>(
         return false;
     }
 
-    if let Some(export_list) = &resources.symbol_db.export_list
+    // `--dynamic-list` is restrictive only for executables. For shared
+    // libraries, ld and lld both export all global defined symbols by
+    // default; `--dynamic-list` is used for `-Bsymbolic` binding control
+    // rather than gating dynsym contents. Matching that here keeps the
+    // wild-vs-ld diff clean on `-shared` outputs that pass the flag.
+    if !resources.symbol_db.output_kind.is_shared_object()
+        && let Some(export_list) = &resources.symbol_db.export_list
         && let Ok(symbol_name) = resources.symbol_db.symbol_name(symbol_id)
         && !&export_list.contains(&UnversionedSymbolName::prehashed(symbol_name.bytes()))
     {
