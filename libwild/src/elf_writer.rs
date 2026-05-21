@@ -1980,7 +1980,9 @@ fn write_symbols<'data>(
             let section_id =
                 if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
                     match &object.sections[section_index.0] {
-                        SectionSlot::Loaded(section) => section.output_section_id(),
+                        SectionSlot::Loaded(section) | SectionSlot::LoadedDebugInfo(section) => {
+                            section.output_section_id()
+                        }
                         SectionSlot::MergeStrings(section) => section.part_id.output_section_id(),
                         SectionSlot::FrameData(..) => output_section_id::EH_FRAME,
                         _ => bail!(
@@ -4047,7 +4049,10 @@ fn get_symbol_attributes(layout: &ElfLayout, symbol_id: SymbolId) -> Result<(u32
                         .sections
                         .get(section_index.0)
                         .and_then(|slot| match slot {
-                            SectionSlot::Loaded(section) => Some(section.output_section_id()),
+                            SectionSlot::Loaded(section)
+                            | SectionSlot::LoadedDebugInfo(section) => {
+                                Some(section.output_section_id())
+                            }
                             SectionSlot::MergeStrings(section) => {
                                 Some(section.part_id.output_section_id())
                             }
@@ -4263,7 +4268,9 @@ fn write_regular_object_dynamic_symbol_definition<'data>(
     let name = sym_def.name;
     if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
         let output_section_id = match &object.sections[section_index.0] {
-            SectionSlot::Loaded(section) => section.output_section_id(),
+            SectionSlot::Loaded(section) | SectionSlot::LoadedDebugInfo(section) => {
+                section.output_section_id()
+            }
             SectionSlot::MergeStrings(merge_section) => merge_section.part_id.output_section_id(),
             _ => bail!(
                 "Internal error: Defined symbols should always be for a loaded or merge-strings section"

@@ -217,7 +217,9 @@ pub(crate) fn get_or_compute(
     Ok(bytes)
 }
 
-#[cfg(test)]
+// wasi can't host `tempfile::tempdir()` (`std::env::temp_dir` panics there).
+// The whole module relies on tempfile-backed cache dirs.
+#[cfg(all(test, not(target_os = "wasi")))]
 mod tests {
     use super::*;
 
@@ -263,8 +265,6 @@ mod tests {
         assert!(key.filename().to_ascii_lowercase().ends_with(".obj"));
     }
 
-    // wasi can't host `tempfile::tempdir()` (panics in `std::env::temp_dir`).
-    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn get_miss_returns_none_and_does_not_create_the_dir() {
         let td = tempfile::tempdir().unwrap();
@@ -335,7 +335,6 @@ mod tests {
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
-    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn env_override_wins_over_cargo_target_dir() {
         let td_env = tempfile::tempdir().unwrap();
@@ -354,7 +353,6 @@ mod tests {
         assert_eq!(resolved, td_env.path());
     }
 
-    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn cargo_target_dir_used_when_no_explicit_override() {
         let td = tempfile::tempdir().unwrap();
