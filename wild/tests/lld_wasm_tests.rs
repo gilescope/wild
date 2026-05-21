@@ -929,6 +929,14 @@ fn collect_tests(tests: &mut Vec<libtest_mimic::Trial>) {
 fn main() {
     let mut tests = Vec::new();
     collect_tests(&mut tests);
-    let args = libtest_mimic::Arguments::from_args();
+    let mut args = libtest_mimic::Arguments::from_args();
+    // Cap parallelism: each test spawns multiple sh+llvm-mc+wild+obj2yaml+FileCheck
+    // child processes. On the ARM ubuntu:25.10 `--features plugins` CI lane the
+    // default `available_parallelism * subprocesses` was tripping container-level
+    // limits, surfacing as `Command::output()` returning ENOENT before `sh` ran.
+    // Leave the user's `--test-threads` override in place when set explicitly.
+    if args.test_threads.is_none() {
+        args.test_threads = Some(4);
+    }
     libtest_mimic::run(&args, tests).exit();
 }
