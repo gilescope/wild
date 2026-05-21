@@ -685,6 +685,77 @@ fn rewrite_command(line: &str, ctx: &TestContext) -> String {
     result
 }
 
+/// Read the ELF `PT_INTERP` (dynamic loader path) from an ELF file's
+/// raw bytes. Returns None for non-ELF or malformed inputs. Only used
+/// by the spawn-failure diagnostic path, so it parses just enough of
+/// the headers to find the interpreter and is intentionally minimal.
+fn read_pt_interp(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    let is_64 = bytes[4] == 2;
+    let little = bytes[5] == 1;
+    let read_u16 = |o: usize| -> u16 {
+        let b = [bytes[o], bytes[o + 1]];
+        if little {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        }
+    };
+    let read_u32 = |o: usize| -> u32 {
+        let b = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+        if little {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        }
+    };
+    let read_u64 = |o: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[o..o + 8]);
+        if little {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        }
+    };
+    let (ph_off, ph_entsize, ph_num) = if is_64 {
+        (
+            read_u64(32) as usize,
+            read_u16(54) as usize,
+            read_u16(56) as usize,
+        )
+    } else {
+        (
+            read_u32(28) as usize,
+            read_u16(42) as usize,
+            read_u16(44) as usize,
+        )
+    };
+    for i in 0..ph_num {
+        let off = ph_off + i * ph_entsize;
+        if off + ph_entsize > bytes.len() {
+            return None;
+        }
+        let p_type = read_u32(off);
+        if p_type != 3 {
+            continue; // PT_INTERP = 3
+        }
+        let (p_offset, p_filesz) = if is_64 {
+            (read_u64(off + 8) as usize, read_u64(off + 32) as usize)
+        } else {
+            (read_u32(off + 4) as usize, read_u32(off + 16) as usize)
+        };
+        if p_offset + p_filesz > bytes.len() || p_filesz == 0 {
+            return None;
+        }
+        let end = p_offset + p_filesz - 1; // strip trailing NUL
+        return Some(String::from_utf8_lossy(&bytes[p_offset..end]).into_owned());
+    }
+    None
+}
+
 /// Run a single test: execute each RUN line as a shell command.
 fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
     let content = std::fs::read_to_string(test_path).map_err(|e| format!("read: {e}"))?;
@@ -762,61 +833,74 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
             }
         }
 
-        // Retry posix_spawn on ENOENT: observed flake on ubuntu:25.10
-        // ARM containers under `--features plugins` (which doubles the
-        // workspace's parallel test count) — `Command::output()` can
-        // return ENOENT before sh actually runs when the per-thread
-        // pipe-fd budget is exhausted during the fork/exec dance.
-        // Reading `sh` always exists in PATH; tests that genuinely
-        // need a non-existent `current_dir` would fail deterministically.
-        //
-        // Use the absolute `/bin/sh` so a sanitised/empty `PATH` in
-        // the test child can't surface as ENOENT for the interpreter
-        // itself (observed across all 113 non-ignored tests on one
-        // linux lane). Fall back to `/usr/bin/sh` then bare `sh` so
-        // a divergent filesystem layout still works.
-        let sh_path = ["/bin/sh", "/usr/bin/sh", "sh"]
-            .iter()
-            .find(|p| !p.starts_with('/') || std::path::Path::new(p).exists())
-            .copied()
-            .unwrap_or("/bin/sh");
+        // Try a list of shells in order — on the AArch64 ubuntu:25.10
+        // workspace lane, `/bin/sh` exec's ENOENT despite `Path::exists`
+        // returning true (classic missing-interpreter symptom). Falling
+        // through to alternates means we don't have to diagnose the
+        // root cause to keep CI green.
         let output = {
-            let mut attempt = 0;
-            loop {
-                let mut cmd = Command::new(sh_path);
-                cmd.args(["-c", &shell_cmd]);
-                if let Some(d) = &current_cwd {
-                    cmd.current_dir(d);
-                }
-                match cmd.output() {
-                    Ok(o) => break o,
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::NotFound
-                            && attempt < 5
-                            && current_cwd.as_ref().is_none_or(|d| d.is_dir()) =>
-                    {
-                        attempt += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
-                        continue;
-                    }
-                    Err(e) => {
-                        // Diagnostic dump — every test failing with ENOENT
-                        // means something structural; surface enough to
-                        // tell whether sh is missing, the current_dir is
-                        // bogus, or the spawn budget is exhausted.
-                        let cwd_state = match &current_cwd {
-                            Some(d) => format!("Some({}) is_dir={}", d.display(), d.is_dir()),
-                            None => "None".to_string(),
-                        };
-                        let sh_exists = std::path::Path::new("/bin/sh").exists();
-                        let usr_sh_exists = std::path::Path::new("/usr/bin/sh").exists();
-                        let pid = std::process::id();
-                        return Err(format!(
-                            "sh exec ({sh_path}): {e} kind={:?} cwd={cwd_state} /bin/sh={sh_exists} /usr/bin/sh={usr_sh_exists} pid={pid} cmd={shell_cmd:.180}",
-                            e.kind()
-                        ));
+            let candidates = ["/bin/sh", "/bin/dash", "/bin/bash", "/usr/bin/sh", "sh"];
+            let mut last_err: Option<(String, std::io::Error)> = None;
+            'shell: loop {
+                for &sh in &candidates {
+                    let mut attempt = 0;
+                    loop {
+                        let mut cmd = Command::new(sh);
+                        cmd.args(["-c", &shell_cmd]);
+                        if let Some(d) = &current_cwd {
+                            cmd.current_dir(d);
+                        }
+                        match cmd.output() {
+                            Ok(o) => break 'shell o,
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::NotFound
+                                    && attempt < 3
+                                    && current_cwd.as_ref().is_none_or(|d| d.is_dir()) =>
+                            {
+                                attempt += 1;
+                                std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+                                continue;
+                            }
+                            Err(e) => {
+                                last_err = Some((sh.to_string(), e));
+                                break;
+                            }
+                        }
                     }
                 }
+                // None of the candidates worked — bail with a rich diagnostic.
+                let (failing, err) = last_err.expect("at least one candidate tried");
+                let cwd_state = match &current_cwd {
+                    Some(d) => format!("Some({}) is_dir={}", d.display(), d.is_dir()),
+                    None => "None".to_string(),
+                };
+                // Sanity: can we exec ANYTHING at all? Try /bin/true.
+                let true_works = Command::new("/bin/true").output().is_ok();
+                // Read /bin/sh's ELF interpreter — if its dynamic linker
+                // is gone, exec ENOENTs even though stat succeeds.
+                let sh_interp = std::fs::read("/bin/sh")
+                    .ok()
+                    .and_then(|bytes| read_pt_interp(&bytes))
+                    .unwrap_or_else(|| "<unread>".to_string());
+                let interp_exists = std::path::Path::new(&sh_interp).exists();
+                // Resource state — fd/proc exhaustion shows up here.
+                let status_excerpt = std::fs::read_to_string("/proc/self/status")
+                    .map(|s| {
+                        s.lines()
+                            .filter(|l| {
+                                l.starts_with("Threads:")
+                                    || l.starts_with("FDSize:")
+                                    || l.starts_with("VmRSS:")
+                                    || l.starts_with("Pid:")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_else(|_| "<no /proc>".to_string());
+                return Err(format!(
+                    "sh exec ({failing}): {err} kind={:?} cwd={cwd_state} /bin/true={true_works} sh_interp={sh_interp} interp_exists={interp_exists} {status_excerpt} cmd={shell_cmd:.140}",
+                    err.kind()
+                ));
             }
         };
 
