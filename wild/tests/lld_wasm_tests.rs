@@ -377,7 +377,7 @@ const KNOWN_PASSING: &[&str] = &[
 /// them. Locally (where the LLVM tools are installed system-wide) the
 /// `KNOWN_PASSING_LTO` override would re-enable these — re-add the
 /// stems below if you want to exercise them on a developer machine.
-const KNOWN_PASSING_LTO: &[&str] = &["incompatible", "import-attributes"];
+const KNOWN_PASSING_LTO: &[&str] = &[];
 
 /// Check if this test should be skipped entirely.
 fn should_skip(content: &str, path: &Path) -> bool {
