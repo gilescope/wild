@@ -300,7 +300,10 @@ jobs:
       matrix:
         check: ${{ fromJson(needs.calc-matrix.outputs.matrix) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # `nix build .#checks.x86_64-linux.wild` consistently runs ~9 min
+    # on a warm-ish cache and was nudging over the previous 10 min cap.
+    # 20 gives comfortable headroom for cache-restore variance.
+    timeout-minutes: 20
     name: Nix/${{ matrix.check }}
 
     steps:
