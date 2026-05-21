@@ -936,7 +936,13 @@ fn main() {
     // limits, surfacing as `Command::output()` returning ENOENT before `sh` ran.
     // Leave the user's `--test-threads` override in place when set explicitly.
     if args.test_threads.is_none() {
-        args.test_threads = Some(4);
+        // Sledgehammer for the ubuntu:25.10 ARM `--features plugins` lane:
+        // even capped to 4 threads, `sh` posix_spawn was returning ENOENT
+        // on a deterministic-ish set of ~10 tests. Serialise lld-wasm tests
+        // for now; revisit once we understand the root cause (likely an
+        // fd / pipe / process limit specific to the plugin-feature build's
+        // libloading runtime on this lane's container).
+        args.test_threads = Some(1);
     }
     libtest_mimic::run(&args, tests).exit();
 }
