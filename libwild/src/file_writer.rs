@@ -453,14 +453,17 @@ impl SizedOutput {
         // allocated (Mach-O reserves trailing space for the codesign
         // blob). Dropping the mmap before `ftruncate` avoids kernel
         // refusals on actively-mapped files.
+        //
+        // `set_len` on a non-truncatable target — `/dev/null`, a pipe,
+        // a character device — returns EINVAL; treat that like the
+        // `make_executable` call below and shrug it off, since the
+        // user-visible bytes still got written.
         if let Some(n) = final_size {
             drop(std::mem::replace(
                 &mut self.out,
                 OutputBuffer::InMemory(Vec::new()),
             ));
-            self.file
-                .set_len(n)
-                .with_context(|| format!("truncate {}", self.path.display()))?;
+            let _ = self.file.set_len(n);
         }
 
         // Making the file executable is best-effort only. For example if we're writing to a pipe or

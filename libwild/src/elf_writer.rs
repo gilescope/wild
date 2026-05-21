@@ -1985,6 +1985,8 @@ fn write_symbols<'data>(
                         }
                         SectionSlot::MergeStrings(section) => section.part_id.output_section_id(),
                         SectionSlot::FrameData(..) => output_section_id::EH_FRAME,
+                        SectionSlot::NoteGnuProperty(..) => output_section_id::NOTE_GNU_PROPERTY,
+                        SectionSlot::RiscvVAttributes(..) => output_section_id::RISCV_ATTRIBUTES,
                         _ => bail!(
                             "Tried to copy a symbol in a section we didn't load. {}",
                             layout.symbol_debug(symbol_id)
