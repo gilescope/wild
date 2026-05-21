@@ -773,11 +773,17 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
         // Use the absolute `/bin/sh` so a sanitised/empty `PATH` in
         // the test child can't surface as ENOENT for the interpreter
         // itself (observed across all 113 non-ignored tests on one
-        // linux lane).
+        // linux lane). Fall back to `/usr/bin/sh` then bare `sh` so
+        // a divergent filesystem layout still works.
+        let sh_path = ["/bin/sh", "/usr/bin/sh", "sh"]
+            .iter()
+            .find(|p| !p.starts_with('/') || std::path::Path::new(p).exists())
+            .copied()
+            .unwrap_or("/bin/sh");
         let output = {
             let mut attempt = 0;
             loop {
-                let mut cmd = Command::new("/bin/sh");
+                let mut cmd = Command::new(sh_path);
                 cmd.args(["-c", &shell_cmd]);
                 if let Some(d) = &current_cwd {
                     cmd.current_dir(d);
@@ -793,7 +799,23 @@ fn run_wasm_test(ctx: &TestContext, test_path: &Path) -> Result<(), String> {
                         std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
                         continue;
                     }
-                    Err(e) => return Err(format!("sh exec: {e}")),
+                    Err(e) => {
+                        // Diagnostic dump — every test failing with ENOENT
+                        // means something structural; surface enough to
+                        // tell whether sh is missing, the current_dir is
+                        // bogus, or the spawn budget is exhausted.
+                        let cwd_state = match &current_cwd {
+                            Some(d) => format!("Some({}) is_dir={}", d.display(), d.is_dir()),
+                            None => "None".to_string(),
+                        };
+                        let sh_exists = std::path::Path::new("/bin/sh").exists();
+                        let usr_sh_exists = std::path::Path::new("/usr/bin/sh").exists();
+                        let pid = std::process::id();
+                        return Err(format!(
+                            "sh exec ({sh_path}): {e} kind={:?} cwd={cwd_state} /bin/sh={sh_exists} /usr/bin/sh={usr_sh_exists} pid={pid} cmd={shell_cmd:.180}",
+                            e.kind()
+                        ));
+                    }
                 }
             }
         };
