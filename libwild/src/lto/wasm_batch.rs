@@ -179,7 +179,8 @@ fn run(tool: &Path, cmd: &mut Command, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// Tests build scratch dirs via tempfile; wasi has no `std::env::temp_dir`.
+#[cfg(all(test, not(target_os = "wasi")))]
 mod tests {
     use super::*;
 

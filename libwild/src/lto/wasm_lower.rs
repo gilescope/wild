@@ -107,7 +107,8 @@ pub(crate) fn lower_to_wasm_object_file(
     Ok(out)
 }
 
-#[cfg(test)]
+// Tests build scratch dirs via tempfile; wasi has no `std::env::temp_dir`.
+#[cfg(all(test, not(target_os = "wasi")))]
 mod tests {
     use super::*;
 

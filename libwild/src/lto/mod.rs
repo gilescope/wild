@@ -295,7 +295,8 @@ pub(crate) trait LtoDriver<P: Platform>: Send + Sync {
     fn handles(&self, ir: Ir) -> bool;
 }
 
-#[cfg(test)]
+// Tests build scratch dirs via tempfile; wasi has no `std::env::temp_dir`.
+#[cfg(all(test, not(target_os = "wasi")))]
 mod tests {
     use super::*;
 
