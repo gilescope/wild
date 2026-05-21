@@ -495,6 +495,9 @@ mod tests {
         }
     }
 
+    // wasi has no HOME / XDG_CACHE_HOME, so `cache_dir()` returns None and
+    // the `assert_ne!(a, b)` below blows up (both are None).
+    #[cfg(not(target_os = "wasi"))]
     #[test]
     fn sdk_cache_path_stable_per_sysroot() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

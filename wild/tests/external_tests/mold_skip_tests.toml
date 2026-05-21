@@ -3,14 +3,14 @@ reason = "These tests use unsupported options"
 tests = [
   "audit.sh",
   "color-diagnostics.sh",
-  "compress-debug-sections-zstd.sh",   # Compressed debug sections support #493
+  # "compress-debug-sections-zstd.sh", — now passes (CI confirmed via expect_failure regression).
   "compress-debug-sections.sh",        # Compressed debug sections support #493
   "default-symver-version-script.sh",
   "default-symver.sh",
   "depaudit.sh",
   "depaudit2.sh",
   "dynamic-list-data.sh",
-  "dynamic-list4.sh",                  # --dynamic-list on `-shared` outputs; wild reports `Undefined symbol print` because b.so localises symbols not on the list, while mold/ld still resolve them when referenced via `-no-as-needed`.
+  # "dynamic-list4.sh", — now passes (the `--dynamic-list` on `-shared` divergence is fixed in libwild/src/layout.rs).
   "emit-relocs-cpp.sh",
   "emit-relocs-dead-sections.sh",
   "emit-relocs.sh",
@@ -28,7 +28,7 @@ tests = [
   "oformat-binary.sh",
   "omagic.sh",
   "package-metadata.sh",
-  "relocatable-debug-info.sh",
+  # "relocatable-debug-info.sh", — now passes (LoadedDebugInfo handling in elf_writer).
   "relocatable-exception.sh",
   "relocatable-merge-sections.sh",
   "repro.sh",                          # Note in this test's second half that it uses a custom environment variable called `MOLD_REPRO`. While Wild currently doesn't support `--repro`, it will eventually be moved to the "ignore" group once support is added.
@@ -178,13 +178,13 @@ tests = [
   "run-clang.sh",                   # This test checks the comment section to verify if it's linked with mold.
   "start-lib.sh",                   # Passes when `--no-gc-sections` is passed.
   "stdout.sh",
-  "undefined.sh",                   # Passes when `--no-gc-sections` is passed.
-  "undefined2.sh",                  # Passes when `--no-gc-sections` is passed.
+  # "undefined.sh", — now passes.
+  # "undefined2.sh", — now passes.
   "unresolved-symbols.sh",          # Different message formats
   "verbose.sh",
   "version.sh",                     # The message of `--version` is different from mold's one.
   "warn-unresolved-symbols.sh",     # Different message formats
-  "whole-archive.sh",               # Passes when `--no-gc-sections` is passed.
+  # "whole-archive.sh", — now passes.
   "z-defs.sh",                      # Different message formats
   "exception-multiple-ehframe.sh",  # Support handling multiple .eh_frame sections.
 ]
