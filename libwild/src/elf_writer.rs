@@ -195,7 +195,7 @@ pub(crate) fn write<'data, A: Arch<Platform = Elf>>(
     // `--compress-debug-sections=zstd` post-pass. No-op when the
     // flag wasn't set. Runs after build-id so the ELF is otherwise
     // final; rewrites SHDR offsets + e_shoff and shortens the file.
-    crate::elf_compress::compress_debug_sections(
+    crate::compression::compress_debug_sections(
         sized_output,
         layout.args().compress_debug_sections,
     )?;

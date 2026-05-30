@@ -14,7 +14,7 @@ pub(crate) mod eh_frame;
 pub(crate) mod elf;
 pub(crate) mod elf_aarch64;
 pub(crate) mod elf_abbrev_dedup;
-pub(crate) mod elf_compress;
+pub(crate) mod compression;
 pub(crate) mod elf_line_v5;
 pub(crate) mod elf_loongarch64;
 pub(crate) mod elf_riscv64;
@@ -102,7 +102,7 @@ pub(crate) mod value_flags;
 pub(crate) mod verification;
 pub(crate) mod version_script;
 pub(crate) mod wasm;
-pub(crate) mod wasm_arch;
+pub(crate) mod wasm_wasm32;
 pub(crate) mod wasm_writer;
 
 use crate::elf::Elf;

@@ -856,7 +856,7 @@ impl platform::Platform for Wasm {
         linker: &'data crate::Linker,
         args: &'data Self::Args,
     ) -> crate::error::Result<crate::LinkerOutput<'data>> {
-        linker.link_for_arch::<Wasm, crate::wasm_arch::WasmArch>(args)
+        linker.link_for_arch::<Wasm, crate::wasm_wasm32::WasmWasm32>(args)
     }
 
     fn write_output_file<'data, A: platform::Arch<Platform = Self>>(
