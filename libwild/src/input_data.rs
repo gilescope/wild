@@ -620,7 +620,7 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
         let kind = FileKind::identify_bytes(&data.bytes)?;
 
         match kind {
-            FileKind::FatBinary => {
+            FileKind::FatMachOObject => {
                 // TODO: Extract arm64 slice from universal binary.
                 // For now, skip fat binaries (e.g. libclang_rt.osx.a).
                 Ok(LoadedFileState::Archive(input_file, Vec::new()))

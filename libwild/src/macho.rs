@@ -14,7 +14,7 @@ use object::read::macho::Nlist;
 use object::read::macho::Section as MachOSectionTrait;
 use object::read::macho::Segment as MachOSegmentTrait;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
 
 const LE: Endianness = Endianness::Little;

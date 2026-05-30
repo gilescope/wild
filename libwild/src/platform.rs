@@ -171,7 +171,9 @@ pub(crate) struct RelaxSymbolInfo {
 }
 
 /// A platform for which we support writing producing linked outputs.
-pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'static {
+pub(crate) trait Platform:
+    Copy + Send + Sync + Sized + Default + std::fmt::Debug + 'static
+{
     type File<'data>: ObjectFile<'data, Platform = Self>;
     type SymtabEntry: Symbol;
     type SectionHeader: SectionHeader;

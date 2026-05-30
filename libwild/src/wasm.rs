@@ -5,7 +5,7 @@ use crate::OutputKind;
 use crate::args::wasm::WasmArgs;
 use crate::platform;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct Wasm;
 
 // --- Sub-types ---
