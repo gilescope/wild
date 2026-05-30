@@ -67,8 +67,11 @@ pub(crate) trait Arch: Send + Sync + 'static {
     /// Write PLT entry for the architecture.
     fn write_plt_entry(plt_entry: &mut [u8], got_address: u64, plt_address: u64) -> Result;
 
-    /// Make architecture-specific parsing of the relocation types.
-    fn relocation_from_raw(r_type: u32) -> Result<RelocationKindInfo>;
+    /// Make architecture-specific parsing of the relocation types. The raw descriptor type
+    /// is platform-defined (`Platform::RelocationInfo`); for ELF/Wasm it is `u32`.
+    fn relocation_from_raw(
+        r_type: <Self::Platform as Platform>::RelocationInfo,
+    ) -> Result<RelocationKindInfo>;
 
     /// Get string representation of a relocation specific for the architecture.
     fn rel_type_to_string(r_type: u32) -> Cow<'static, str>;
@@ -184,6 +187,12 @@ pub(crate) trait Platform:
     type ProgramSegmentDef: ProgramSegmentDef<Platform = Self>;
     type BuiltInSectionDetails: BuiltInSectionDetails;
     type RelocationSections: std::fmt::Debug + Default + Send + Sync + 'static;
+    /// The raw, architecture-specific relocation descriptor passed to
+    /// `Arch::relocation_from_raw`. ELF and Wasm use a plain `u32` relocation-type code;
+    /// Mach-O will eventually use `object::macho::RelocationInfo` (it carries `r_length` /
+    /// `r_pcrel`). Matches upstream's Platform shape so the merge doesn't conflict on the
+    /// `relocation_from_raw` signature.
+    type RelocationInfo: Copy + Send + Sync + 'static;
     type DynamicEntry: Send + Sync + 'static;
     type DynamicSymbolDefinitionExt: Copy + Send + Sync + std::fmt::Debug + 'static;
     type NonAddressableIndexes: NonAddressableIndexes + Send + Sync + 'static;

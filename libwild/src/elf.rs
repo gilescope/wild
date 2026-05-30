@@ -308,6 +308,7 @@ impl platform::Platform for Elf {
     type ProgramSegmentDef = ProgramSegmentDef;
     type BuiltInSectionDetails = BuiltInSectionDetails;
     type RelocationSections = RelocationSections;
+    type RelocationInfo = u32;
     type DynamicEntry = DynamicEntry;
     type DynamicSymbolDefinitionExt = DynamicSymbolDefinitionExt;
     type LayoutExt = LayoutExt;
