@@ -211,7 +211,9 @@ pub(crate) trait Platform:
     /// Format-specific properties produced by the layout phase.
     type LayoutExt: Send + Sync + 'static;
 
-    type SectionIterator<'data>: Iterator<Item = &'data Self::SectionHeader>;
+    type SectionIterator<'a>: Iterator<Item = &'a Self::SectionHeader>
+    where
+        Self: 'a;
     type DynamicTagValues<'data>: DynamicTagValues<'data>;
     type RelocationList<'data>: RelocationList<'data>;
     type DynamicLayoutStateExt<'data>: Default + Send + Sync + 'data;
