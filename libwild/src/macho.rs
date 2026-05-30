@@ -3135,6 +3135,9 @@ impl platform::Platform for MachO {
     type ProgramSegmentDef = ProgramSegmentDef;
     type BuiltInSectionDetails = BuiltInSectionDetails;
     type RelocationSections = ();
+    // u32 for now (matches our relocation_from_raw(r_type: u32) impl). Upstream uses
+    // object::macho::RelocationInfo here; that switch belongs with the macho reader reshape.
+    type RelocationInfo = u32;
     type DynamicEntry = ();
     type DynamicSymbolDefinitionExt = ();
     type NonAddressableIndexes = NonAddressableIndexes;
