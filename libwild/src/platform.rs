@@ -789,6 +789,38 @@ pub(crate) trait Platform:
         _total_sizes: &mut OutputSectionPartMap<u64>,
     ) {
     }
+
+    /// Allocates output space for any thunk symbols this platform emits. Default: none.
+    /// Added to match upstream's Platform shape (range-extension thunks); platforms that
+    /// don't (yet) emit thunk symbols inherit the empty default. Not yet called on our
+    /// side — present so the eventual upstream merge is a no-op here, not a conflict.
+    #[allow(dead_code)]
+    fn allocate_thunk_symbol_sizes(
+        _sizes: &mut OutputSectionPartMap<u64>,
+        _symbols: &[SymbolId],
+        _symbol_db: &SymbolDb<Self>,
+    ) {
+    }
+
+    /// Extra bytes to extend the last part of a record by. Default: none.
+    /// Added to match upstream's Platform shape. Not yet called on our side.
+    #[allow(dead_code)]
+    fn last_part_size_to_extend(
+        _record: &OutputRecordLayout,
+        _last_part_id: PartId,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Optionally compress debug sections after layout. Default: no-op.
+    /// Added to match upstream's Platform shape; our ELF compression runs from the
+    /// writer (see `compression`), so the default is sufficient here. Not yet called.
+    #[allow(dead_code)]
+    fn maybe_compress_debug_sections<'data, A: Arch<Platform = Self>>(
+        _layout: &mut Layout<'data, Self>,
+    ) -> Result {
+        Ok(())
+    }
 }
 
 /// Abstracts over the different object file formats that we support (or may support). e.g. ELF.
