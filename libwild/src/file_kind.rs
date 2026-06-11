@@ -18,14 +18,15 @@ pub(crate) enum FileKind {
     ElfObject,
     ElfDynamic,
     MachOObject,
+    // OURS-extra: upstream has no Mach-O dylib support yet, so it lacks this variant.
     MachODylib,
-    FatBinary,
+    FatMachOObject,
+    WasmObject,
     Archive,
     ThinArchive,
     Text,
     LlvmIr,
     GccIr,
-    WasmObject,
 }
 
 impl FileKind {
@@ -84,8 +85,12 @@ impl FileKind {
         {
             // Mach-O universal (fat) binary. Currently not fully supported.
             // TODO: extract the arm64 slice and process it.
-            Ok(FileKind::FatBinary)
+            // OURS-extra: we also recognise FAT_MAGIC_64 (64-bit fat); upstream only
+            // checks the 32-bit FAT_MAGIC/FAT_CIGAM pair.
+            Ok(FileKind::FatMachOObject)
         } else if bytes.starts_with(b"\0asm") {
+            // Wasm binary magic number is `\0asm` followed by a 4-byte version.
+            ensure!(bytes.len() >= 8, "Invalid Wasm file (too short)");
             Ok(FileKind::WasmObject)
         } else if bytes.is_ascii() {
             Ok(FileKind::Text)
@@ -111,7 +116,7 @@ fn is_gcc_bitcode(data: &[u8], header: &crate::elf::FileHeader) -> Option<bool> 
     // If we don't have plugin support, then we skip checking if the file contains GCC IR. If it is,
     // then we'll figure that out later on and report an error. We do this because this code has a
     // measurable performance impact.
-    if !cfg!(feature = "plugins") {
+    if !cfg!(all(feature = "plugins", unix)) {
         return Some(false);
     }
     let e = LittleEndian;
@@ -137,13 +142,13 @@ impl std::fmt::Display for FileKind {
             FileKind::ElfDynamic => "ELF dynamic",
             FileKind::MachOObject => "MachO object",
             FileKind::MachODylib => "MachO dylib",
-            FileKind::FatBinary => "fat binary",
+            FileKind::FatMachOObject => "Fat MachO",
+            FileKind::WasmObject => "Wasm object",
             FileKind::Archive => "archive",
             FileKind::ThinArchive => "thin archive",
             FileKind::Text => "text",
             FileKind::LlvmIr => "LLVM-IR",
             FileKind::GccIr => "GCC-IR",
-            FileKind::WasmObject => "WASM object",
         };
         std::fmt::Display::fmt(s, f)
     }

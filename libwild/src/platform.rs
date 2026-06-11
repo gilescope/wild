@@ -67,8 +67,11 @@ pub(crate) trait Arch: Send + Sync + 'static {
     /// Write PLT entry for the architecture.
     fn write_plt_entry(plt_entry: &mut [u8], got_address: u64, plt_address: u64) -> Result;
 
-    /// Make architecture-specific parsing of the relocation types.
-    fn relocation_from_raw(r_type: u32) -> Result<RelocationKindInfo>;
+    /// Make architecture-specific parsing of the relocation types. The raw descriptor type
+    /// is platform-defined (`Platform::RelocationInfo`); for ELF/Wasm it is `u32`.
+    fn relocation_from_raw(
+        r_type: <Self::Platform as Platform>::RelocationInfo,
+    ) -> Result<RelocationKindInfo>;
 
     /// Get string representation of a relocation specific for the architecture.
     fn rel_type_to_string(r_type: u32) -> Cow<'static, str>;
@@ -171,7 +174,9 @@ pub(crate) struct RelaxSymbolInfo {
 }
 
 /// A platform for which we support writing producing linked outputs.
-pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'static {
+pub(crate) trait Platform:
+    Copy + Send + Sync + Sized + Default + std::fmt::Debug + 'static
+{
     type File<'data>: ObjectFile<'data, Platform = Self>;
     type SymtabEntry: Symbol;
     type SectionHeader: SectionHeader;
@@ -182,6 +187,12 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     type ProgramSegmentDef: ProgramSegmentDef<Platform = Self>;
     type BuiltInSectionDetails: BuiltInSectionDetails;
     type RelocationSections: std::fmt::Debug + Default + Send + Sync + 'static;
+    /// The raw, architecture-specific relocation descriptor passed to
+    /// `Arch::relocation_from_raw`. ELF and Wasm use a plain `u32` relocation-type code;
+    /// Mach-O will eventually use `object::macho::RelocationInfo` (it carries `r_length` /
+    /// `r_pcrel`). Matches upstream's Platform shape so the merge doesn't conflict on the
+    /// `relocation_from_raw` signature.
+    type RelocationInfo: Copy + Send + Sync + 'static;
     type DynamicEntry: Send + Sync + 'static;
     type DynamicSymbolDefinitionExt: Copy + Send + Sync + std::fmt::Debug + 'static;
     type NonAddressableIndexes: NonAddressableIndexes + Send + Sync + 'static;
@@ -200,7 +211,9 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
     /// Format-specific properties produced by the layout phase.
     type LayoutExt: Send + Sync + 'static;
 
-    type SectionIterator<'data>: Iterator<Item = &'data Self::SectionHeader>;
+    type SectionIterator<'a>: Iterator<Item = &'a Self::SectionHeader>
+    where
+        Self: 'a;
     type DynamicTagValues<'data>: DynamicTagValues<'data>;
     type RelocationList<'data>: RelocationList<'data>;
     type DynamicLayoutStateExt<'data>: Default + Send + Sync + 'data;
@@ -787,6 +800,38 @@ pub(crate) trait Platform: Copy + Send + Sync + Sized + std::fmt::Debug + 'stati
         _total_sizes: &mut OutputSectionPartMap<u64>,
     ) {
     }
+
+    /// Allocates output space for any thunk symbols this platform emits. Default: none.
+    /// Added to match upstream's Platform shape (range-extension thunks); platforms that
+    /// don't (yet) emit thunk symbols inherit the empty default. Not yet called on our
+    /// side — present so the eventual upstream merge is a no-op here, not a conflict.
+    #[allow(dead_code)]
+    fn allocate_thunk_symbol_sizes(
+        _sizes: &mut OutputSectionPartMap<u64>,
+        _symbols: &[SymbolId],
+        _symbol_db: &SymbolDb<Self>,
+    ) {
+    }
+
+    /// Extra bytes to extend the last part of a record by. Default: none.
+    /// Added to match upstream's Platform shape. Not yet called on our side.
+    #[allow(dead_code)]
+    fn last_part_size_to_extend(
+        _record: &OutputRecordLayout,
+        _last_part_id: PartId,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Optionally compress debug sections after layout. Default: no-op.
+    /// Added to match upstream's Platform shape; our ELF compression runs from the
+    /// writer (see `compression`), so the default is sufficient here. Not yet called.
+    #[allow(dead_code)]
+    fn maybe_compress_debug_sections<'data, A: Arch<Platform = Self>>(
+        _layout: &mut Layout<'data, Self>,
+    ) -> Result {
+        Ok(())
+    }
 }
 
 /// Abstracts over the different object file formats that we support (or may support). e.g. ELF.
@@ -808,7 +853,7 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
     ) -> impl Iterator<
         Item = (
             object::SymbolIndex,
-            &'data <Self::Platform as Platform>::SymtabEntry,
+            &<Self::Platform as Platform>::SymtabEntry,
         ),
     > {
         self.symbols_iter()
@@ -816,14 +861,12 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
             .map(|(i, sym)| (object::SymbolIndex(i), sym))
     }
 
-    fn symbols_iter(
-        &self,
-    ) -> impl Iterator<Item = &'data <Self::Platform as Platform>::SymtabEntry>;
+    fn symbols_iter(&self) -> impl Iterator<Item = &<Self::Platform as Platform>::SymtabEntry>;
 
     fn symbol(
         &self,
         index: object::SymbolIndex,
-    ) -> Result<&'data <Self::Platform as Platform>::SymtabEntry>;
+    ) -> Result<&<Self::Platform as Platform>::SymtabEntry>;
 
     fn section_size(&self, header: &<Self::Platform as Platform>::SectionHeader) -> Result<u64>;
 
@@ -834,21 +877,21 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn num_sections(&self) -> usize;
 
-    fn section_iter(&self) -> <Self::Platform as Platform>::SectionIterator<'data>;
+    fn section_iter<'a>(&'a self) -> <Self::Platform as Platform>::SectionIterator<'a>;
 
     fn enumerate_sections(
         &self,
     ) -> impl Iterator<
         Item = (
             object::SectionIndex,
-            &'data <Self::Platform as Platform>::SectionHeader,
+            &<Self::Platform as Platform>::SectionHeader,
         ),
     >;
 
     fn section(
         &self,
         index: object::SectionIndex,
-    ) -> Result<&'data <Self::Platform as Platform>::SectionHeader>;
+    ) -> Result<&<Self::Platform as Platform>::SectionHeader>;
 
     fn section_by_name(
         &self,
@@ -898,7 +941,7 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn section_name(
         &self,
-        section_header: &'data <Self::Platform as Platform>::SectionHeader,
+        section_header: &<Self::Platform as Platform>::SectionHeader,
     ) -> Result<&'data [u8]>;
 
     /// Returns the raw section data. Doesn't handle decompression.

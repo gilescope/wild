@@ -166,7 +166,7 @@ pub(crate) type NoteHeader = object::elf::NoteHeader64<LittleEndian>;
 type SectionTable<'data> = object::read::elf::SectionTable<'data, FileHeader>;
 type SymbolTable<'data> = object::read::elf::SymbolTable<'data, FileHeader>;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct Elf;
 
 #[derive(derive_more::Debug)]
@@ -308,6 +308,7 @@ impl platform::Platform for Elf {
     type ProgramSegmentDef = ProgramSegmentDef;
     type BuiltInSectionDetails = BuiltInSectionDetails;
     type RelocationSections = RelocationSections;
+    type RelocationInfo = u32;
     type DynamicEntry = DynamicEntry;
     type DynamicSymbolDefinitionExt = DynamicSymbolDefinitionExt;
     type LayoutExt = LayoutExt;
@@ -2029,7 +2030,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         self.sections.section_by_name(LittleEndian, name.as_bytes())
     }
 
-    fn section_name(&self, section: &'data SectionHeader) -> Result<&'data [u8]> {
+    fn section_name(&self, section: &SectionHeader) -> Result<&'data [u8]> {
         Ok(self.sections.section_name(LittleEndian, section)?)
     }
 
@@ -2137,7 +2138,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         )
     }
 
-    fn symbol(&self, index: object::SymbolIndex) -> Result<&'data SymtabEntry> {
+    fn symbol(&self, index: object::SymbolIndex) -> Result<&SymtabEntry> {
         Ok(self.symbols.symbol(index)?)
     }
 
@@ -2224,13 +2225,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         None
     }
 
-    fn section_iter(&self) -> core::slice::Iter<'data, SectionHeader> {
+    fn section_iter(&self) -> core::slice::Iter<'_, SectionHeader> {
         self.sections.iter()
     }
 
-    fn enumerate_sections(
-        &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &'data SectionHeader)> {
+    fn enumerate_sections(&self) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections.enumerate()
     }
 
@@ -2299,7 +2298,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         })
     }
 
-    fn symbols_iter(&self) -> impl Iterator<Item = &'data SymtabEntry> {
+    fn symbols_iter(&self) -> impl Iterator<Item = &SymtabEntry> {
         self.symbols.iter()
     }
 

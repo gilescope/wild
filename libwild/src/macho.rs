@@ -14,7 +14,7 @@ use object::read::macho::Nlist;
 use object::read::macho::Section as MachOSectionTrait;
 use object::read::macho::Segment as MachOSegmentTrait;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
 
 const LE: Endianness = Endianness::Little;
@@ -1980,11 +1980,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         self.symbols.len()
     }
 
-    fn symbols_iter(&self) -> impl Iterator<Item = &'data SymtabEntry> {
+    fn symbols_iter(&self) -> impl Iterator<Item = &SymtabEntry> {
         self.symbols.iter()
     }
 
-    fn symbol(&self, index: object::SymbolIndex) -> crate::error::Result<&'data SymtabEntry> {
+    fn symbol(&self, index: object::SymbolIndex) -> crate::error::Result<&SymtabEntry> {
         self.symbols
             .symbol(index)
             .map_err(|e| error!("Symbol index {} out of range: {e}", index.0))
@@ -2010,12 +2010,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         }
     }
 
-    fn enumerate_sections(
-        &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &'data SectionHeader)> {
+    fn enumerate_sections(&self) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections.iter().enumerate().map(|(i, section)| {
             // Safety: SectionHeader is #[repr(transparent)] over Section64<Endianness>
-            let header: &'data SectionHeader = unsafe {
+            let header: &SectionHeader = unsafe {
                 &*(section as *const macho::Section64<Endianness> as *const SectionHeader)
             };
             (object::SectionIndex(i), header)
@@ -3135,6 +3133,9 @@ impl platform::Platform for MachO {
     type ProgramSegmentDef = ProgramSegmentDef;
     type BuiltInSectionDetails = BuiltInSectionDetails;
     type RelocationSections = ();
+    // u32 for now (matches our relocation_from_raw(r_type: u32) impl). Upstream uses
+    // object::macho::RelocationInfo here; that switch belongs with the macho reader reshape.
+    type RelocationInfo = u32;
     type DynamicEntry = ();
     type DynamicSymbolDefinitionExt = ();
     type NonAddressableIndexes = NonAddressableIndexes;

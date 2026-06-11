@@ -3,6 +3,7 @@ pub use args::Args;
 pub(crate) mod arch;
 pub(crate) mod archive;
 pub mod args;
+pub(crate) mod compression;
 #[cfg(unix)]
 pub mod daemon;
 pub mod daemon_protocol;
@@ -14,7 +15,6 @@ pub(crate) mod eh_frame;
 pub(crate) mod elf;
 pub(crate) mod elf_aarch64;
 pub(crate) mod elf_abbrev_dedup;
-pub(crate) mod elf_compress;
 pub(crate) mod elf_line_v5;
 pub(crate) mod elf_loongarch64;
 pub(crate) mod elf_riscv64;
@@ -102,7 +102,7 @@ pub(crate) mod value_flags;
 pub(crate) mod verification;
 pub(crate) mod version_script;
 pub(crate) mod wasm;
-pub(crate) mod wasm_arch;
+pub(crate) mod wasm_wasm32;
 pub(crate) mod wasm_writer;
 
 use crate::elf::Elf;
@@ -296,7 +296,7 @@ pub fn setup_tracing(args: &Args) -> Result<(), AlreadyInitialised> {
     } else {
         tracing_subscriber::registry()
             .with(fmt::layer())
-            .with(EnvFilter::from_default_env())
+            .with(EnvFilter::from_env("WILD_LOG"))
             .try_init()
             .map_err(|_| AlreadyInitialised)
     }

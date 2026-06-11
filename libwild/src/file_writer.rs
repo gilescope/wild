@@ -80,7 +80,7 @@ impl SizedOutput {
     /// `elf_line_v5` has shrunk the file), else the full allocated
     /// buffer length.
     ///
-    /// Used by downstream passes (e.g. `elf_compress`) that want to
+    /// Used by downstream passes (e.g. `compression`) that want to
     /// see only the valid bytes of the preceding pass, not the
     /// stale trailing bytes left in the mmap-backed buffer.
     pub(crate) fn effective_len(&self) -> usize {

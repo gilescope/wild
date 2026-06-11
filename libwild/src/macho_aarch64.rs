@@ -16,6 +16,16 @@ pub(crate) struct MachOAArch64;
 ///
 /// **Complexity:** Θ(1) CPU, Θ(1) memory — single integer match over
 /// a closed set of 11 ARM64 relocation type codes; no allocation.
+///
+/// Note on `mask`: every entry below sets `mask: None`, including the ADRP-family
+/// PAGE21 relocations — unlike the ELF path (`linker-utils/src/aarch64.rs`), where
+/// `R_AARCH64_ADR_PREL_PG_HI21` carries `Some(PageMask::SymbolPlusAddendAndPosition)`.
+/// This is deliberate, not a gap: the `RelocationKindInfo.mask` field is only read by
+/// the ELF writer (`elf_writer.rs` → `get_page_mask`). The Mach-O writer
+/// (`macho_writer.rs`) never consults it — it does its own page-delta masking inline
+/// (`addr & !0xFFF`, `>> 12`, immhi/immlo packing). So a value here would be dead
+/// config. Don't "fix" it to match ELF/upstream without first making the Mach-O
+/// writer actually consume `mask`.
 fn macho_aarch64_relocation_from_raw(r_type: u32) -> Option<RelocationKindInfo> {
     let (kind, size, range, alignment) = match r_type as u8 {
         macho::ARM64_RELOC_UNSIGNED => (

@@ -7,7 +7,7 @@ use linker_utils::elf::RelocationKindInfo;
 use linker_utils::elf::RelocationSize;
 use linker_utils::relaxation::RelocationModifier;
 
-pub(crate) struct WasmArch;
+pub(crate) struct WasmWasm32;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Relaxation;
@@ -39,7 +39,7 @@ impl crate::platform::Relaxation for Relaxation {
     }
 }
 
-impl crate::platform::Arch for WasmArch {
+impl crate::platform::Arch for WasmWasm32 {
     type Relaxation = Relaxation;
     type Platform = Wasm;
 
