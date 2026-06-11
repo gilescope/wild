@@ -2229,9 +2229,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         self.sections.iter()
     }
 
-    fn enumerate_sections(
-        &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
+    fn enumerate_sections(&self) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections.enumerate()
     }
 

@@ -618,9 +618,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         }
     }
 
-    fn enumerate_sections(
-        &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
+    fn enumerate_sections(&self) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections
             .iter()
             .enumerate()
@@ -731,10 +729,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         std::borrow::Cow::Owned(format!("wasm-section-{}", index.0))
     }
 
-    fn section_name(
-        &self,
-        section_header: &SectionHeader,
-    ) -> crate::error::Result<&'data [u8]> {
+    fn section_name(&self, section_header: &SectionHeader) -> crate::error::Result<&'data [u8]> {
         self.section_names
             .get(section_header.index)
             .copied()

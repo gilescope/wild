@@ -2010,9 +2010,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         }
     }
 
-    fn enumerate_sections(
-        &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
+    fn enumerate_sections(&self) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections.iter().enumerate().map(|(i, section)| {
             // Safety: SectionHeader is #[repr(transparent)] over Section64<Endianness>
             let header: &SectionHeader = unsafe {

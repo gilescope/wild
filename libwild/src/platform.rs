@@ -861,9 +861,7 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
             .map(|(i, sym)| (object::SymbolIndex(i), sym))
     }
 
-    fn symbols_iter(
-        &self,
-    ) -> impl Iterator<Item = &<Self::Platform as Platform>::SymtabEntry>;
+    fn symbols_iter(&self) -> impl Iterator<Item = &<Self::Platform as Platform>::SymtabEntry>;
 
     fn symbol(
         &self,

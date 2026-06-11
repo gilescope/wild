@@ -3,6 +3,7 @@ pub use args::Args;
 pub(crate) mod arch;
 pub(crate) mod archive;
 pub mod args;
+pub(crate) mod compression;
 #[cfg(unix)]
 pub mod daemon;
 pub mod daemon_protocol;
@@ -14,7 +15,6 @@ pub(crate) mod eh_frame;
 pub(crate) mod elf;
 pub(crate) mod elf_aarch64;
 pub(crate) mod elf_abbrev_dedup;
-pub(crate) mod compression;
 pub(crate) mod elf_line_v5;
 pub(crate) mod elf_loongarch64;
 pub(crate) mod elf_riscv64;
