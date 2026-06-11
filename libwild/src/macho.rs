@@ -1980,11 +1980,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         self.symbols.len()
     }
 
-    fn symbols_iter(&self) -> impl Iterator<Item = &'data SymtabEntry> {
+    fn symbols_iter(&self) -> impl Iterator<Item = &SymtabEntry> {
         self.symbols.iter()
     }
 
-    fn symbol(&self, index: object::SymbolIndex) -> crate::error::Result<&'data SymtabEntry> {
+    fn symbol(&self, index: object::SymbolIndex) -> crate::error::Result<&SymtabEntry> {
         self.symbols
             .symbol(index)
             .map_err(|e| error!("Symbol index {} out of range: {e}", index.0))
@@ -2012,10 +2012,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn enumerate_sections(
         &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &'data SectionHeader)> {
+    ) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections.iter().enumerate().map(|(i, section)| {
             // Safety: SectionHeader is #[repr(transparent)] over Section64<Endianness>
-            let header: &'data SectionHeader = unsafe {
+            let header: &SectionHeader = unsafe {
                 &*(section as *const macho::Section64<Endianness> as *const SectionHeader)
             };
             (object::SectionIndex(i), header)

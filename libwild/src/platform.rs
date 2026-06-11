@@ -853,7 +853,7 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
     ) -> impl Iterator<
         Item = (
             object::SymbolIndex,
-            &'data <Self::Platform as Platform>::SymtabEntry,
+            &<Self::Platform as Platform>::SymtabEntry,
         ),
     > {
         self.symbols_iter()
@@ -863,12 +863,12 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn symbols_iter(
         &self,
-    ) -> impl Iterator<Item = &'data <Self::Platform as Platform>::SymtabEntry>;
+    ) -> impl Iterator<Item = &<Self::Platform as Platform>::SymtabEntry>;
 
     fn symbol(
         &self,
         index: object::SymbolIndex,
-    ) -> Result<&'data <Self::Platform as Platform>::SymtabEntry>;
+    ) -> Result<&<Self::Platform as Platform>::SymtabEntry>;
 
     fn section_size(&self, header: &<Self::Platform as Platform>::SectionHeader) -> Result<u64>;
 
@@ -879,21 +879,21 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn num_sections(&self) -> usize;
 
-    fn section_iter(&self) -> <Self::Platform as Platform>::SectionIterator<'data>;
+    fn section_iter<'a>(&'a self) -> <Self::Platform as Platform>::SectionIterator<'a>;
 
     fn enumerate_sections(
         &self,
     ) -> impl Iterator<
         Item = (
             object::SectionIndex,
-            &'data <Self::Platform as Platform>::SectionHeader,
+            &<Self::Platform as Platform>::SectionHeader,
         ),
     >;
 
     fn section(
         &self,
         index: object::SectionIndex,
-    ) -> Result<&'data <Self::Platform as Platform>::SectionHeader>;
+    ) -> Result<&<Self::Platform as Platform>::SectionHeader>;
 
     fn section_by_name(
         &self,
@@ -943,7 +943,7 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn section_name(
         &self,
-        section_header: &'data <Self::Platform as Platform>::SectionHeader,
+        section_header: &<Self::Platform as Platform>::SectionHeader,
     ) -> Result<&'data [u8]>;
 
     /// Returns the raw section data. Doesn't handle decompression.

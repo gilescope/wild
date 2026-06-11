@@ -2030,7 +2030,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         self.sections.section_by_name(LittleEndian, name.as_bytes())
     }
 
-    fn section_name(&self, section: &'data SectionHeader) -> Result<&'data [u8]> {
+    fn section_name(&self, section: &SectionHeader) -> Result<&'data [u8]> {
         Ok(self.sections.section_name(LittleEndian, section)?)
     }
 
@@ -2138,7 +2138,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         )
     }
 
-    fn symbol(&self, index: object::SymbolIndex) -> Result<&'data SymtabEntry> {
+    fn symbol(&self, index: object::SymbolIndex) -> Result<&SymtabEntry> {
         Ok(self.symbols.symbol(index)?)
     }
 
@@ -2225,13 +2225,13 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         None
     }
 
-    fn section_iter(&self) -> core::slice::Iter<'data, SectionHeader> {
+    fn section_iter(&self) -> core::slice::Iter<'_, SectionHeader> {
         self.sections.iter()
     }
 
     fn enumerate_sections(
         &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &'data SectionHeader)> {
+    ) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
         self.sections.enumerate()
     }
 
@@ -2300,7 +2300,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         })
     }
 
-    fn symbols_iter(&self) -> impl Iterator<Item = &'data SymtabEntry> {
+    fn symbols_iter(&self) -> impl Iterator<Item = &SymtabEntry> {
         self.symbols.iter()
     }
 

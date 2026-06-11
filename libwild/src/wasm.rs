@@ -584,22 +584,14 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         self.symbols.len()
     }
 
-    fn symbols_iter(&self) -> impl Iterator<Item = &'data WasmSymbol> {
-        // Safety: symbols are owned by File which lives for 'data.
-        // The symbols Vec is allocated once and never reallocated.
-        let slice = self.symbols.as_slice();
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-        unsafe { std::slice::from_raw_parts(ptr, len) }.iter()
+    fn symbols_iter(&self) -> impl Iterator<Item = &WasmSymbol> {
+        self.symbols.iter()
     }
 
-    fn symbol(&self, index: object::SymbolIndex) -> crate::error::Result<&'data WasmSymbol> {
-        let sym = self
-            .symbols
+    fn symbol(&self, index: object::SymbolIndex) -> crate::error::Result<&WasmSymbol> {
+        self.symbols
             .get(index.0)
-            .ok_or_else(|| crate::error!("Symbol index {} out of range", index.0))?;
-        // Safety: same as symbols_iter
-        Ok(unsafe { &*(sym as *const WasmSymbol) })
+            .ok_or_else(|| crate::error!("Symbol index {} out of range", index.0))
     }
 
     fn section_size(&self, header: &SectionHeader) -> crate::error::Result<u64> {
@@ -608,45 +600,37 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn symbol_name(&self, symbol: &WasmSymbol) -> crate::error::Result<&'data [u8]> {
         let idx = symbol.name_offset as usize;
-        let name = self
-            .symbol_names
+        // symbol_names holds genuine &'data [u8] slices, so copying the
+        // reference out of the Vec yields a &'data [u8] directly — no unsafe.
+        self.symbol_names
             .get(idx)
-            .ok_or_else(|| crate::error!("Symbol name index {} out of range", idx))?;
-        // Safety: symbol_names stores &'data [u8] references
-        Ok(unsafe { &*((*name) as *const [u8]) })
+            .copied()
+            .ok_or_else(|| crate::error!("Symbol name index {} out of range", idx))
     }
 
     fn num_sections(&self) -> usize {
         self.sections.len()
     }
 
-    fn section_iter(&self) -> WasmSectionIter<'data> {
-        let slice = self.sections.as_slice();
-        let ptr = slice.as_ptr();
-        let len = slice.len();
+    fn section_iter(&self) -> WasmSectionIter<'_> {
         WasmSectionIter {
-            inner: unsafe { std::slice::from_raw_parts(ptr, len) }.iter(),
+            inner: self.sections.iter(),
         }
     }
 
     fn enumerate_sections(
         &self,
-    ) -> impl Iterator<Item = (object::SectionIndex, &'data SectionHeader)> {
-        let slice = self.sections.as_slice();
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+    ) -> impl Iterator<Item = (object::SectionIndex, &SectionHeader)> {
+        self.sections
             .iter()
             .enumerate()
             .map(|(i, s)| (object::SectionIndex(i), s))
     }
 
-    fn section(&self, index: object::SectionIndex) -> crate::error::Result<&'data SectionHeader> {
-        let s = self
-            .sections
+    fn section(&self, index: object::SectionIndex) -> crate::error::Result<&SectionHeader> {
+        self.sections
             .get(index.0)
-            .ok_or_else(|| crate::error!("Section index {} out of range", index.0))?;
-        Ok(unsafe { &*(s as *const SectionHeader) })
+            .ok_or_else(|| crate::error!("Section index {} out of range", index.0))
     }
 
     fn section_by_name(&self, _name: &str) -> Option<(object::SectionIndex, &'data SectionHeader)> {
@@ -749,7 +733,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn section_name(
         &self,
-        section_header: &'data SectionHeader,
+        section_header: &SectionHeader,
     ) -> crate::error::Result<&'data [u8]> {
         self.section_names
             .get(section_header.index)
